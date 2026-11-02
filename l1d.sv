@@ -521,6 +521,7 @@ endfunction
    logic 				  t_got_non_mem, r_got_non_mem;
 
    logic 				  t_ucld_dead_drop;
+   logic 				  t_io_drop;   /* port 1 answered a cached I/O-space load (machine.vh IS_IO_PA) */
       
    logic 				  n_is_retry, r_is_retry;
    logic 				  r_q_priority, n_q_priority;
@@ -1000,6 +1001,10 @@ endfunction
 		  r_rob_inflight[{t_mem_head.restart_id, t_mem_head.rob_ptr}] <= 1'b0;
 	       end
 	     if(t_ucld_dead_drop)
+	       begin
+		  r_rob_inflight[{r_req.restart_id, r_req.rob_ptr}] <= 1'b0;
+	       end
+	     if(t_io_drop)
 	       begin
 		  r_rob_inflight[{r_req.restart_id, r_req.rob_ptr}] <= 1'b0;
 	       end
@@ -2755,6 +2760,7 @@ endfunction
 	n_is_retry = 1'b0;
 	n_chop_wait = r_chop_wait;
 	t_ucld_dead_drop = 1'b0;
+	t_io_drop = 1'b0;
 	
 
 	n_q_priority = !r_q_priority;
@@ -2920,6 +2926,30 @@ endfunction
 			  n_core_mem_rsp.bad_addr = 1'b1;
 			  n_core_mem_rsp_valid = 1'b1;
 		       end
+		    else if(t_remapped_req2.cached && `IS_IO_PA(t_remapped_req2.addr[`PA_WIDTH-1:0]) && !w_is_chop2
+`ifndef ENABLE_R10000
+			    && !r_req2.is_store
+`endif
+			    )
+		      begin
+			 /* cached access to I/O space (machine.vh IS_IO_PA): answer here, with no
+			  * fill -- the line is never allocated and nothing reaches the bus.  IP28:
+			  * DBE at retirement for loads and stores (the R10000's ERR completion).
+			  * IP22: a load reads 0; a store takes its normal address pass and is
+			  * dropped when it commits (the port-1 arm below). */
+`ifdef ENABLE_R10000
+			 n_core_mem_rsp.data = r_req2.addr;
+			 n_core_mem_rsp.dst_valid = 1'b0;
+			 n_core_mem_rsp.bus_err = 1'b1;
+`else
+			 n_core_mem_rsp.data = 'd0;
+			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
+`endif
+			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
+			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
+			 n_core_mem_rsp.tlb_index = w_tlb_index;
+			 n_core_mem_rsp_valid = 1'b1;
+		      end
 		    else if(r_req2.is_store && r_req2.lsu_hold && !w_is_chop2)
 		      begin
 			 /* plain store address pass: record PA/mask in the store buffer and
@@ -3141,6 +3171,29 @@ endfunction
 			      n_mem_req_valid = 1'b1;
 			      n_chop_wait = 1'b1;
 			      n_state = FLUSH_CL_WAIT;
+			   end
+		      end
+		    else if(r_req.cached && `IS_IO_PA(r_req.addr[`PA_WIDTH-1:0]))
+		      begin
+			 /* cached access to I/O space that reached the queue (an IP22 store's
+			  * commit, or a load queued behind another): never filled, never
+			  * allocated.  A store is dropped; a load answers as port 2 would. */
+			 if(r_req.commit)
+			   begin
+			      n_core_mem_st_done_valid = 1'b1;
+			   end
+			 else
+			   begin
+			      t_io_drop = 1'b1;
+`ifdef ENABLE_R10000
+			      n_core_mem_rsp.dst_valid = 1'b0;
+			      n_core_mem_rsp.bus_err = 1'b1;
+`else
+			      n_core_mem_rsp.data = 'd0;
+			      n_core_mem_rsp.dst_valid = r_req.dst_valid;
+`endif
+			      n_core_mem_rsp.bad_addr = r_req.bad_addr;
+			      n_core_mem_rsp_valid = 1'b1;
 			   end
 		      end
 		    else if((r_req.cached == 1'b0) && !r_req.is_store && drain_ds_complete && dead_rob_mask[r_req.rob_ptr])

@@ -535,3 +535,15 @@ atomic/test_ll_fwd.elf: atomic/test_ll_fwd.S $(STARTUP) $(COMMON)/sim.h $(COMMON
 except/test_nested_epc.elf: except/test_nested_epc.S $(COMMON)/sim.h $(COMMON)/link.ld
 	$(CC) $(CFLAGS) -x assembler-with-cpp -c except/test_nested_epc.S -o except/test_nested_epc.o
 	$(LD) $(LDFLAGS) except/test_nested_epc.o -o $@
+
+# cached accesses to I/O PA space (machine.vh IS_IO_PA): IP22 build, self-check (-c 0);
+# run with --watch-va 0xffffffff9f000040 and expect no mem-fill of the wrong-path line
+cache/test_io_cached_r4k.elf: cache/test_io_cached_r4k.S $(STARTUP) $(COMMON)/sim.h $(COMMON)/link.ld
+	$(CC) $(CFLAGS) -x assembler-with-cpp -c cache/test_io_cached_r4k.S -o cache/test_io_cached_r4k.o
+	$(LD) $(LDFLAGS) $(STARTUP) cache/test_io_cached_r4k.o -o $@
+
+# IP28 build (ENABLE_R10000): cached I/O access -> precise DBE; speculative -> none.
+# Self-contained (own vectors), self-check (-c 0).
+cache/test_io_cached_r10k.elf: cache/test_io_cached_r10k.S $(COMMON)/sim.h $(COMMON)/link.ld
+	$(CC) $(CFLAGS) -x assembler-with-cpp -c cache/test_io_cached_r10k.S -o cache/test_io_cached_r10k.o
+	$(LD) $(LDFLAGS) cache/test_io_cached_r10k.o -o $@
