@@ -6,420 +6,153 @@
 #include <cstdio>
 #include <ostream>
 #include <cassert>
-#include <unordered_map>
 
 #include "sparse_mem.hh"
-#include "mips_insns.hh"
 
-#include <deque>
-/* Co-sim store-check (ported from rv64core): the golden ISS records each committed
- * store; the RTL reports its store-writes via the wr_log DPI; henry_tb compares.
- * Only active when interpret.cc is built with -DSTORE_CHECK (henry_tb); r9999's own
- * builds leave the push #ifdef'd out and never reference g_iss_stores. */
-struct store_rec {
-  uint64_t pc, addr, data;
-  store_rec(uint64_t p, uint64_t a, uint64_t d) : pc(p), addr(a), data(d) {}
-};
-extern std::deque<store_rec> g_iss_stores;
+class sun4m_t;
 
-/* co-sim checker: ISS TLB is written solely by the RTL mirror (see interpret.cc). */
-extern bool g_iss_tlb_ext;
-extern bool g_iss_os_mode;   // true in the henry OS-checker: SYSCALL/BREAK trap to 0x180 (not halt)
+/* SPARC V8 golden ISS.
+ *
+ * Register windows use the SAME flat 8-bit architectural index the RTL rename
+ * uses (SPARC_V8_PLAN.md section 2), so an ISS register dump lines up 1:1 with
+ * the RTL retire RAT:
+ *   r0..r7  (globals)   -> 0..7
+ *   r8..r31 (windowed)  -> 8 + ((r - 8) + 16*CWP) mod (16*NWINDOWS)
+ * ins(w) alias outs(w+1); SAVE decrements CWP, so the callee's ins are the
+ * caller's outs. */
+#ifndef NWINDOWS
+#define NWINDOWS 8
+#endif
+#define N_ARCH_REGS (8 + 16*NWINDOWS)
 
-/* LL/SC reservation model -- MUST MATCH machine.vh's `define LLSC_BREAK_ON_LOAD.
- * default (undefined) = BERI/CHERI (store to the linked line breaks the link);
- * define = R10000 conservative (any intervening load/store breaks it). */
-//#define LLSC_BREAK_ON_LOAD 1
-
-#define IS_LITTLE_ENDIAN false
-
-enum class fpMode {
-  mipsii, mipsiv, mips32
-};
-
-enum class fpOperation {
-  abs,neg,mov,add,
-  sub,mul,div,sqrt,
-  rsqrt,recip,truncl,
-  truncw, cvts, cvtd,
-  unknown
-};
-
-static inline fpOperation decode_fp(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  uint32_t functField = (inst>>21) & 31;
-  uint32_t lowop = inst & 63;  
-  uint32_t fmt = (inst >> 21) & 31;
-  uint32_t nd_tf = (inst>>16) & 3;
-  uint32_t lowbits = inst & ((1<<11)-1);
-  
-  if(opcode != 0x11) {
-    return fpOperation::unknown;
+static inline uint32_t widx(uint32_t cwp, uint32_t r) {
+  if(r < 8) {
+    return r;
   }
-  opcode &= 0x3;
-  if(fmt == 0x8) {
-    return fpOperation::unknown;
-    }
-  else if((lowbits == 0) && ((functField==0x0) || (functField==0x4))) {
-    return fpOperation::unknown;    
-  }
-  if((lowop >> 4) == 3) {
-    return fpOperation::unknown;	  
-  }
-  switch(lowop)
-    {
-    case 0x0:
-      return fpOperation::add;
-    case 0x1:
-      return fpOperation::sub;
-    case 0x2:
-      return fpOperation::mul;
-    case 0x3:
-      return fpOperation::div;
-    case 0x4:
-      return fpOperation::sqrt;
-    case 0x5:
-      return fpOperation::abs;
-    case 0x6:
-      return fpOperation::mov;
-    case 0x7:
-      return fpOperation::neg;
-      //case 0x9:
-      //return fpOperation::truncl;
-      //case 0xd:
-      //return fpOperation::truncw;
-    // case 0x11:
-    //   _fmovc(inst, s);
-    //   break;
-    // case 0x12:
-    //   _fmovz(inst, s);
-    //   break;
-    // case 0x13:
-    //   _fmovn(inst, s);
-    //   break;
-    case 0x15:
-      return fpOperation::recip;
-    case 0x16:
-      return fpOperation::rsqrt;
-    // case 0x20:
-    //   return fpOperation::cvts;
-    // case 0x21:
-    //   return fpOperation::cvtd;
-    default:
-      break;
-    }
-  return fpOperation::unknown;
+  return 8 + (((r - 8) + 16*cwp) % (16*NWINDOWS));
 }
 
-enum class branch_type {
-  beq, bne, blez, bgtz,
-  beql, bnel, blezl, bgtzl,
-  bgez, bgezl, bltz, bltzl,
-  bgezal, bltzal, bgezall, bltzall,
-  bc1f, bc1t, bc1fl, bc1tl
+/* trap types (tt), V8 manual table 7-1 */
+enum trap_type : uint32_t {
+  TT_RESET          = 0x00,
+  TT_IACCESS        = 0x01,
+  TT_ILLEGAL        = 0x02,
+  TT_PRIVILEGED     = 0x03,
+  TT_FP_DISABLED    = 0x04,
+  TT_WIN_OVERFLOW   = 0x05,
+  TT_WIN_UNDERFLOW  = 0x06,
+  TT_UNALIGNED      = 0x07,
+  TT_FP_EXCEPTION   = 0x08,
+  TT_DACCESS        = 0x09,
+  TT_TAG_OVERFLOW   = 0x0a,
+  TT_IACCESS_ERROR  = 0x21,
+  TT_CP_DISABLED    = 0x24,
+  TT_DACCESS_ERROR  = 0x29,
+  TT_DIV_ZERO       = 0x2a,
+  TT_INTERRUPT_BASE = 0x10,
+  TT_TRAP_INSN_BASE = 0x80
 };
 
+/* FSR fields */
+#define FSR_CEXC_SHIFT 0
+#define FSR_AEXC_SHIFT 5
+#define FSR_FCC_SHIFT  10
+#define FSR_QNE        (1u<<13)
+#define FSR_FTT_SHIFT  14
+#define FSR_VER_SHIFT  17
+#define FSR_NS         (1u<<22)
+#define FSR_TEM_SHIFT  23
+#define FSR_RD_SHIFT   30
+/* writable by LDFSR: RD, TEM, NS, fcc, aexc, cexc (ver, ftt, qne are read-only) */
+#define FSR_LDFSR_MASK 0xcfc00fffu
+/* IEEE exception bits (cexc/aexc/TEM order) */
+#define FEXC_NX 0x01
+#define FEXC_DZ 0x02
+#define FEXC_UF 0x04
+#define FEXC_OF 0x08
+#define FEXC_NV 0x10
+/* ftt */
+#define FTT_IEEE   1
+#define FTT_UNIMP  3
 
-enum class fp_reg_state { unknown, sp, dp };
+/* superdupersparc presents as a TI SuperSPARC (Viking) sun4m module.  Linux
+ * srmmu.c picks its MMU/cache code from PSR impl/ver plus the SRMMU control
+ * register impl/ver: impl 4 / ver 1 with MCR impl/ver 0/0 => init_viking().
+ * MMODE (MCR bit 11) set = MBus mode, i.e. no SuperCache/MXCC to model. */
+#define PSR_IMPL_VER 0x41u
+#define MCR_E      (1u<<0)    /* MMU enable */
+#define MCR_NF     (1u<<1)    /* no-fault */
+#define MCR_MMODE  (1u<<11)   /* Viking: MBus mode (no MXCC) */
+#define MCR_BMODE  (1u<<13)   /* Viking: boot mode -- MMU-off insn fetches go to the PROM */
+#define MCR_RESET  MCR_MMODE  /* impl/ver [31:24] = 0 */
+/* SRMMU fault status register fields */
+#define MFSR_OW        (1u<<0)
+#define MFSR_FAV       (1u<<1)
+#define MFSR_FT_SHIFT  2
+#define MFSR_AT_SHIFT  5
+#define MFSR_L_SHIFT   8
+enum mmu_ft : uint32_t {
+  FT_NONE = 0, FT_INVALID = 1, FT_PROTECTION = 2, FT_PRIVILEGE = 3, FT_TRANSLATION = 4,
+  FT_BUS_ERROR = 5
+};
 
-class sgi_mc;
-class sgi_hpc;
-class sgi_scc;
-class sgi_scsi;
-class sgi_seeq;
-class sgi_newport;
-class sgi_ps2;
-
-class state_t{
+class state_t {
 public:
-  typedef int64_t reg_t;
-  reg_t pc = 0;
-  reg_t gpr[32] = {0};
-  reg_t lo = 0;
-  reg_t hi = 0;
-  uint32_t cpr0[32] = {0};
-  /* FR=1 (mips3/mips4): 32 independent 64-bit FP registers, NOT FR=0 even/odd
-   * 32-bit pairs.  Singles live in bits[31:0]; doubles use the full 64 bits. */
-  uint64_t cpr1[32] = {0};
-  uint32_t fcr1[5] = {0};
+  uint32_t pc = 0;
+  uint32_t npc = 4;
+  uint32_t r[N_ARCH_REGS] = {0};
+  /* PSR, held unpacked; get_psr()/set_psr() pack it */
+  bool icc_n = false, icc_z = false, icc_v = false, icc_c = false;
+  bool ef = false, s = true, ps = false, et = false;
+  uint32_t pil = 0;
+  uint32_t cwp = 0;
+  uint32_t wim = 0;
+  uint32_t tbr = 0;
+  uint32_t y = 0;
+  uint32_t asr[32] = {0};
+  uint32_t f[32] = {0};
+  uint32_t fsr = 0;
+  /* one-deep FP queue (FPop traps are taken precisely here; FQ holds the trapping FPop) */
+  uint32_t fq_addr = 0, fq_insn = 0;
+
+  /* SRMMU (ASI 0x4 registers) */
+  uint32_t mmu_ctrl = MCR_RESET;
+  uint32_t mmu_ctpr = 0;     /* context table pointer: PA[35:6] in bits [31:2] */
+  uint32_t mmu_ctx = 0;
+  uint32_t mmu_fsr = 0;
+  uint32_t mmu_far = 0;
+
+  /* PA below ram_size is sparse_mem RAM; everything else is sun4m device space
+   * (with no sun4m attached -- the user-mode tests -- all 4GB is RAM) */
+  uint64_t ram_size = 1ULL << 32;
+  sun4m_t *sun4m = nullptr;
+  bool bus_error = false;    /* set by a physical access to an unassigned address */
+
+  uint32_t irl = 0;          /* external interrupt request level, 0 = none */
+  bool brk = false;          /* halted (exit syscall or error mode) */
+  bool error_mode = false;
+  int exit_code = 0;
   uint64_t icnt = 0;
-  uint8_t brk = 0;
-  uint64_t maxicnt = 0;
+
+  /* --user: start in user mode and emulate the Linux sparc32 syscall ABI (ta 0x10)
+   * plus the kernel's window spill/fill, so the same static ELF runs under
+   * qemu-sparc for comparison */
+  bool user_emu = false;
+
   sparse_mem &mem;
-  fp_reg_state cpr1_state[32] = {fp_reg_state::unknown};
-  std::unordered_map<mipsInsn,uint64_t> insn_histo;
-
-  /* Software TLB -- mirrors the fully-associative RTL TLB.  N_TLB_ENTRIES follows
-   * machine.vh's `N_TLB_ENTRIES: 64 under ENABLE_R10000, else the R4x00's 48
-   * (-DN_TLB_ENTRIES=N overrides, for a 16-entry Linux-only build). */
-#ifndef N_TLB_ENTRIES
-#ifdef ENABLE_R10000
-#define N_TLB_ENTRIES 64
-#else
-#define N_TLB_ENTRIES 48
-#endif
-#endif
-  static const int NUM_TLB_ENTRIES = N_TLB_ENTRIES;
-  struct tlb_entry_t {
-    uint64_t entry_hi  = 0;   /* R[63:62] + VPN2[39:13] + ASID[7:0] */
-    uint64_t entry_lo0 = 0;   /* PFN[33:6] + C[5:3] + D[2] + V[1] + G[0] */
-    uint64_t entry_lo1 = 0;
-    uint32_t page_mask = 0;   /* variable page size bits [24:13] */
-  } tlb[NUM_TLB_ENTRIES];
-  /* 64-bit CP0 shadow registers for DMTC0/DMFC0 (EntryHi, EntryLo, XContext) */
-  uint64_t cpr0_64[32] = {0};
-
-  /*
-   * When true, MMIO side-effects (MTC0 $7 putchar) are suppressed.
-   * Set on the checker state so RTL output appears exactly once.
-   */
-  bool silent = false;
-
-  /* LL/SC reservation (link).  Matches the RTL (l1d.sv r_link_reg), cache-line
-   * granularity (LG_L1D_CL_LEN=4 -> 16B).  Set by LL/LLD; cleared by any
-   * intervening load/store, exception, or ERET (R10000 conservative model,
-   * p.27).  SC/SCD succeeds iff valid && the SC's line matches the linked line.
-   * The interp is 1:1 va2pa so the effective address is the physical line. */
-  bool ll_link_valid = false;
-  uint64_t ll_link_addr = 0;   /* cache-line-aligned address */
-
-  /* True while executing a branch/jump delay-slot instruction.  An exception in
-   * a delay slot sets EPC = the branch pc and Cause.BD = 1 (matches the RTL,
-   * core.sv: n_epc = in_delay_slot ? pc-4 : pc; n_exc_in_delay = in_delay_slot). */
-  bool in_delay_slot = false;
-
-  /* Set by va_translate() on a TLB exception (Refill/Invalid/Modified); the
-   * caller (a load/store/fetch handler) checks it and aborts the instruction --
-   * the PC has already been vectored to the handler.  Cleared at the top of
-   * execMips each instruction.  Mirrors interp_mips. */
-  bool tlb_fault = false;
-
-  /* SGI devices (ooo_core --ip22/--ip28; the models come from indysim, which hangs
-   * them off state_t): null when there is no board.  irq_poke = a device raised an
-   * interrupt, poll now. */
-  sgi_mc *mc = nullptr;
-  sgi_hpc *hpc = nullptr;
-  sgi_scc *scc = nullptr;
-  sgi_scsi *scsi = nullptr;
-  sgi_seeq *seeq = nullptr;
-  sgi_newport *np = nullptr;
-  sgi_ps2 *ps2 = nullptr;
-  bool irq_poke = false;
-
-  state_t(sparse_mem &mem) : mem(mem) {}
+  state_t(sparse_mem &m) : mem(m) {}
   ~state_t();
-};
 
-struct rtype_t {
-  uint32_t opcode : 6;
-  uint32_t sa : 5;
-  uint32_t rd : 5;
-  uint32_t rt : 5;
-  uint32_t rs : 5;
-  uint32_t special : 6;
-};
-
-struct itype_t {
-  uint32_t imm : 16;
-  uint32_t rt : 5;
-  uint32_t rs : 5;
-  uint32_t opcode : 6;
-};
-
-union mips_t {
-  rtype_t r;
-  itype_t i;
-  uint32_t raw;
-  mips_t(uint32_t x) : raw(x) {}
-};
-
-
-static inline bool is_jr(uint32_t inst, bool r31 = false) {
-  uint32_t opcode = inst>>26;
-  uint32_t funct = inst & 63;
-  uint32_t rs = (inst >> 21) & 31;
-  bool jr = (opcode==0) and (funct == 0x08);
-  if(jr) {
-    return r31 ? (rs==31) : true;
+  uint32_t &gpr(uint32_t rr) {
+    return r[widx(cwp, rr)];
   }
-  return false;
-}
+  uint32_t get_psr() const;
+  void set_psr(uint32_t v);
+};
 
-static inline bool is_jal(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  return (opcode == 3);
-}
-
-inline bool is_jalr(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  return (opcode==0) && ((inst&63) == 0x9);
-}
-
-
-static inline bool is_j(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  return (opcode == 2);
-}
-
-static inline uint32_t get_jump_target(uint32_t pc, uint32_t inst) {
-  assert(is_jal(inst) or is_j(inst));
-  static const uint32_t pc_mask = (~((1U<<28)-1));
-  uint32_t jaddr = (inst & ((1<<26)-1)) << 2;
-  return ((pc + 4)&pc_mask) | jaddr;
-}
-
-static inline bool is_memory(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  switch(opcode)
-    {
-    case 0x20: //_lb(inst, s);
-    case 0x21: //_lh<EL>(inst, s);
-    case 0x22: //_lwl<EL>(inst, s);
-    case 0x23: //_lw<EL>(inst, s);
-    case 0x24: //_lbu(inst, s);
-    case 0x25: //_lhu<EL>(inst, s);
-    case 0x26: //_lwr<EL>(inst, s);
-    case 0x28: //_sb(inst, s);
-    case 0x29: //_sh<EL>(inst, s);
-    case 0x2a: //_swl<EL>(inst, s);
-    case 0x2b: //_sw<EL>(inst, s);
-    case 0x2e: //_swr<EL>(inst, s); 
-    case 0x31: //_lwc1<EL>(inst, s);
-    case 0x35: //_ldc1<EL>(inst, s);
-    case 0x39: //_swc1<EL>(inst, s);
-    case 0x3d: //_sdc1<EL>(inst, s);
-      return true;
-    default:
-      break;
-    }
-  return false;
-}
-
-static inline bool is_branch(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  uint32_t rt = ((inst>>16) & 31);
-  switch(opcode)
-    {
-    case 0x01:
-      return (rt == 0) || (rt == 1);
-    case 0x04:
-    case 0x05:
-    case 0x06:
-    case 0x07:
-      return true;
-    default:
-      break;
-    }
-  return false;
-}
-
-static inline bool is_branch_likely(uint32_t inst) {
-  uint32_t opcode = inst>>26;
-  uint32_t rt = ((inst>>16) & 31);
-  switch(opcode)
-    {
-    case 0x01:
-      return (rt == 2) || (rt == 3);
-    case 0x14: /* BEQL */
-    case 0x15: /* BNEL */
-    case 0x16: /* BNEZL */
-    case 0x17: /* BGTZL */
-      return true;
-    default:
-      break;
-    }
-  return false;
-}
-
-static inline uint32_t get_branch_target(uint32_t pc, uint32_t inst) {
-  int16_t himm = (int16_t)(inst & ((1<<16) - 1));
-  int32_t imm = ((int32_t)himm) << 2;
-  return  pc+4+imm; 
-}
+std::ostream &operator<<(std::ostream &out, const state_t &s);
 
 void initState(state_t *s);
-void execMips(state_t *s);
-/* co-sim retire_trace: fetch the BE instruction word at a virtual PC via the ISS TLB
- * (code is identical in RTL & ISS memory); *ppa gets the PA.  0 on untranslatable PC. */
-uint32_t iss_fetch_inst(state_t *s, uint64_t vpc, uint32_t *ppa);
-/* ooo_core: a device model wrote n bytes of memory at pa by DMA (sgi_hpc/sgi_mc).  The
- * checker ISS keeps its own memory, so the same bytes are copied there (top.cc). */
-void sgi_dma_wrote(state_t *s, uint64_t pa, size_t n);
-/* co-sim: a load VA's PA and whether it bypasses the caches (interpret.cc) */
-bool iss_load_class(state_t *s, uint64_t va, uint32_t *pa, bool *uncached);
-extern uint64_t g_iss_last_ld_va, g_iss_last_st_va, g_iss_st_seq;
-void raise_int(state_t *s, uint64_t epc, uint32_t ip = (1u << 7));
-
-
-std::ostream &operator<<(std::ostream &out, const state_t & s);
-
-bool is_store_insn(state_t *s);
-
-/* CP0 Status register bit positions */
-#define SR_IE    (1u <<  0)  /* interrupt enable */
-#define SR_EXL   (1u <<  1)  /* exception level */
-#define SR_ERL   (1u <<  2)  /* error level */
-#define SR_UX    (1u <<  5)  /* user extended (64-bit user mode) */
-#define SR_SX    (1u <<  6)  /* supervisor extended */
-#define SR_KX    (1u <<  7)  /* kernel extended (64-bit kernel mode) */
-#define SR_BEV   (1u << 22)  /* bootstrap exception vectors */
-#define SR_FR    (1u << 26)  /* FP register mode (flat FR=1 datapath; hardwired 1 in RTL) */
-#define SR_CU0   (1u << 28)  /* coprocessor 0 usable */
-#define SR_CU1   (1u << 29)  /* coprocessor 1 usable (FPU) */
-#define SR_CU2   (1u << 30)  /* coprocessor 2 usable */
-#define SR_CU3   (1u << 31)  /* coprocessor 3 usable */
-
-/* CP0 register indices */
-#define CPR0_INDEX    0
-#define CPR0_RANDOM   1
-#define CPR0_ENTRYLO0 2
-#define CPR0_ENTRYLO1 3
-#define CPR0_CONTEXT  4
-#define CPR0_PAGEMASK 5
-#define CPR0_WIRED    6
-/* 7 = simulator putchar port (MTC0 $rt, $7 outputs rt[7:0]) */
-#define CPR0_BADVADDR 8
-#define CPR0_COUNT    9
-#define CPR0_ENTRYHI  10
-#define CPR0_COMPARE  11
-#define CPR0_SR       12
-#define CPR0_CAUSE    13
-#define CPR0_EPC      14
-#define CPR0_PRID     15
-#define CPR0_CONFIG   16
-#define CPR0_XCONTEXT 20
-#define CPR0_ERROREPC 30
-
-/* CP0 PRId values (imp field bits [15:8]; R4000 family shares imp 0x04 and is
- * distinguished by the revision byte). */
-#define PRID_R4000  0x00000400u   /* imp 0x04, rev 0x00 */
-#define PRID_R4400  0x00000440u   /* imp 0x04, rev 0x40 */
-#define PRID_R4600  0x00002020u   /* imp 0x20, rev 0x20 */
-#define PRID_R10000 0x00000900u   /* imp 0x09, rev 0x00 */
-/* This ISS is the RTL's co-sim checker: it must report what the RTL reports
- * (machine.vh PRID_VALUE = R4400), or every PRId read diverges.  (It once
- * presented R4600 for booting IRIX in the ISS -- IRIX /unix branches on
- * PRId.IMP in start(), MAME_QUESTIONS.md Q5; IRIX now boots on the RTL as an
- * R4400, and standalone ISS work uses interp_mips.) */
-/* CP0 Config: the RTL's read-only constant (exec.sv 'd16); keep in sync.  Under
- * ENABLE_R10000 all three are the R10000's (machine.vh PRID/FIR/CONFIG_VALUE). */
-#ifdef ENABLE_R10000
-#define PRID_VALUE  0x00000925u
-#define CONFIG_VALUE 0x6c00a002u
-#define FIR_VALUE   0x00000900u
-#else
-#define PRID_VALUE  PRID_R4400
-#define CONFIG_VALUE 0x0002e483u
-#define FIR_VALUE   0x00000500u   /* R4000 FPU, as exec.sv CFC1 */
-#endif
-
-#define VA2PA(x) ((x & 0x1fffffff))
-
-static uint32_t va2pa(uint32_t va) {
-  if((va >> 31) & 1) {
-    return va & 0x1fffffff;
-  }
-  return va;
-}
+void execSparc(state_t *s);
 
 #endif

@@ -105,11 +105,11 @@ void load_elf(const char* fn, state_t *ms) {
     exit(-1);
   }
 
-  /* Check for a MIPS machine */
+  /* Check for a SPARC machine (EM_SPARC=2, EM_SPARC32PLUS=18) */
   assert(checkBigEndian(eh32));
 
-  if(bswap_(eh32->e_machine) != 8) {
-    printf("INTERP : non-mips binary..goodbye\n");
+  if(bswap_(eh32->e_machine) != 2 && bswap_(eh32->e_machine) != 18) {
+    printf("INTERP : non-sparc binary..goodbye\n");
     exit(-1);
   }
 
@@ -120,7 +120,8 @@ void load_elf(const char* fn, state_t *ms) {
   ph32 = reinterpret_cast<Elf32_Phdr*>(buf + e_phoff);
   e_shnum = bswap_(eh32->e_shnum);
   sh32 = reinterpret_cast<Elf32_Shdr*>(buf + bswap_(eh32->e_shoff));
-  ms->pc = (int64_t)(int32_t)lAddr;
+  ms->pc = lAddr;
+  ms->npc = lAddr + 4;
 
   uint32_t loaddr = ~0U, hiaddr = 0;
   /* Find instruction segments and copy to
@@ -162,7 +163,7 @@ void load_elf(const char* fn, state_t *ms) {
       
       for(int32_t cc = 0; cc < p_filesz; cc++) {
 	uint32_t v_addr = cc+p_vaddr;
-	mem.set<uint8_t>(va2pa(v_addr),
+	mem.set<uint8_t>(v_addr,
 			 reinterpret_cast<uint8_t*>(buf + p_offset)[cc]);
       }
     }

@@ -92,3 +92,9 @@ gen_html : gen_html.cc pipeline_record.hh
 
 clean:
 	rm -rf $(EXE) $(OBJ) $(DEP) obj_dir
+
+# standalone SPARC V8 ISS (no verilator)
+ISS_OBJ = iss_main.o interpret.o sun4m.o disassemble.o loadelf.o helper.o sparse_mem.o
+sparc_iss : $(ISS_OBJ)
+	$(CXX) -o $@ $(ISS_OBJ) $(LIBS)
+-include $(ISS_OBJ:.o=.d)
