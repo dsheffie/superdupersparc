@@ -32,7 +32,6 @@
 #include "interpret.hh"
 #include "globals.hh"
 #include "disassemble.hh"
-#include "saveState.hh"
 #include "pipeline_record.hh"
 
 #include "Vcore_l1d_l1i__Dpi.h"
@@ -62,103 +61,6 @@ inline double histo_mean_median(const std::map<A,B> &histo, A &median) {
   }
   return acc;
 }
-
-
-
-union itype {
-  struct {
-    uint32_t imm : 16;
-    uint32_t rs : 5;
-    uint32_t rt : 5;
-    uint32_t op : 6;
-  } uu;
-  uint32_t u;
-};
-
-union rtype {
-  struct {
-    uint32_t subop : 6;
-    uint32_t z : 5;
-    uint32_t rd : 5;
-    uint32_t rt : 5;
-    uint32_t rs : 5;
-    uint32_t op : 6;
-  } uu;
-  uint32_t u;
-};
-
-union ceqs {
-  struct {
-    uint32_t fpop : 6;
-    uint32_t zeros : 2;
-    uint32_t cc : 3;
-    uint32_t fs : 5;
-    uint32_t ft : 5;
-    uint32_t fmt : 5;
-    uint32_t opcode : 6;
-  } uu;
-  uint32_t u;
-  ceqs(uint32_t fs, uint32_t ft, uint32_t cc) {
-    uu.fpop = 50;
-    uu.zeros = 0;
-    uu.cc = cc;
-    uu.fs = fs;
-    uu.ft = ft;
-    uu.fmt = 16;
-    uu.opcode = 17;
-  }  
-};
-
-union mtc1 {
-  struct {
-    uint32_t zeros : 11;
-    uint32_t fs : 5;
-    uint32_t rt : 5;
-    uint32_t mt : 5;
-    uint32_t opcode : 6;
-  } uu;
-  uint32_t u;
-  mtc1(uint32_t fs, uint32_t rt) {
-    uu.opcode = 17;
-    uu.mt = 4;
-    uu.zeros = 0;
-    uu.fs = fs;
-    uu.rt = rt;
-  }
-};
-
-
-union mthi {
-  struct {
-    uint32_t secondary_opcode : 6;
-    uint32_t zeros : 15;
-    uint32_t rs : 5;
-    uint32_t primary_opcode : 6;
-  } uu;
-  uint32_t u;
-  mthi(uint32_t rs) {
-    uu.primary_opcode = 0;
-    uu.rs = rs;
-    uu.zeros = 0;
-    uu.secondary_opcode = 17;
-  }
-};
-
-union mtlo {
-  struct {
-    uint32_t secondary_opcode : 6;
-    uint32_t zeros : 15;
-    uint32_t rs : 5;
-    uint32_t primary_opcode : 6;
-  } uu;
-  uint32_t u;
-  mtlo(uint32_t rs) {
-    uu.primary_opcode = 0;
-    uu.rs = rs;
-    uu.zeros = 0;
-    uu.secondary_opcode = 19;
-  }
-};
 
 
 
@@ -199,7 +101,7 @@ static inline void dump_histo(const std::string &fname,
   std::sort(sorted_by_cnt.begin(), sorted_by_cnt.end());
   for(auto it = sorted_by_cnt.rbegin(), E = sorted_by_cnt.rend(); it != E; ++it) {
     uint32_t r_inst = s->mem.get<uint32_t>(it->second);
-    r_inst = bswap<IS_LITTLE_ENDIAN>(r_inst);	
+    r_inst = bswap<false>(r_inst);	
     auto s = getAsmString(r_inst, it->second);
     out << std::hex << it->second << ":"
   	      << s << ","
@@ -223,69 +125,6 @@ static inline float to_float(uint32_t u) {
 static inline double to_double(uint64_t u) {
   return *reinterpret_cast<double*>(&u);
 }
-
-
-template<typename T>
-static inline T compute_fp_insn(uint32_t r_inst, fpOperation op, state_t *s) {
-  T x = static_cast<T>(0);
-  uint32_t ft = (r_inst>>16)&31;
-  uint32_t fs = (r_inst>>11)&31;
-  uint32_t fmt=(r_inst >> 21) & 31;	    
-  T _fs = *reinterpret_cast<T*>(s->cpr1+fs);
-  T _ft = *reinterpret_cast<T*>(s->cpr1+ft);  
-  switch(op)
-    {
-    case fpOperation::abs:
-      x = std::abs(_fs);
-      break;
-    case fpOperation::neg:
-      x = -_fs;
-      break;
-    case fpOperation::mov:
-      x = _fs;
-      break;
-    case fpOperation::add:
-      x = _fs + _ft;
-      break;
-    case fpOperation::sub:
-      x = _fs - _ft;
-      break;
-    case fpOperation::mul:
-      x = _fs * _ft;
-      break;
-    case fpOperation::div:
-      if(_ft==0.0) {
-	x = std::numeric_limits<T>::max();
-      }
-      else {
-	x = _fs / _ft;
-      }
-      break;
-    case fpOperation::sqrt:
-      x = std::sqrt(_fs);
-      break;
-    case fpOperation::rsqrt:
-      x = static_cast<T>(1.0) / std::sqrt(_fs);
-      break;
-    case fpOperation::recip:
-      x = static_cast<T>(1.0) / _fs;
-      break;
-      //case fpOperation::cvtd:
-      //assert(fmt == FMT_W);
-      //x = (double)(*((int32_t*)(s->cpr1 + fs)));
-      //break;
-      //case fpOperation::truncw: {
-      //assert(fmt == FMT_D);
-      //int32_t t = (int32_t)_fs;
-      //*reinterpret_cast<int32_t*>(&x) = t;
-      //break;
-      //}
-    default:
-      break;
-    }
-  return x;
-}
-
 
 
 #endif
