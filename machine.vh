@@ -33,14 +33,6 @@
 
 `define FPGA 1
 
-// LL/SC reservation model -- KEEP IN SYNC with interpret.hh (LLSC_BREAK_ON_LOAD).
-//   default (undefined) = BERI/CHERI: a STORE to the linked cache line breaks the
-//     link; loads (and stores to other lines) do not.  Matches cheritest.
-//   LLSC_BREAK_ON_LOAD  = R10000 conservative (p.27): ANY intervening load OR
-//     store breaks the link.  R4400 (p.289) breaks only on external coherence +
-//     ERET.  Selecting this requires quarantining cheri scd_alias / lld_ld_scd.
-//`define LLSC_BREAK_ON_LOAD 1
-
 //`define RESPECT_MAPPED 1
 
 /* L1D request skid buffer: bypass the r_mem_q FIFO when it is empty and the L1D
@@ -537,22 +529,9 @@ typedef enum logic [5:0] {
    MEM_SB   = 6'd5,
    MEM_SH   = 6'd6,
    MEM_SW   = 6'd7,
-   MEM_SWR  = 6'd8,
-   MEM_SWL  = 6'd9,
-   MEM_LWR  = 6'd10,
-   MEM_LWL  = 6'd11,
-   MEM_SC   = 6'd12,
    MEM_TLBP = 6'd13,
    MEM_LD   = 6'd14,
    MEM_SD   = 6'd15,
-   MEM_LWU  = 6'd16,
-   MEM_LDL  = 6'd17,
-   MEM_LDR  = 6'd18,
-   MEM_SDL  = 6'd19,
-   MEM_SDR  = 6'd20,
-   MEM_LL   = 6'd21,   /* load-linked word  */
-   MEM_LLD  = 6'd22,   /* load-linked dword */
-   MEM_SCD  = 6'd23,   /* store-conditional dword */
    MEM_INVL = 6'd24,   /* L2 line invalidate -- CACHE DMA-in drop; a dirty L2 line (or a dirty
                         * other-colour L1D copy found by the alias probe) is written back first */
    MEM_MOV  = 6'd25,   /* GPR<->FPR move: data carried in req.addr, echoed by L1D (no memory access) */

@@ -81,7 +81,6 @@ module l1d(clk,
 	   retired_rob_ptr,
 	   retired_rob_ptr_two,
 	   restart_valid,
-	   clr_link_reg,
 	   memq_empty,
 	   dbg_rob_inflight,
 	   drain_ds_complete,
@@ -162,7 +161,6 @@ module l1d(clk,
    input logic [`LG_ROB_ENTRIES-1:0] retired_rob_ptr;
    input logic [`LG_ROB_ENTRIES-1:0] retired_rob_ptr_two;
    input logic 			     restart_valid;
-   input logic			     clr_link_reg;
    output logic			     memq_empty;
    output logic [N_ROB_ENTRIES-1:0] dbg_rob_inflight;
    input logic 			     drain_ds_complete;
@@ -305,58 +303,23 @@ module l1d(clk,
    localparam N_MQ_ENTRIES = (1<<`LG_MRQ_ENTRIES);
 
    function logic [15:0] make_mask(mem_req_t r);
-      logic [15:0]		  t_m, m;
-      logic			  b,s,w,d;
-      logic			  lwl_lwr, swl_swr;
-      logic [3:0]		  swl, swr;
-
-      swr = r.addr[1:0] == 'd0 ? 4'b0001 :
-	    r.addr[1:0] == 'd1 ? 4'b0011 :
-	    r.addr[1:0] == 'd2 ? 4'b0111 :
-	    4'b1111;
-
-      swl = r.addr[1:0] == 'd3 ? 4'b1000 :
-	    r.addr[1:0] == 'd2 ? 4'b1100 :
-	    r.addr[1:0] == 'd1 ? 4'b1110 :
-	    4'b1111;        // BE swl at word-aligned EA stores all 4 bytes (was 4'b0000 = no-op)
-            
-      
-      swl_swr = (r.op == MEM_SWR | r.op == MEM_SWL);
-      lwl_lwr = (r.op == MEM_LWR | r.op == MEM_LWL);
-      if(r.op == MEM_LDL || r.op == MEM_LDR || r.op == MEM_SDL || r.op == MEM_SDR ||
-         r.op == MEM_LLD || r.op == MEM_SCD || r.op == MEM_LD || r.op == MEM_SD)
+      logic [15:0]		  t_m;
+      logic			  b,s,w;
+      if(r.op == MEM_LD || r.op == MEM_SD)
 	return 16'hff << {r.addr[DWORD_START], 3'b0};
 
       b = 	(r.op == MEM_SB | r.op == MEM_LB | r.op == MEM_LBU);
       s = 	(r.op == MEM_SH | r.op == MEM_LH | r.op == MEM_LHU);
-      w = 	(r.op == MEM_SW | r.op == MEM_LW | r.op == MEM_LL | r.op == MEM_SC | lwl_lwr);
+      w = 	(r.op == MEM_SW | r.op == MEM_LW);
       
       t_m = b ? 16'h0001 :
 	    s ? 16'h0003 :
 	    w ? 16'h000f :
-	    (r.op == MEM_SWL) ? {12'd0, swl} :
-	    (r.op == MEM_SWR) ? {12'd0, swr} :
 	    16'hffff;
       
-      m = t_m << ((lwl_lwr | swl_swr) ? {r.addr[3:2], 2'd0} : r.addr[3:0]);      
-      return m;
+      return t_m << r.addr[3:0];
    endfunction
          
-   /* byte mask an UNCACHED store sends to memory.  make_mask gives SDL/SDR the whole
-    * doubleword (fine for the cached merge, the store-buffer overlap checks and the MQ),
-    * but an uncached store's line is merged onto r_array_out -- the cached line that
-    * happens to sit at that index -- so every byte under the mask reaches memory.
-    * SDL/SDR must cover only their own bytes (big-endian: SDL k..7, SDR 0..k), or the
-    * unrelated line's bytes land in memory (IRIX 5.3's bcopy/blkclr on kseg1 directory
-    * buffers: /tmp got the in-core superblock's bytes). */
-   function logic [15:0] unc_st_mask(mem_req_t r);
-      if(r.op == MEM_SDL)
-	return {8'd0, 8'hff << r.addr[2:0]} << {r.addr[DWORD_START], 3'b0};
-      if(r.op == MEM_SDR)
-	return {8'd0, 8'hff >> (3'd7 - r.addr[2:0])} << {r.addr[DWORD_START], 3'b0};
-      return make_mask(r);
-   endfunction
-
 function logic [L1D_CL_LEN_BITS-1:0] merge_cl32(logic [L1D_CL_LEN_BITS-1:0] cl, logic [31:0] w32, logic[LG_WORDS_PER_CL-1:0] pos);
    logic [L1D_CL_LEN_BITS-1:0] 		 cl_out;
    case(pos)
@@ -771,15 +734,6 @@ endfunction
    logic [N_ROB_ENTRIES-1:0] r_missed;
    logic [2*N_ROB_ENTRIES-1:0] r_rob_inflight;   /* indexed {restart color, rob_ptr} */
 
-   logic r_link_reg_val;
-   logic [`PA_WIDTH-1:0] r_link_reg;
-   wire w_match_link = r_link_reg_val &&
-                       (r_link_reg == {r_req.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN],
-                                       {`LG_L1D_CL_LEN{1'b0}}});
-   wire w_match_link2 = r_link_reg_val &&
-                        (r_link_reg == {r_req2.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN],
-                                        {`LG_L1D_CL_LEN{1'b0}}});
-
 `ifdef VERILATOR
    logic r_pg_wait2;
    always_ff@(posedge clk)
@@ -847,49 +801,6 @@ endfunction
 	  $display("[l2op] cyc=%d op=%s pa=%x data=%x", r_cycle, (n_mem_req_opcode == MEM_WB) ? "WB" : "INVL", n_mem_req_addr, n_mem_req_store_data[31:0]);
      end
 `endif
-
-
-   wire w_req2_is_store = (r_req2.op == MEM_SB)  || (r_req2.op == MEM_SH)  ||
-                          (r_req2.op == MEM_SW)  || (r_req2.op == MEM_SWL) ||
-                          (r_req2.op == MEM_SWR) || (r_req2.op == MEM_SD)  ||
-                          (r_req2.op == MEM_SDL) || (r_req2.op == MEM_SDR);
-   /* What breaks the LL/SC link on the in-order first pass (LLSC model, machine.vh).
-    * NOT MEM_LL/LLD (set it), NOT MEM_SC/SCD (clear at response after w_match_link2). */
-`ifdef LLSC_BREAK_ON_LOAD
-   /* R10000 (p.27): ANY intervening normal load/store breaks the link. */
-   wire w_req2_breaks_link = (r_req2.op != MEM_LL)   && (r_req2.op != MEM_LLD) &&
-                             (r_req2.op != MEM_SC)    && (r_req2.op != MEM_SCD) &&
-                             (r_req2.op != MEM_TLBP)  && (r_req2.op != MEM_INVL) &&
-                             (r_req2.op != MEM_MOV);
-`else
-   /* BERI/CHERI (default): only a STORE to the linked line breaks the link. */
-   wire w_req2_breaks_link = w_req2_is_store && w_match_link2;
-`endif
-   always_ff@(posedge clk)
-     begin
-	if(reset || clr_link_reg)
-	  begin
-	     r_link_reg_val <= 1'b0;
-	     r_link_reg <= 'd0;
-	  end
-	/* Track the link at the IN-ORDER first pass (port2 = core_mem_req ingress);
-	 * misses replay via port1, which is OOO and must NOT touch the link. */
-	else if(r_got_req2 && (r_req2.op == MEM_LL || r_req2.op == MEM_LLD))
-	  begin
-	     r_link_reg_val <= 1'b1;
-	     r_link_reg <= {r_req2.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
-	  end
-	else if(n_core_mem_rsp_valid && r_got_req2 && (r_req2.op == MEM_SC || r_req2.op == MEM_SCD))
-	  begin
-	     /* SC/SCD: clear at its response, after the w_match_link2 check below */
-	     r_link_reg_val <= 1'b0;
-	  end
-	else if(r_got_req2 && w_req2_breaks_link && !r_req2.commit)
-	  begin
-	     /* in-order first pass breaks the link (model selected above) */
-	     r_link_reg_val <= 1'b0;
-	  end
-     end
 
 
    always_ff@(posedge clk)
@@ -1049,13 +960,6 @@ endfunction
 	 * mark it unmapped so the replay refills from / re-tags with the PA and
 	 * does NOT translate it a second time. */
 	t_remapped_req2.mapped = 1'b0;
-	/* merge loads (LWL/LWR/LDL/LDR) take their register merge value from
-	 * their LSU slot; MQ entries and direct fills carry it in .data */
-	if(r_req2.op == MEM_LWL || r_req2.op == MEM_LWR ||
-	   r_req2.op == MEM_LDL || r_req2.op == MEM_LDR)
-	  begin
-	     t_remapped_req2.data = r_sb_data[r_req2.lsu_idx];
-	  end
      end
 
    /* ---------------- LSU store buffer (payload only) ----------------
@@ -1070,7 +974,6 @@ endfunction
    logic [15:0] 	 r_sb_mask[N_LSU-1:0];
    mem_op_t		 r_sb_op[N_LSU-1:0];
    logic [N_LSU-1:0] 	 r_sb_cached;
-   logic [N_LSU-1:0] 	 r_sb_scok;       /* SC/SCD: link held at the address pass */
    logic [63:0] 	 r_sb_data[N_LSU-1:0];
    logic 		 t_sb_wr;
    /* pipetrace: the port-2 / port-1 outcome for this cycle's op (0 = none) */
@@ -1088,7 +991,6 @@ endfunction
 	     r_sb_mask[r_req2.lsu_idx] <= make_mask(r_req2);
 	     r_sb_op[r_req2.lsu_idx] <= r_req2.op;
 	     r_sb_cached[r_req2.lsu_idx] <= t_remapped_req2.cached;
-	     r_sb_scok[r_req2.lsu_idx] <= w_match_link2;
 	  end
 	if(lsu_sb.data_valid)
 	  begin
@@ -1186,7 +1088,6 @@ endfunction
 	     t_mq_push_req.op = r_sb_op[r_req2.lsu_idx];
 	     t_mq_push_req.data = r_sb_data[r_req2.lsu_idx];
 	     t_mq_push_req.cached = r_sb_cached[r_req2.lsu_idx];
-	     t_mq_push_req.sc_ok = r_sb_scok[r_req2.lsu_idx];
 	     t_mq_push_req.mapped = 1'b0;
 	     t_mq_push_req.is_store = 1'b1;
 	     t_mq_push_req.bad_addr = 1'b0;
@@ -2032,109 +1933,11 @@ endfunction
 	       t_rsp_data2 = {{32{t_bswap_w32_2[31]}}, t_bswap_w32_2};
 	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
 	    end
-	  MEM_LWU:
-	    begin
-	       t_rsp_data2 = {32'd0, t_bswap_w32_2};
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end
-	  MEM_LL:
-	    begin
-	       t_rsp_data2 = {{32{t_bswap_w32_2[31]}}, t_bswap_w32_2};
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end
-	  MEM_LLD:
-	    begin
-	       t_rsp_data2 = bswap64(select_cl64(t_data2, r_req2.addr[DWORD_START]));
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end
 	  MEM_LD:
 	    begin
 	       t_rsp_data2 = bswap64(select_cl64(t_data2, r_req2.addr[DWORD_START]));
 	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
 	    end
-	  MEM_LWR:
-	    begin
-	       case(r_req2.addr[1:0])
-		 2'd0:
-		   begin
-		      t_rsp_data2 = {{32{t_remapped_req2.data[31]}}, t_remapped_req2.data[31:8], t_bswap_w32_2[31:24]};
-		   end
-		 2'd1:
-		   begin
-		      t_rsp_data2 = {{32{t_remapped_req2.data[31]}}, t_remapped_req2.data[31:16], t_bswap_w32_2[31:16]};
-		   end
-		 2'd2:
-		   begin
-		      t_rsp_data2 = {{32{t_remapped_req2.data[31]}}, t_remapped_req2.data[31:24], t_bswap_w32_2[31:8]};				       
-		   end
-		 2'd3:
-		   begin
-		      t_rsp_data2 = {{32{t_bswap_w32_2[31]}}, t_bswap_w32_2};
-		   end
-	       endcase // case (r_req.addr[1:0])
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end
-	  MEM_LWL:
-	    begin
-	       case(r_req2.addr[1:0])
-		 2'd0:
-		   begin
-		      t_rsp_data2 = {{32{t_bswap_w32_2[31]}}, t_bswap_w32_2};
-		   end
-		 2'd1:
-		   begin
-		      t_rsp_data2 = {{32{t_bswap_w32_2[23]}}, t_bswap_w32_2[23:0], t_remapped_req2.data[7:0]};
-		   end
-		 2'd2:
-		   begin
-		      t_rsp_data2 = {{32{t_bswap_w32_2[15]}}, t_bswap_w32_2[15:0], t_remapped_req2.data[15:0]};
-		   end
-		 2'd3:
-		   begin
-		      t_rsp_data2 = {{32{t_bswap_w32_2[7]}}, t_bswap_w32_2[7:0], t_remapped_req2.data[23:0]};
-		   end
-	       endcase // case (r_req.addr[1:0])
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;	       
-	    end // case: MEM_LWL
-	  MEM_LDL:
-	    begin
-	       /* Doubleword-aligned base: high word (MSW, lower addr) at dw_hi_idx,
-		* low word (LSW, higher addr) at dw_hi_idx+1.
-		* t_dword[63:56]=byte0(lowest addr) .. t_dword[7:0]=byte7(highest addr). */
-	       begin
-		  logic [63:0] 		       t_dword;
-		  t_dword = bswap64(select_cl64(t_data2, r_req2.addr[DWORD_START]));
-		  case(r_req2.addr[2:0])
-		    3'd0: t_rsp_data2 = t_dword;
-		    3'd1: t_rsp_data2 = {t_dword[55:0], t_remapped_req2.data[7:0]};
-		    3'd2: t_rsp_data2 = {t_dword[47:0], t_remapped_req2.data[15:0]};
-		    3'd3: t_rsp_data2 = {t_dword[39:0], t_remapped_req2.data[23:0]};
-		    3'd4: t_rsp_data2 = {t_dword[31:0], t_remapped_req2.data[31:0]};
-		    3'd5: t_rsp_data2 = {t_dword[23:0], t_remapped_req2.data[39:0]};
-		    3'd6: t_rsp_data2 = {t_dword[15:0], t_remapped_req2.data[47:0]};
-		    3'd7: t_rsp_data2 = {t_dword[7:0],  t_remapped_req2.data[55:0]};
-		  endcase
-	       end
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end // case: MEM_LDL
-	  MEM_LDR:
-	    begin
-	       begin
-		  logic [63:0] 		       t_dword;
-		  t_dword = bswap64(select_cl64(t_data2, r_req2.addr[DWORD_START]));
-		  case(r_req2.addr[2:0])
-		    3'd0: t_rsp_data2 = {t_remapped_req2.data[63:8],  t_dword[63:56]};
-		    3'd1: t_rsp_data2 = {t_remapped_req2.data[63:16], t_dword[63:48]};
-		    3'd2: t_rsp_data2 = {t_remapped_req2.data[63:24], t_dword[63:40]};
-		    3'd3: t_rsp_data2 = {t_remapped_req2.data[63:32], t_dword[63:32]};
-		    3'd4: t_rsp_data2 = {t_remapped_req2.data[63:40], t_dword[63:24]};
-		    3'd5: t_rsp_data2 = {t_remapped_req2.data[63:48], t_dword[63:16]};
-		    3'd6: t_rsp_data2 = {t_remapped_req2.data[63:56], t_dword[63:8]};
-		    3'd7: t_rsp_data2 = t_dword;
-		  endcase
-	       end
-	       t_rsp_dst_valid2 = r_req2.dst_valid & t_hit_cache2;
-	    end // case: MEM_LDR
 	  default:
 	    begin
 	    end
@@ -2225,152 +2028,12 @@ endfunction
 	       t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
 	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
 	    end
-	  MEM_LWU:
-	    begin
-	       t_rsp_data = {32'd0, t_bswap_w32};
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end
-	  MEM_LL:
-	    begin
-	       t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end
-	  MEM_LLD:
-	    begin
-	       t_rsp_data = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end
 	  MEM_LD:
 	    begin
 	       /* High word at addr, low word at addr+4 (big-endian doubleword). */
 	       t_rsp_data = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
 	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
 	    end
-	  MEM_LWR:
-	    begin
-	       case(r_req.addr[1:0])
-		 2'd0:
-		   begin
-		      t_rsp_data = {{32{r_req.data[31]}}, r_req.data[31:8], t_bswap_w32[31:24]};
-		   end
-		 2'd1:
-		   begin
-		      t_rsp_data = {{32{r_req.data[31]}}, r_req.data[31:16], t_bswap_w32[31:16]};
-		   end
-		 2'd2:
-		   begin
-		      t_rsp_data = {{32{r_req.data[31]}}, r_req.data[31:24], t_bswap_w32[31:8]};				       
-		   end
-		 2'd3:
-		   begin
-		      t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
-		   end
-	       endcase // case (r_req.addr[1:0])
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end
-	  MEM_LWL:
-	    begin
-	       case(r_req.addr[1:0])
-		 2'd0:
-		   begin
-		      t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
-		   end
-		 2'd1:
-		   begin
-		      t_rsp_data = {{32{t_bswap_w32[23]}}, t_bswap_w32[23:0], r_req.data[7:0]};
-		   end
-		 2'd2:
-		   begin
-		      t_rsp_data = {{32{t_bswap_w32[15]}}, t_bswap_w32[15:0], r_req.data[15:0]};
-		   end
-		 2'd3:
-		   begin
-		      t_rsp_data = {{32{t_bswap_w32[7]}}, t_bswap_w32[7:0], r_req.data[23:0]};
-		   end
-	       endcase // case (r_req.addr[1:0])
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;	       
-	    end // case: MEM_LWL
-	  MEM_LDL:
-	    begin
-	       /* Doubleword-aligned base: high word (MSW, lower addr) at dw_hi_idx,
-		* low word (LSW, higher addr) at dw_hi_idx+1.
-		* t_dword[63:56]=byte0(lowest addr) .. t_dword[7:0]=byte7(highest addr). */
-	       begin
-		  logic [63:0] 		       t_dword;
-		  t_dword = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
-		  case(r_req.addr[2:0])
-		    3'd0: t_rsp_data = t_dword;
-		    3'd1: t_rsp_data = {t_dword[55:0], r_req.data[7:0]};
-		    3'd2: t_rsp_data = {t_dword[47:0], r_req.data[15:0]};
-		    3'd3: t_rsp_data = {t_dword[39:0], r_req.data[23:0]};
-		    3'd4: t_rsp_data = {t_dword[31:0], r_req.data[31:0]};
-		    3'd5: t_rsp_data = {t_dword[23:0], r_req.data[39:0]};
-		    3'd6: t_rsp_data = {t_dword[15:0], r_req.data[47:0]};
-		    3'd7: t_rsp_data = {t_dword[7:0],  r_req.data[55:0]};
-		  endcase
-	       end
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end // case: MEM_LDL
-	  MEM_LDR:
-	    begin
-	       begin
-		  logic [63:0] 		       t_dword;
-		  t_dword = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
-		  case(r_req.addr[2:0])
-		    3'd0: t_rsp_data = {r_req.data[63:8],  t_dword[63:56]};
-		    3'd1: t_rsp_data = {r_req.data[63:16], t_dword[63:48]};
-		    3'd2: t_rsp_data = {r_req.data[63:24], t_dword[63:40]};
-		    3'd3: t_rsp_data = {r_req.data[63:32], t_dword[63:32]};
-		    3'd4: t_rsp_data = {r_req.data[63:40], t_dword[63:24]};
-		    3'd5: t_rsp_data = {r_req.data[63:48], t_dword[63:16]};
-		    3'd6: t_rsp_data = {r_req.data[63:56], t_dword[63:8]};
-		    3'd7: t_rsp_data = t_dword;
-		  endcase
-	       end
-	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
-	    end // case: MEM_LDR
-	  MEM_SDL:
-	    begin
-	       begin
-		  logic [63:0] 		       t_dword, t_sdl_merged;
-		  t_dword = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
-		  /* SDL: store rt's high bytes at positions [ma..7]; preserve mem [0..ma-1].
-		   * For ma=k: merged = {t_dword[63:64-k*8], data[63:k*8]}
-		   * (top k bytes from memory, bottom (8-k) bytes = data shifted right k bytes). */
-		  case(r_req.addr[2:0])
-		    3'd0: t_sdl_merged = r_req.data;
-		    3'd1: t_sdl_merged = {t_dword[63:56], r_req.data[63:8]};
-		    3'd2: t_sdl_merged = {t_dword[63:48], r_req.data[63:16]};
-		    3'd3: t_sdl_merged = {t_dword[63:40], r_req.data[63:24]};
-		    3'd4: t_sdl_merged = {t_dword[63:32], r_req.data[63:32]};
-		    3'd5: t_sdl_merged = {t_dword[63:24], r_req.data[63:40]};
-		    3'd6: t_sdl_merged = {t_dword[63:16], r_req.data[63:48]};
-		    3'd7: t_sdl_merged = {t_dword[63:8],  r_req.data[63:56]};
-		  endcase
-		  t_array_data = merge_cl64(t_data, bswap64(t_sdl_merged), r_req.addr[DWORD_START]);
-	       end
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
-	    end // case: MEM_SDL
-	  MEM_SDR:
-	    begin
-	       begin
-		  logic [63:0] 		       t_dword, t_sdr_merged;
-		  t_dword = bswap64(select_cl64(t_data, r_req.addr[DWORD_START]));
-		  /* SDR: store rt's low bytes at positions [0..ma]; preserve mem [ma+1..7] */
-		  case(r_req.addr[2:0])
-		    3'd0: t_sdr_merged = {r_req.data[7:0],  t_dword[55:0]};
-		    3'd1: t_sdr_merged = {r_req.data[15:0], t_dword[47:0]};
-		    3'd2: t_sdr_merged = {r_req.data[23:0], t_dword[39:0]};
-		    3'd3: t_sdr_merged = {r_req.data[31:0], t_dword[31:0]};
-		    3'd4: t_sdr_merged = {r_req.data[39:0], t_dword[23:0]};
-		    3'd5: t_sdr_merged = {r_req.data[47:0], t_dword[15:0]};
-		    3'd6: t_sdr_merged = {r_req.data[55:0], t_dword[7:0]};
-		    3'd7: t_sdr_merged = r_req.data;
-		  endcase
-		  t_array_data = merge_cl64(t_data, bswap64(t_sdr_merged), r_req.addr[DWORD_START]);
-	       end
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
-	    end // case: MEM_SDR
 	  MEM_SB:
 	    begin
 	       case(r_req.addr[1:0])
@@ -2418,68 +2081,6 @@ endfunction
 	    begin
 	       /* High word at addr, low word at addr+4 (big-endian doubleword). */
 	       t_array_data = merge_cl64(t_data, bswap64(r_req.data[63:0]), r_req.addr[DWORD_START]);
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
-	    end
-	  MEM_SC:
-	    begin
-	       /* A FAILED SC must not merge its store data into t_array_data: that data
-		* is forwarded to a same-line load via r_array_wr_data (store->load
-		* forwarding, see r_must_forward) even though the array write is gated
-		* off.  Keep the line unchanged so a failed SC is invisible to a later load. */
-	       t_array_data = r_req.sc_ok ? merge_cl32(t_data, bswap32(r_req.data[31:0]), r_req.addr[WORD_STOP-1:WORD_START]) : t_data;
-	       t_rsp_data = 'd0;
-	       t_rsp_dst_valid = 1'b0;
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload) && r_req.sc_ok;
-	    end
-	  MEM_SCD:
-	    begin
-	       t_array_data = r_req.sc_ok ? merge_cl64(t_data, bswap64(r_req.data[63:0]), r_req.addr[DWORD_START]) : t_data;
-	       t_rsp_data = 'd0;
-	       t_rsp_dst_valid = 1'b0;
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload) && r_req.sc_ok;
-	    end
-	  MEM_SWR:
-	    begin
-	       case(r_req.addr[1:0])
-		 2'd0:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({r_req.data[7:0], t_bswap_w32[23:0]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd1:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({r_req.data[15:0], t_bswap_w32[15:0]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd2:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({r_req.data[23:0], t_bswap_w32[7:0]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd3:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32(r_req.data[31:0]), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-	       endcase // case (r_req.addr[1:0])
-	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
-	    end
-	  MEM_SWL:
-	    begin
-	       case(r_req.addr[1:0])
-		 2'd0:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32(r_req.data[31:0]), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd1:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({t_bswap_w32[31:24], r_req.data[31:8]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd2:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({t_bswap_w32[31:16], r_req.data[31:16]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-		 2'd3:
-		   begin
-		      t_array_data = merge_cl32(t_data, bswap32({t_bswap_w32[31:8], r_req.data[31:24]}), r_req.addr[WORD_STOP-1:WORD_START]);
-		   end
-	       endcase // case (r_req.addr[1:0])
 	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
 	    end
 	  default:
@@ -2635,7 +2236,7 @@ endfunction
 `else
 	t_port2_hit_cache = r_valid_out2 && (r_tag_out2 == w_tlb_tag2);
 `endif
-	t_mem_req_mask = unc_st_mask(r_req);
+	t_mem_req_mask = make_mask(r_req);
 	n_state = r_state;
 	n_prb_seen = r_prb_seen & probe_req;
 	n_prb_ack = 1'b0;
@@ -2955,14 +2556,6 @@ endfunction
 			  * retires, then commits it */
 			 t_sb_wr = 1'b1;
 			 n_core_mem_rsp.dst_valid = 1'b0;
-			 if(r_req2.op == MEM_SC || r_req2.op == MEM_SCD)
-			   begin
-			      /* SC/SCD: answer the reservation (link) now; the commit writes
-			       * only if it held (sc_ok). Do NOT require a cache hit, else a
-			       * conflict-displaced line livelocks the SC (rv64core MEM_SCD). */
-			      n_core_mem_rsp.data = {{(`MEM_WIDTH-1){1'b0}}, w_match_link2};
-			      n_core_mem_rsp.dst_valid = r_req2.dst_valid;
-			   end
 			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
 			 n_core_mem_rsp.tlb_index = w_tlb_index;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
@@ -3231,26 +2824,6 @@ endfunction
 			   begin
 			      n_mem_req_cacheable = 1'b0;
 			      n_mem_req_mask = t_mem_req_mask;
-			      if(r_req.op == MEM_SWR)
-				begin
-				   $display("SWR addr[3:0] = %x, {addr[3:2],2'd0} = %x, bits %x, mask = %b", 
-					    r_req.addr[3:0],
-					    {r_req.addr[3:2], 2'd0},
-					    r_req.addr[1:0],
-					    n_mem_req_mask);
-				   //$stop();
-				   
-				end
-			 if(r_req.op == MEM_SWL)
-			   begin
-			      $display("SWL addr[3:0] = %x, {addr[3:2],2'd0} = %x, bits %x, mask = %b", 
-				       r_req.addr[3:0],
-				       {r_req.addr[3:2], 2'd0},
-				       r_req.addr[1:0],
-				       n_mem_req_mask);
-			      //$stop();
-			      
-			   end			 
 			 n_state = r_req.is_store ? INJECT_UNCACHE_STORE : INJECT_UNCACHE_LOAD;
 			 n_mem_req_valid = 1'b1;
 			 n_mem_req_opcode = r_req.is_store ? MEM_SW : MEM_LW;

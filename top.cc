@@ -6,18 +6,14 @@
  * stream writes back (and the memory image the RTL's memory port serves); ss =
  * the checker ISS (interpret.cc), stepped once per retired instruction.
  *
- * NOTE: the RTL is still the r9999 MIPS core until decode_sparc.sv lands
- * (SPARC_V8_PLAN.md phase 2), so the checker diverges on the first retire for
- * now.  Devices: none yet -- the memory port is RAM only (sun4m.cc devices get
- * wired in once the RTL issues SPARC physical addresses). */
+ * Devices: none yet -- the memory port is RAM only (sun4m.cc devices get wired
+ * in with the SRMMU / sun4m phase). */
 
 bool globals::enClockFuncts = false;
-uint64_t globals::icountMIPS = 0;
 uint64_t globals::cycle = 0;
 bool globals::trace_retirement = false;
 bool globals::trace_fp = false;
 bool globals::report_syscalls = false;
-bool globals::ip28 = false;
 
 static state_t *s = nullptr;
 static state_t *ss = nullptr;
@@ -46,10 +42,7 @@ extern "C" {
   long long loadtlb(int entry, int field)       { (void)entry; (void)field; return 0; }
 }
 
-/* MIPS-era co-sim hooks still imported by the RTL (itlb.sv TLB mirror, l1d.sv
- * ENABLE_STORE_CHECK); no SPARC consumer yet */
-extern "C" void tlb_wr_log(int, long long, long long, long long, int) {
-}
+/* l1d.sv's co-sim hooks (ENABLE_STORE_CHECK etc.); no SPARC consumer yet */
 extern "C" void wr_log(long long, int, unsigned long long, unsigned long long, int) {
 }
 extern "C" void l1d_wb_log(unsigned long long, unsigned long long, unsigned long long) {

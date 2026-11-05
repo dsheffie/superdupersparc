@@ -173,7 +173,6 @@ module core_l1d_l1i(clk,
    logic [(`M_WIDTH-1):0] 	restart_npc;
    logic 			restart_npc_valid;
    logic 			restart_valid;
-   logic 			clr_link_reg;
    logic 			restart_ack;
    logic [`LG_BPU_TBL_SZ-1:0] 	branch_bpu_idx;
    logic 			took_branch;
@@ -975,7 +974,6 @@ module core_l1d_l1i(clk,
 	       .retired_rob_ptr(retired_rob_ptr),
 	       .retired_rob_ptr_two(retired_rob_ptr_two),
 	       .restart_valid(restart_valid),
-	       .clr_link_reg(clr_link_reg),
 	       .memq_empty(memq_empty),
 	       .dbg_rob_inflight(w_l1d_dbg_rob),
 	       .drain_ds_complete(drain_ds_complete),
@@ -1170,7 +1168,6 @@ module core_l1d_l1i(clk,
 	     .restart_src_pc(),
 	     .restart_src_is_indirect(),
 	     .restart_valid(restart_valid),
-	     .clr_link_reg(clr_link_reg),
 	     .restart_ack(restart_ack),
 
 	     .core_mem_req_ack(core_mem_req_ack),

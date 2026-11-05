@@ -123,7 +123,6 @@ module core(clk,
 	    restart_src_pc,
 	    restart_src_is_indirect,
 	    restart_valid,
-	    clr_link_reg,
 	    restart_ack,
 	    core_mem_req_ack,
 	    core_mem_req,
@@ -307,7 +306,6 @@ module core(clk,
    output logic [(`M_WIDTH-1):0] restart_src_pc;
    output logic 		 restart_src_is_indirect;
    output logic 		 restart_valid;
-   output logic			 clr_link_reg;
    input logic 			 restart_ack;
    
    output logic [(`M_WIDTH-1):0] branch_pc;
@@ -606,8 +604,6 @@ module core(clk,
       r.pc = e.pc;
       r.is_br = e.is_br;
       r.is_indirect = e.is_indirect;
-      r.is_break = e.is_break;
-      r.is_syscall = e.is_syscall;
       r.is_cache = e.is_cache;
       r.cache_act = e.cache_act;
       r.opcode = e.opcode;
@@ -695,8 +691,6 @@ module core(clk,
       r.is_br = m.is_br;
       r.is_indirect = m.is_indirect;
       r.take_br = c.take_br;
-      r.is_break = m.is_break;
-      r.is_syscall = m.is_syscall;
       r.is_cache = m.is_cache;
       r.cache_act = m.cache_act;
       r.data = c.data;
@@ -1932,12 +1926,6 @@ module core(clk,
    assign dead_rob_mask = r_rob_dead_insns;
    assign restart_valid = r_restart_valid;
 
-   /* clr_link_reg: pulse on exception (WRITE_EPC) or ERET retirement only.
-    * Branch mispredictions must NOT clear the link register. */
-   assign clr_link_reg = (r_state == WRITE_EPC) ||
-                         (r_state == ACTIVE && t_can_retire_rob_head &&
-                          t_rob_head.faulted && !t_arch_fault &&
-                          t_rob_head.opcode == ERET);
 
    
    assign branch_pc = r_branch_pc;
@@ -2631,9 +2619,7 @@ module core(clk,
 	  end
 
 	t_arch_fault = t_rob_head.faulted & 
-		       (t_rob_head.is_break | 
-			t_rob_head.is_syscall | 
-			t_rob_head.is_ii |
+		       (t_rob_head.is_ii |
 			t_rob_head.is_cpu |
 			t_rob_head.is_fpe |
 			t_rob_head.is_bad_addr |
@@ -3700,8 +3686,6 @@ module core(clk,
 	t_rob_tail.is_call = t_alloc_uop.is_call;
 	t_rob_tail.is_irq = t_alloc_uop.op == IRQ;
 	t_rob_tail.is_ret = t_alloc_uop.is_ret;
-	t_rob_tail.is_break  = (t_alloc_uop.op == BREAK);
-	t_rob_tail.is_syscall  = (t_alloc_uop.op == SYSCALL);
 	t_rob_tail.is_cache  = t_alloc_uop.is_cache;
 	t_rob_tail.cache_act = t_alloc_uop.cache_act;
 	t_rob_tail.is_indirect = (t_alloc_uop.op == S_JMPL);
@@ -3760,8 +3744,6 @@ module core(clk,
 	t_rob_next_tail.is_irq = t_alloc_uop2.op == IRQ;
 	
 	t_rob_next_tail.is_ret = t_alloc_uop2.is_ret;
-	t_rob_next_tail.is_break = (t_alloc_uop2.op == BREAK);
-	t_rob_next_tail.is_syscall = (t_alloc_uop2.op == SYSCALL);
 	t_rob_next_tail.is_cache = t_alloc_uop2.is_cache;
 	t_rob_next_tail.cache_act = t_alloc_uop2.cache_act;
 	t_rob_next_tail.is_tlbp = (t_alloc_uop2.op == TLBP);
@@ -5509,12 +5491,12 @@ module core(clk,
    // P-mode-hazard: a Reserved-Instruction fault must commit in the mode it was
    // fetched in; a mismatch is a stale-mode RI restart-on-commit should have squashed.
    always_ff@(posedge clk)
-     if(!reset && (r_state == ARCH_FAULT) && t_rob_head.is_ii && !t_rob_head.is_break && !t_rob_head.is_syscall)
+     if(!reset && (r_state == ARCH_FAULT) && t_rob_head.is_ii)
        assert(t_rob_head.mode_when_fetched == w_in_64b_mode);
    // cover: can the BMC reach a committed Reserved Instruction (the P-mode-hazard gate)?
    always_ff@(posedge clk)
      if(!reset)
-       cover((r_state == ARCH_FAULT) && t_rob_head.is_ii && !t_rob_head.is_break && !t_rob_head.is_syscall);
+       cover((r_state == ARCH_FAULT) && t_rob_head.is_ii);
 `endif
 
 

@@ -51,8 +51,6 @@ typedef struct packed {
    logic 			 is_br;
    logic 			 is_indirect;
    logic 			 take_br;
-   logic 			 is_break;
-   logic			 is_syscall;
    logic			 is_cache;   /* MIPS CACHE op (serializing flush) */
    cache_act_t		 cache_act;  /* what the CACHE op does at retire (machine.vh) */
    logic [(`MEM_WIDTH-1):0]	 data;
@@ -131,8 +129,6 @@ typedef struct packed {
    logic [(`M_WIDTH-1):0] pc;
    logic is_br;
    logic is_indirect;
-   logic is_break;
-   logic is_syscall;
    logic is_cache;
    cache_act_t cache_act;
    logic [8:0] opcode;
@@ -282,7 +278,6 @@ typedef struct packed {
     * (commits are never dead and are exempt) */
    logic 		       restart_id;
    /* SC/SCD commit: the reservation held at its address pass (write only if set) */
-   logic 		       sc_ok;
    /* load: plain stores older than it at issue, with their slot epochs */
    logic [(1<<`LG_MEM_SCHED_ENTRIES)-1:0] lsu_older_st;
    logic [(1<<`LG_MEM_SCHED_ENTRIES)-1:0] lsu_older_ep;

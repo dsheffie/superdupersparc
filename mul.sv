@@ -17,7 +17,6 @@ module mul(clk,
 	   go,
 	   src_A,
 	   src_B,
-	   is_32b,
 	   rob_ptr_in,
 	   hilo_prf_ptr_in,
 	   dst_ptr_in,
@@ -40,7 +39,6 @@ module mul(clk,
    
    input logic [W-1:0] src_A;
    input logic [W-1:0] src_B;
-   input logic	       is_32b;
    input logic [`LG_ROB_ENTRIES-1:0] rob_ptr_in;
    input logic [`LG_HILO_PRF_ENTRIES-1:0] hilo_prf_ptr_in;
    /* SPARC: rd (the low word) and whether icc is written, carried to the
@@ -60,7 +58,6 @@ module mul(clk,
    output logic 			  cc_out;
    
    logic [`MUL_LAT:0] 			   r_complete;
-   logic [`MUL_LAT:0]			   r_is_32b;
    logic [`MUL_LAT:0] 			   r_hilo_val;
    logic [`LG_HILO_PRF_ENTRIES-1:0] 	   r_hilo_ptr[`MUL_LAT:0];
    logic [`LG_ROB_ENTRIES-1:0] 		   r_rob_ptr[`MUL_LAT:0];
@@ -81,31 +78,13 @@ module mul(clk,
    logic [(2*W)-1:0] 			   t_mul;
    logic [(2*W)-1:0]			   r_mul[`MUL_LAT:0];
 
-   wire [63:0]				   w_mul32b_lo = {{32{r_mul[`MUL_LAT][31]}}, r_mul[`MUL_LAT][31:0]};
-   wire [63:0]				   w_mul32b_hi = {{32{r_mul[`MUL_LAT][63]}}, r_mul[`MUL_LAT][63:32]};
-
-   wire [`M_WIDTH-1:0]			   w_src_A, w_src_B;
-   generate
-      if(`M_WIDTH == 64)
-	begin
-	   assign   w_src_A = is_32b ? {32'd0, src_A[31:0]} : src_A;
-	   assign   w_src_B = is_32b ? {32'd0, src_B[31:0]} : src_B;
-	end
-      else
-	begin
-	   assign w_src_A = src_A;
-	   assign w_src_B = src_B;
-	end
-   endgenerate
-
    /* Sign/zero-extend inputs to 2W bits so the product is a full 2W-bit result.
     * Without this, SV truncates the W*W multiply to W bits and the HI half is wrong. */
    wire signed [(2*W)-1:0] w_signed_A = {{W{src_A[W-1]}}, src_A};
    wire signed [(2*W)-1:0] w_signed_B = {{W{src_B[W-1]}}, src_B};
-   wire        [(2*W)-1:0] w_unsigned_A = {{W{1'b0}}, w_src_A};
-   wire        [(2*W)-1:0] w_unsigned_B = {{W{1'b0}}, w_src_B};
+   wire        [(2*W)-1:0] w_unsigned_A = {{W{1'b0}}, src_A};
+   wire        [(2*W)-1:0] w_unsigned_B = {{W{1'b0}}, src_B};
 
-   wire [127:0]				   w_mul32b = {w_mul32b_hi, w_mul32b_lo};
    always_comb
      begin
 	t_mul = is_signed ? (w_signed_A * w_signed_B) : (w_unsigned_A * w_unsigned_B);
@@ -123,16 +102,7 @@ module mul(clk,
    // 	  end
    //   end
 
-   generate
-      if(`M_WIDTH == 64)
-	begin
-	   assign y = r_is_32b[`MUL_LAT] ? w_mul32b : r_mul[`MUL_LAT];
-	end
-      else
-	begin
-	   assign y = r_mul[`MUL_LAT];
-	end
-   endgenerate
+   assign y = r_mul[`MUL_LAT];
    
 
    always_ff@(posedge clk)
@@ -164,7 +134,6 @@ module mul(clk,
 	     r_dst_val <= 'd0;
 	     r_cc <= 'd0;
 	     r_hilo_val <= 'd0;
-	     r_is_32b <= 'd0;
 	  end
 	else
 	  begin
@@ -176,7 +145,6 @@ module mul(clk,
 		       r_rob_ptr[0] <= rob_ptr_in;
 		       r_hilo_val[0] <= go;
 		       r_hilo_ptr[0] <= hilo_prf_ptr_in;
-		       r_is_32b[0] <= is_32b;
 		       r_dst_ptr[0] <= dst_ptr_in;
 		       r_dst_val[0] <= go & dst_val_in;
 		       r_cc[0] <= cc_in;
@@ -187,7 +155,6 @@ module mul(clk,
 		       r_rob_ptr[i] <= r_rob_ptr[i-1];
 		       r_hilo_val[i] <= r_hilo_val[i-1];
 		       r_hilo_ptr[i] <= r_hilo_ptr[i-1];
-		       r_is_32b[i] <= r_is_32b[i-1];
 		       r_dst_ptr[i] <= r_dst_ptr[i-1];
 		       r_dst_val[i] <= r_dst_val[i-1];
 		       r_cc[i] <= r_cc[i-1];

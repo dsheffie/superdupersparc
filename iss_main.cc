@@ -17,12 +17,10 @@
 
 namespace globals {
   bool enClockFuncts = false;
-  uint64_t icountMIPS = 0;
   uint64_t cycle = 0;
   bool trace_retirement = false;
   bool trace_fp = false;
   bool report_syscalls = false;
-  bool ip28 = false;
 };
 
 int main(int argc, char *argv[]) {

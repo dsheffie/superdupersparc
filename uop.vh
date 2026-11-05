@@ -5,46 +5,7 @@
 
 typedef enum logic [8:0]
   {
-   SLL = 'd0, //0
-   SRL = 'd1, //1
-   SRA = 'd2, //2
-   SLLV = 'd3, //3
-   SRLV = 'd4,
-   SRAV = 'd5, //6
-   JR = 'd6, //7
-   JALR = 'd7,
-   MFHI = 'd8,
-   MTHI = 'd9,
-   MULT = 'd10,
-   MULTU = 'd11,
-   DIV = 'd12,
-   DIVU = 'd13,
-   ADD = 'd14,
-   ADDU = 'd15,
-   SUB = 'd16,
-   SUBU = 'd17,
-   AND = 'd18,
-   OR = 'd19,
-   XOR = 'd20,
-   NOR = 'd21,
-   SLT = 'd22,
-   SLTU = 'd23,
-   MFLO = 'd24,
-   MTLO = 'd25,
-   BEQ  = 'd26,
-   BNE  = 'd27,
-   BLEZ = 'd28,
-   BGTZ = 'd29,
-   ADDI = 'd30,
-   ADDIU = 'd31,
-   SLTI = 'd32,
-   SLTIU = 'd33,
-   ANDI = 'd34,
-   ORI = 'd35,
-   XORI = 'd36,
-   LUI = 'd37,
    J = 'd38, 
-   JAL = 'd39,
    MFC0 = 'd40,
    MTC0 = 'd41,
    MFC1 = 'd42,
@@ -57,67 +18,18 @@ typedef enum logic [8:0]
    SB = 'd49,
    SH = 'd50,
    SW = 'd51,
-   BEQL = 'd52,
-   BNEL = 'd53, 
-   BLTZ = 'd54, 
-   BGEZ = 'd55,
-   BLTZL = 'd56,
-   BGEZL = 'd57,
-   BGTZL = 'd58,
-   BLEZL = 'd59,
-   TEQ = 'd60,
-   LWL = 'd61,
-   LWR = 'd62,
-   SWL = 'd63,
-   SWR = 'd64,
-   BAL = 'd65,
-   BGEZAL = 'd66,
-   BGEZALL = 'd67,
-   SC = 'd68,
-   BREAK = 'd69,
    MTC1_MERGE = 'd70,
    MFC1_MERGE = 'd71,
-   MOVI = 'd72,
-   MOV = 'd73,
    NOP = 'd75,
    ERET = 'd76,
-   SYSCALL = 'd77,
    TLBR = 'd78,
    TLBWI = 'd79,
    TLBWR = 'd80,
    TLBP = 'd81,
-   DADD = 'd82,
-   DADDU = 'd83,
-   DSUB = 'd84,
-   DSUBU = 'd85,
-   DADDIU = 'd86,
-   DADDI = 'd87,
    LD = 'd88,
    SD = 'd89,
-   DSLL   = 'd90,
-   DSRL   = 'd91,
-   DSRA   = 'd92,
-   DSLL32 = 'd93,
-   DSRL32 = 'd94,
-   DSRA32 = 'd95,
-   DSLLV  = 'd96,
-   DSRLV  = 'd97,
-   DSRAV  = 'd98,
    DMFC0  = 'd99,
    DMTC0  = 'd100,
-   LWU    = 'd101,
-   DMULT  = 'd102,
-   DMULTU = 'd103,
-   DDIV   = 'd104,
-   DDIVU  = 'd105,
-   LDL    = 'd106,
-   LDR    = 'd107,
-   SDL    = 'd108,
-   SDR    = 'd109,
-   LL     = 'd110,
-   LLD    = 'd111,
-   SCD    = 'd112,
-   TNE    = 'd113,
    FETCH_MISALIGNED = 'd114,
    FETCH_ADDR_ERROR = 'd115,   /* i-side AdEL: access-level / VA-range violation (BadVAddr=PC, ExcCode 4) */
    FETCH_TLB_MISS = 'd116,
@@ -130,14 +42,8 @@ typedef enum logic [8:0]
    CHWBINV = 'd123,   /* CACHE D Hit-Writeback-Invalidate -- mem uop */
    CHINV = 'd124,     /* CACHE D Hit-Invalidate -- mem uop */
    /* branch-and-link REGIMM variants (BGEZAL/BGEZALL already above) */
-   BLTZAL,
-   BLTZALL,
    /* register/immediate traps (the immediate forms reuse these ops with
     * srcB_valid=0 and compare against the sign-extended imm; TEQ/TNE reused) */
-   TGE,
-   TGEU,
-   TLT,
-   TLTU,
    /* FP loads/stores */
    LWC1,
    SWC1,
@@ -210,22 +116,16 @@ typedef enum logic [8:0]
     * APPENDED AT THE END ON PURPOSE: this enum mixes explicit 'dN entries with
     * IMPLICIT ones, so inserting in the middle silently renumbers everything
     * downstream (it collided with BLTZAL/BLTZALL/TGE when tried). */
-   BEQZ,
-   BNEZ,
-   BRA,
    /* Same treatment for the register-form traps.  GCC's divide-by-zero guard is
     * exactly `teq'/`tne' against $zero (and the `break 0x7' that the SIGFPE
     * signature fires), so these were reading physreg 0 on the operand that decides
     * whether the trap fires.  TEQZ/TNEZ carry only the non-zero operand.
     * teq $0,$0 / tne $0,$0 are degenerate and stay plain TEQ/TNE. */
-   TEQZ,
-   TNEZ,
    /* Single-source bitwise complement.  `nor rd,rs,$0' is the canonical MIPS
     * `not rd,rs'.  NOR(x,x) yields the same value without reading physreg 0,
     * but still occupies TWO register read ports -- which defeats the point if
     * we ever want to exploit single-reader uops to shrink the RF port count.
     * NOT reads exactly one source. */
-   NOT,
    /* Overflow-CHECK forms of the trapping arithmetic: `add $0,rs,rt' and friends.
     * These are documented MIPS idioms -- the result is discarded but Integer
     * Overflow is STILL raised (the exception is independent of rd/rt; interpret.cc
@@ -237,12 +137,6 @@ typedef enum logic [8:0]
     * have NO destination, so they are not int-PRF writers and can never present
     * dst==0 to the bypass.  One per {overflow signal, operand-mux group}: the csa
     * operand selects in exec.sv key off the opcode and MUST list these. */
-   ADDCHK,      /* add   $0,rs,rt  -> w_add32_overflow, addend = t_srcB  */
-   ADDICHK,     /* addi  $0,rs,imm -> w_add32_overflow, addend = imm     */
-   SUBCHK,      /* sub   $0,rs,rt  -> w_sub32_overflow, addend = ~t_srcB */
-   DADDCHK,     /* dadd  $0,rs,rt  -> w_add64_overflow, addend = t_srcB  */
-   DADDICHK,    /* daddi $0,rs,imm -> w_add64_overflow, addend = imm     */
-   DSUBCHK,     /* dsub  $0,rs,rt  -> w_sub64_overflow, addend = ~t_srcB */
    /* Branch-LIKELY zero compares.  `beqzl rs' IS `beql rs,$0' and `bnezl rs' IS
     * `bnel rs,$0', so they read physreg 0 exactly like the non-likely forms that
     * BEQZ/BNEZ already fixed -- these were simply missed.  They matter in a
@@ -252,33 +146,25 @@ typedef enum logic [8:0]
     * -- IRIX being where this bug was first observed.
     * Identical to BEQZ/BNEZ except t_mispred_br also asserts when NOT taken,
     * which is how the likely form nullifies its delay slot. */
-   BEQZL,
-   BNEZL,
    /* Zero-extended immediate load.  `ori rt,$0,imm' is how gas builds any constant
     * that does not fit a signed 16-bit `li' -- measured 1935 static occurrences
     * across wc+dhrystone+big-csmith+hello, the largest remaining physreg-0 reader
     * after `move' was fixed.  MOVI cannot be reused: it SIGN-extends, so it is
     * wrong whenever imm[15] is set.  Same uop serves `xori rt,$0,imm'. */
-   MOVIU,
    /* Single-source compare-against-zero forms of slt/sltu.
     *   sltu rd,$0,rt  ==  (rt != 0)   -> SNEZ   (461 occurrences)
     *   slt  rd,$0,rt  ==  (rt >  0)   -> SGTZ   (16)
     *   slt  rd,rs,$0  ==  (rs <  0)   -> SLTZ   (0 measured; same arm, free)
     * (sltu rd,rs,$0 is unsigned `< 0' -- statically 0 -> MOVI, no uop needed.) */
-   SNEZ,
-   SGTZ,
-   SLTZ,
    /* 32-bit negate, single source.  `subu rd,$0,rt' is `negu rd,rt' -- 6039 static
     * occurrences across wc+dhrystone+big-csmith+hello, the last large physreg-0
     * reader.  Result is sign-extended like SUBU. */
-   NEG,
    /* TRAPPING negate: `sub rd,$0,rt' (gas/objdump spell it `neg rd,rt').  Unlike
     * NEG it can raise Integer Overflow -- but for exactly ONE input, rt ==
     * INT_MIN, because -INT_MIN is not representable in 32 bits.  It is NOT
     * "trap if negative": the overflow rule needs the result sign to differ from
     * the minuend's, and with a $0 minuend only 0x80000000 does that.  So the
     * whole overflow condition collapses to a single equality. */
-   NEGT,
    /* ARM-requested cache maintenance, injected by decode like an IRQ (see
     * core.sv ext_flush_req); the page's physical address rides in {jmp_imm, imm}.
     * Not architectural instructions: they never count as retired. */
@@ -287,8 +173,6 @@ typedef enum logic [8:0]
    XPG_INV,      /* one page, after a deposit: drop, no write back (L2, then L1D) */
    /* ENABLE_MIPS4 (MIPS IV): rd = (rt != 0 / == 0) ? rs : rd.  srcA = rs, srcB = rd
     * (renamed: the old rd), srcC = rt, read only as its physical register's zero flag */
-   MOVN,
-   MOVZ,
    /* ENABLE_MIPS4 (MIPS IV movt/movf): rd = (FCC[cc] == tf) ? rs : rd.  srcA = rs,
     * srcB = rd (renamed: the old rd), the renamed FCC like BC1x (fcr_src_valid,
     * hilo_src), cc in srcC (not renamed), tf in imm[0] */
@@ -429,14 +313,6 @@ typedef enum logic [8:0]
 function logic is_mult(opcode_t op);
    logic     x;
    case(op)
-     MULT:
-       x = 1'b1;
-     MULTU:
-       x = 1'b1;
-     DMULT:
-       x = 1'b1;
-     DMULTU:
-       x = 1'b1;
      S_UMUL:
        x = 1'b1;
      S_SMUL:
@@ -516,14 +392,6 @@ endfunction // is_xflush
 function logic is_div(opcode_t op);
    logic     x;
    case(op)
-     DIV:
-       x = 1'b1;
-     DIVU:
-       x = 1'b1;
-     DDIV:
-       x = 1'b1;
-     DDIVU:
-       x = 1'b1;
      S_UDIV:
        x = 1'b1;
      S_SDIV:
@@ -541,8 +409,7 @@ endfunction // is_div
 /* the stores the LSU holds until retirement and drains itself: all of them but
  * the CACHE ops (serializing, answered when done) */
 function logic is_lsu_store(opcode_t op);
-   return (op == SB) | (op == SH) | (op == SW) | (op == SD) | (op == SWC1) | (op == SDC1) |
-	  (op == SWL) | (op == SWR) | (op == SDL) | (op == SDR) | (op == SC) | (op == SCD);
+   return (op == SB) | (op == SH) | (op == SW) | (op == SD) | (op == SWC1) | (op == SDC1);
 endfunction
 
 function logic is_store(opcode_t op);
@@ -554,19 +421,7 @@ function logic is_store(opcode_t op);
        x = 1'b1;
      SW:
        x = 1'b1;
-     SC:
-       x = 1'b1;
-     SWR:
-       x = 1'b1;
-     SWL:
-       x = 1'b1;
      SD:
-       x = 1'b1;
-     SDL:
-       x = 1'b1;
-     SDR:
-       x = 1'b1;
-     SCD:
        x = 1'b1;
      SWC1:   /* FP stores are stores too -- exec.sv remaps SWC1->MEM_SW / SDC1->MEM_SD,
               * but t_rob_tail.is_store and t_blocked_by_store use is_store() on the
@@ -594,19 +449,7 @@ function logic is_load(opcode_t op);
        x = 1'b1;     
      LW:
        x = 1'b1;
-     LWU:
-       x = 1'b1;     
      LD:
-       x = 1'b1;
-     LWR:
-       x = 1'b1;
-     LWL:
-       x = 1'b1;
-     LDL:
-       x = 1'b1;
-     LDR:
-       x = 1'b1;
-     LLD:
        x = 1'b1;
      LWC1:   /* FP loads are loads too (exec.sv remaps LWC1->MEM_LW / LDC1->MEM_LD) */
        x = 1'b1;
