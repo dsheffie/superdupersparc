@@ -5,9 +5,6 @@
 
 typedef enum logic [8:0]
   {
-   J = 'd38, 
-   MFC0 = 'd40,
-   MTC0 = 'd41,
    MFC1 = 'd42,
    MTC1 = 'd43,
    LW = 'd44,
@@ -21,23 +18,10 @@ typedef enum logic [8:0]
    MTC1_MERGE = 'd70,
    MFC1_MERGE = 'd71,
    NOP = 'd75,
-   ERET = 'd76,
-   TLBR = 'd78,
-   TLBWI = 'd79,
-   TLBWR = 'd80,
-   TLBP = 'd81,
    LD = 'd88,
    SD = 'd89,
-   DMFC0  = 'd99,
-   DMTC0  = 'd100,
-   FETCH_MISALIGNED = 'd114,
-   FETCH_ADDR_ERROR = 'd115,   /* i-side AdEL: access-level / VA-range violation (BadVAddr=PC, ExcCode 4) */
-   FETCH_TLB_MISS = 'd116,
-   FETCH_TLB_INVALID = 'd117,
    II = 'd118,
    IRQ = 'd119,
-   CPU = 'd120,
-   CACHE_OP = 'd121,  /* MIPS CACHE: completes benignly in the ALU, then serializes to flush */
    CHWB = 'd122,      /* CACHE D Hit-Writeback -- mem uop, dtlb-translated (mapped K2SEG buffers) */
    CHWBINV = 'd123,   /* CACHE D Hit-Writeback-Invalidate -- mem uop */
    CHINV = 'd124,     /* CACHE D Hit-Invalidate -- mem uop */
@@ -327,53 +311,6 @@ function logic is_mult(opcode_t op);
    return x;
 endfunction // is_mult
 
-/* CP0 ordering: every CP0 writer bumps a sequence number at alloc and at retire
- * (core.sv r_cp0_alloc_seq / r_cp0_retire_seq); every CP0 reader snapshots the alloc
- * sequence into uop.cp0_seq and issues only once exec's commit sequence has caught up,
- * i.e. every older CP0 write has retired and committed.  Together this renames all of
- * CP0 as ONE register whose versions become ready at retire: CP0 ops are totally
- * ordered, nothing else waits on them.  (D)MTC0 data is staged per ROB entry at exec
- * and committed at retire (exec.sv r_cp0_stage_*). */
-function logic is_cp0_wr(opcode_t op);
-   logic     x;
-   case(op)
-     MTC0:
-       x = 1'b1;
-     DMTC0:
-       x = 1'b1;
-     TLBP:
-       x = 1'b1;
-     TLBR:
-       x = 1'b1;
-     default:
-       x = 1'b0;
-   endcase
-   return x;
-endfunction // is_cp0_wr
-
-function logic is_cp0_rd(opcode_t op);
-   logic     x;
-   case(op)
-     MFC0:
-       x = 1'b1;
-     DMFC0:
-       x = 1'b1;
-     TLBR:
-       x = 1'b1;
-     TLBWI:
-       x = 1'b1;
-     TLBWR:
-       x = 1'b1;
-     TLBP:
-       x = 1'b1;
-     ERET:
-       x = 1'b1;
-     default:
-       x = 1'b0;
-   endcase
-   return x;
-endfunction // is_cp0_rd
-
 function logic is_xflush(opcode_t op);
    logic     x;
    case(op)
@@ -502,7 +439,6 @@ typedef struct packed {
    logic [`M_WIDTH-1:0]        pc;
    logic [`M_WIDTH-1:0]        pred_target;
    logic [`LG_ROB_ENTRIES-1:0] rob_ptr;
-   logic [`LG_ROB_ENTRIES+1:0] cp0_seq;   /* CP0 readers: CP0 writers allocated before this op (see is_cp0_wr) */
    logic 		       serializing_op;
    logic 		       must_restart;
    logic 		       oldest_first;
@@ -514,10 +450,8 @@ typedef struct packed {
    logic 		       is_cache;   /* MIPS CACHE op (serializing flush) */
    cache_act_t 	       cache_act;  /* the CACHE op's retire-time action (machine.vh) */
    logic 		       is_fp;   /* compute FP op (routes to the FP issue queue) */
-   logic 		       cpu_ce1; /* CpU is for CP1 (Status.CU1=0) -> Cause.CE=1 (vs CP0 CpU = CE=0) */
    logic [`LG_BPU_TBL_SZ-1:0]      bpu_idx;
    logic [7:0] 	       asi;        /* SPARC memory ops: the address space identifier */
-   logic		       mode_when_fetched;
 `ifdef VERILATOR
    logic [31:0] 	       clear_id;
    logic [31:0] 	       raw_insn;   /* the fetched word, for the co-sim checker (stale-L1I fetches) */

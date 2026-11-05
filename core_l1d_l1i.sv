@@ -4,17 +4,7 @@
 
 module core_l1d_l1i(clk, 
 		    reset,
-		    ip6,
-		    ip5,
-		    ip4,
-		    ip3,
-		    ip2,
 		    retire_allowed,
-		    putchar_fifo_out,
-		    putchar_fifo_empty,
-		    putchar_fifo_pop,
-		    putchar_fifo_wptr,
-		    putchar_fifo_rptr,
 		    single_step,
 		    bp_enable,
 		    fault_clear,
@@ -40,7 +30,6 @@ module core_l1d_l1i(clk,
 		    mem_rsp_bad,		    
 		    mem_rsp_load_data,
 		    
-		    asid,
 		    retire_fp_reg_ptr,
 		    retire_fp_reg_data,
 		    retire_fp_reg_valid,
@@ -96,12 +85,8 @@ module core_l1d_l1i(clk,
 		    inflight,
 		    dbg_rob_inflight,
 		    epc,
-		    status_reg,
-		    badvaddr,
-		    cause,
 		    dbg_frozen,
 		    dbg_wp_data,
-		    cause_ip,
 		    l1i_flush_done,
 		    l1d_flush_done,
 		    l2_flush_done,
@@ -120,9 +105,6 @@ module core_l1d_l1i(clk,
 		    snoop_req_ack,
 		    snoop_req_wbinv,
 		    snoop_done,
-		    took_irq,
-		    cp0_count,
-		    cp0_random,
 		    dbg_head_pc,
 		    dbg_head_status,
 		    dbg_head_fetch_cycle,
@@ -141,17 +123,7 @@ module core_l1d_l1i(clk,
    input logic clk;
    input logic reset;
    input logic retire_allowed;
-   input logic ip6;
-   input logic ip5;
-   input logic ip4;
-   input logic ip3;
-   input logic ip2;
    
-   output logic [7:0] putchar_fifo_out;
-   output logic       putchar_fifo_empty;
-   input logic 	      putchar_fifo_pop;
-   output logic [3:0] putchar_fifo_wptr;
-   output logic [3:0] putchar_fifo_rptr;
    
    input logic single_step;
    input logic bp_enable;
@@ -214,15 +186,13 @@ module core_l1d_l1i(clk,
    
    input logic [127:0] 			  mem_rsp_load_data;
 
-   /* henry_soc taps.  `asid' is REAL -- core.sv drives it and core_l1d_l1i already
-    * receives it as w_asid, it was simply never exposed.  The rest are DEAD STUBS:
+   /* henry_soc taps.  DEAD STUBS:
     * henry_soc.sv reaches for FP/FCR retire taps, retiring-load VAs and the
     * wild-fault latch, but no r9999 core implements them (they were added on the
     * henry side and never plumbed through).  Nothing consumes them either -- the
     * on-board driver reads none of these, and the AXI wrapper touches only wf_*.
     * Tied to zero so the SoC elaborates; they READ ZERO, they are not measurements.
     * Implement them for real before trusting any register that shows them. */
-   output logic [7:0] 			  asid;
    output logic [4:0] 			  retire_fp_reg_ptr;
    output logic [`FP_WIDTH-1:0]		  retire_fp_reg_data;
    output logic 			  retire_fp_reg_valid;
@@ -241,7 +211,6 @@ module core_l1d_l1i(clk,
    output logic [31:0] 			  wf_badv;
    output logic [31:0] 			  wf_stat;
 
-   assign asid                     = w_asid;   /* real */
    assign retire_fp_reg_ptr        = 5'd0;
    assign retire_fp_reg_data       = 'd0;
    assign retire_fp_reg_valid      = 1'b0;
@@ -318,12 +287,8 @@ module core_l1d_l1i(clk,
    output logic [3:0]			  l2_rsp_state;
    
    output logic [`M_WIDTH-1:0]		  epc;
-   output logic [31:0]			  status_reg;
-   output logic [`M_WIDTH-1:0]		  badvaddr;
-   output logic [4:0]			  cause;
    output logic [2:0]			  dbg_frozen;
    output logic [31:0]			  dbg_wp_data;
-   output logic [7:0]			  cause_ip;
 
    
       
@@ -370,9 +335,6 @@ module core_l1d_l1i(clk,
    output logic		 snoop_req_ack;
    input logic 		 snoop_req_wbinv;   /* 1 = WBINV (probe + writeback + invalidate), 0 = discard */
    output logic		 snoop_done;        /* the snoop has fully completed */
-   output logic			 took_irq;
-   output logic [31:0]		 cp0_count;
-   output logic [5:0]		 cp0_random;   /* CP0 Random (co-sim checker sync) */
    output logic [31:0]  dbg_head_pc;
    output logic [31:0]  dbg_head_status;
    output logic [31:0]  dbg_head_fetch_cycle;
@@ -393,10 +355,6 @@ module core_l1d_l1i(clk,
    logic				  head_of_rob_ds_committable;
    
 
-   wire					  w_in_kernel_mode, w_in_supervisor_mode,
-					  w_in_user_mode;
-   wire					  w_in_64b_kernel_mode, w_in_64b_supervisor_mode,
-					  w_in_64b_user_mode;
    wire 				  flush_req_l1i, flush_req_l1d;
    logic 				  flush_cl_req;
    logic [`M_WIDTH-1:0] 		  flush_cl_addr;
@@ -541,7 +499,6 @@ module core_l1d_l1i(clk,
    wire 	w_l1_mem_rsp_bad;
    logic 	memq_empty;   
    assign in_flush_mode = r_flush;
-   wire [7:0] w_asid;
 
  
    always_ff@(posedge clk)
@@ -735,8 +692,6 @@ module core_l1d_l1i(clk,
    logic				  t_l2_passthru;
 
 
-   tlb_data_t tlb_entry_out;
-   logic			    tlb_entry_out_valid;
    
    wire w_l1_mem_req_ack;
    
@@ -957,13 +912,7 @@ module core_l1d_l1i(clk,
    l1d dcache (
 	       .clk(clk),
 	       .reset(reset),
-	       .asid(w_asid),	
-	       .tlb_entry_in(tlb_entry_out),
-	       .tlb_entry_in_valid(tlb_entry_out_valid),
 	       .state(l1d_state),
-	       .in_kernel_mode(w_in_kernel_mode),
-	       .in_supervisor_mode(w_in_supervisor_mode),
-	       .in_user_mode(w_in_user_mode),
 	       .head_of_rob_ptr_valid(head_of_rob_ptr_valid),
 	       .head_of_rob_ptr(head_of_rob_ptr),
 	       .head_of_rob_has_delay_slot(head_of_rob_has_delay_slot),
@@ -1037,14 +986,7 @@ module core_l1d_l1i(clk,
    l1i icache(
 	      .clk(clk),
 	      .reset(reset),
-	      .asid(w_asid),	      
 	      .state(l1i_state),
-	      .in_kernel_mode(w_in_kernel_mode),
-	      .in_supervisor_mode(w_in_supervisor_mode),
-	      .in_user_mode(w_in_user_mode),
-	      .in_64b_kernel_mode(w_in_64b_kernel_mode),
-	      .in_64b_supervisor_mode(w_in_64b_supervisor_mode),
-	      .in_64b_user_mode(w_in_64b_user_mode),
 	      .flush_req(flush_req_l1i ),
 	      .flush_line_req(w_flush_line_req_l1i),
 	      .flush_line_idx(w_flush_line_idx_l1i),
@@ -1088,30 +1030,12 @@ module core_l1d_l1i(clk,
 	      .mem_rsp_valid(l1i_mem_rsp_valid),
 	      .mem_rsp_load_data(w_l1_mem_load_data),
 	      .cache_accesses(l1i_cache_accesses),
-	      .cache_hits(l1i_cache_hits),
-	      .tlb_entry_in_valid(tlb_entry_out_valid),
-	      .tlb_entry_in(tlb_entry_out)
+	      .cache_hits(l1i_cache_hits)
 	      );
 
    core cpu (
 	     .clk(clk),
 	     .reset(reset),
-	     .ip6(ip6),
-	     .ip5(ip5),
-	     .ip4(ip4),
-	     .ip3(ip3),
-	     .ip2(ip2),
-	     .in_kernel_mode(w_in_kernel_mode),
-	     .in_supervisor_mode(w_in_supervisor_mode),
-	     .in_user_mode(w_in_user_mode),
-	     .in_64b_kernel_mode(w_in_64b_kernel_mode),
-	     .in_64b_supervisor_mode(w_in_64b_supervisor_mode),
-	     .in_64b_user_mode(w_in_64b_user_mode),
-	     .putchar_fifo_out(putchar_fifo_out),
-	     .putchar_fifo_empty(putchar_fifo_empty),
-	     .putchar_fifo_pop(putchar_fifo_pop),
-	     .putchar_fifo_wptr(putchar_fifo_wptr),
-	     .putchar_fifo_rptr(putchar_fifo_rptr),
 	     .single_step(single_step),
 	     .bp_enable(bp_enable),
 	     .fault_clear(fault_clear),
@@ -1230,21 +1154,11 @@ module core_l1d_l1i(clk,
 	     .inflight(inflight),
 	     .dbg_rob_inflight(w_core_dbg_rob),
 	     .epc(epc),
-	     .status_reg(status_reg),
-	     .badvaddr(badvaddr),
-	     .cause(cause),
 	     .dbg_frozen(dbg_frozen),
 	     .dbg_wp_data(dbg_wp_data),
-	     .cause_ip(cause_ip),
-	     .asid(w_asid),
-	     .tlb_entry_out_valid(tlb_entry_out_valid),
-	     .tlb_entry_out(tlb_entry_out),	   	     
 	     .l1i_flush_done(l1i_flush_done),
 	     .l1d_flush_done(l1d_flush_done),
 	     .l2_flush_done(l2_flush_done),
-	     .took_irq(took_irq),
-	     .cp0_count(cp0_count),
-	     .cp0_random(cp0_random),
 	     .dbg_head_pc(dbg_head_pc),
 	     .dbg_head_status(dbg_head_status),
 	     .dbg_head_fetch_cycle(dbg_head_fetch_cycle),

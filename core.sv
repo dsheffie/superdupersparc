@@ -60,22 +60,6 @@ module core(clk,
 	    bp_fault_only,
 	    rt_oneshot,
 	    reset,
-	    ip6,
-	    ip5,
-	    ip4,
-	    ip3,
-	    ip2,	   
-	    in_kernel_mode,
-	    in_supervisor_mode,
-	    in_user_mode,
-	    in_64b_kernel_mode,
-	    in_64b_supervisor_mode,
-	    in_64b_user_mode,
-	    putchar_fifo_out,
-	    putchar_fifo_empty,
-	    putchar_fifo_pop,
-	    putchar_fifo_wptr,
-	    putchar_fifo_rptr,
 	    head_of_rob_ptr_valid,
 	    head_of_rob_ptr,
 	    head_of_rob_has_delay_slot,
@@ -186,18 +170,8 @@ module core(clk,
 	    inflight,
 	    dbg_rob_inflight,
 	    epc,
-	    status_reg,
-	    badvaddr,
-	    cause,
 	    dbg_frozen,
 	    dbg_wp_data,
-	    cause_ip,
-	    asid,
-	    tlb_entry_out,
-	    tlb_entry_out_valid,
-	    took_irq,
-	    cp0_count,
-	    cp0_random,
 	    
 	    l1i_flush_done,
 	    l1d_flush_done,
@@ -215,23 +189,7 @@ module core(clk,
 
    input logic clk;
    input logic reset;
-   input logic ip6;
-   input logic ip5;
-   input logic ip4;
-   input logic ip3;
-   input logic ip2;   
-   output logic	in_kernel_mode;
-   output logic	in_supervisor_mode;
-   output logic	in_user_mode;
-   output logic	in_64b_kernel_mode;
-   output logic	in_64b_supervisor_mode;
-   output logic	in_64b_user_mode;
     
-   output logic [7:0] putchar_fifo_out;
-   output logic       putchar_fifo_empty;
-   input logic 	      putchar_fifo_pop;
-   output logic [3:0] putchar_fifo_wptr;
-   output logic [3:0] putchar_fifo_rptr;
    
    output logic head_of_rob_ptr_valid;
    output logic [`LG_ROB_ENTRIES-1:0] head_of_rob_ptr;
@@ -400,20 +358,10 @@ module core(clk,
    output logic [4:0]			  core_state;
    
    output logic [`M_WIDTH-1:0]		  epc;
-   output logic [31:0]			  status_reg;
    
-   output logic [`M_WIDTH-1:0]		  badvaddr;
    
-   output logic [4:0]			  cause;
-   output logic [7:0]			  cause_ip;
    output logic [2:0]			  dbg_frozen; /* {r_bp_hit, r_wp_hit, r_fault_hit} -- real freeze vs stall */
    output logic [31:0]			  dbg_wp_data; /* the DATA of the last store to bp_wp_addr (exact store value) */
-   output logic [7:0]			  asid;
-   output tlb_data_t		          tlb_entry_out;
-   output logic				  tlb_entry_out_valid;
-   output logic				  took_irq;
-   output logic [31:0]			  cp0_count;
-   output logic [5:0]			  cp0_random;
    
    
    output logic				  l1i_flush_done;
@@ -431,50 +379,9 @@ module core(clk,
    output logic [31:0] 			  dbg_trace_data;
    output logic [15:0] 			  dbg_trace_wptr;
 
-   assign in_64b_kernel_mode     = w_in_64b_kernel_mode;
-   assign in_64b_supervisor_mode = w_in_64b_supervisor_mode;
-   assign in_64b_user_mode       = w_in_64b_user_mode;
-
-   wire				w_in_64b_mode;
-   generate
-      if(`M_WIDTH==64)
-	begin
-	   /* must match decode_mips.sv (70538bc): 64-bit OPS are always valid in
-	    * kernel mode -- KX gates only addressing and the XTLB vector.  This copy
-	    * feeds only the P-mode-hazard guard (mode_when_fetched is decode's value)
-	    * and debug prints; still requiring KX here made the guard fire on any RI
-	    * in kernel mode with KX=0 (tests/fpu/fp_mips4: the first movn). */
-	   assign w_in_64b_mode = in_kernel_mode |
-				  w_in_64b_user_mode | 
-				  w_in_64b_supervisor_mode;
-	end
-      else
-	begin
-	   assign w_in_64b_mode =1'b0;
-	end
-   endgenerate
-
-   wire					  w_in_64b_kernel_mode;
-   wire					  w_in_64b_supervisor_mode;
-   wire					  w_in_64b_user_mode;
-   wire					  w_cu1;   /* Status.CU1 (FPU enable) from exec -> decode CP1 CpU gate */
-   wire					  w_fr;    /* Status.FR (FP reg mode) from exec -> decode FR=0 odd-reg gate */
-   wire					  w_irq_pending;
-   wire [31:0]				  w_cp0_count;
-   wire [5:0]				  w_cp0_random;
-   
-   
+   /* the trapping instruction's pc (error-mode halt reports it as epc) */
    logic [`M_WIDTH-1:0]			  r_epc, n_epc;
-   logic [`M_WIDTH-1:0]			  r_badvaddr, n_badvaddr;   
-   wire [`M_WIDTH-1:0]			  w_exec_epc;
-   
-   wire					  w_sr_bev;
-   wire					  w_sr_exl;
 
-   
-   logic				  r_exc_in_delay, n_exc_in_delay;
-   
-   
    localparam N_PRF_ENTRIES = (1<<`LG_PRF_ENTRIES);
    localparam N_INT_ARCH = `N_INT_ARCH_REGS;
 
@@ -575,13 +482,10 @@ module core(clk,
 
    function automatic mrob_entry_t rob_to_mrob(input rob_entry_t e);
       mrob_entry_t r;
-      r.is_cpu = e.is_cpu;
-      r.cpu_ce1 = e.cpu_ce1;
       r.is_ret = e.is_ret;
       r.is_call = e.is_call;
       r.is_irq = e.is_irq;
       r.is_store = e.is_store;
-      r.is_tlbp = e.is_tlbp;
       r.valid_dst = e.valid_dst;
       r.valid_hilo_dst = e.valid_hilo_dst;
       r.valid_fp_dst = e.valid_fp_dst;
@@ -610,7 +514,6 @@ module core(clk,
       r.bpu_idx = e.bpu_idx;
       r.br_pred = e.br_pred;
       r.oldest_first = e.oldest_first;
-      r.mode_when_fetched = e.mode_when_fetched;
       r.post_restart = e.post_restart;
 `ifdef ENABLE_CYCLE_ACCOUNTING
       r.fetch_cycle = e.fetch_cycle;
@@ -632,11 +535,6 @@ module core(clk,
       r.target_pc = e.target_pc;
       r.take_br = e.take_br;
       r.data = e.data;
-      r.tlb_refill = e.tlb_refill;
-      r.tlb_invalid = e.tlb_invalid;
-      r.tlb_modified = e.tlb_modified;
-      r.tlb_hit = e.tlb_hit;
-      r.tlb_index = e.tlb_index;
       r.exec_cycle = e.exec_cycle;
       r.fwd_sel = e.fwd_sel;
       r.fwd_selB = e.fwd_selB;
@@ -654,8 +552,6 @@ module core(clk,
       rob_entry_t r;
       r.faulted = c.faulted;
       r.is_ii = c.is_ii;
-      r.is_cpu = m.is_cpu;
-      r.cpu_ce1 = m.cpu_ce1;
       r.is_fpe = c.is_fpe;
       r.fp_set_flags = c.fp_set_flags;
       r.overflow = c.overflow;
@@ -666,7 +562,6 @@ module core(clk,
       r.is_call = m.is_call;
       r.is_irq = m.is_irq;
       r.is_store = m.is_store;
-      r.is_tlbp = m.is_tlbp;
       r.valid_dst = m.valid_dst;
       r.valid_hilo_dst = m.valid_hilo_dst;
       r.valid_fp_dst = m.valid_fp_dst;
@@ -698,12 +593,6 @@ module core(clk,
       r.bpu_idx = m.bpu_idx;
       r.br_pred = m.br_pred;
       r.oldest_first = m.oldest_first;
-      r.tlb_refill = c.tlb_refill;
-      r.tlb_invalid = c.tlb_invalid;
-      r.tlb_modified = c.tlb_modified;
-      r.tlb_hit = c.tlb_hit;
-      r.tlb_index = c.tlb_index;
-      r.mode_when_fetched = m.mode_when_fetched;
       r.exec_cycle = c.exec_cycle;
       r.fwd_sel = c.fwd_sel;
       r.fwd_selB = c.fwd_selB;
@@ -959,12 +848,6 @@ module core(clk,
    
    logic [31:0] 	     r_arch_a0;
 
-   logic [4:0] 		     n_cause, r_cause;
-   logic [1:0] 		     n_ce, r_ce;   /* Cause.CE for a CpU (1=CP1/FPU, else 0) */
-   logic		     r_tlb_refill, n_tlb_refill;
-   logic		     r_xtlb_refill, n_xtlb_refill;
-   logic		     n_save_to_tlb_regs, r_save_to_tlb_regs;
-   logic		     n_has_badvaddr,r_has_badvaddr;
    
    
    
@@ -1042,14 +925,6 @@ module core(clk,
    state_t r_state, n_state;
    logic 	r_pending_fault, n_pending_fault;
    logic        r_oldest_first_pending, n_oldest_first_pending;
-   /* CP0 ordering (uop.vh is_cp0_wr/is_cp0_rd): CP0 writers allocated / retired.  A
-    * CP0 reader snapshots r_cp0_alloc_seq into uop.cp0_seq and exec issues it once its
-    * commit sequence (retire_cp0_valid count) catches up.  A flush drops every
-    * un-retired writer: alloc resyncs to retire. */
-   logic [`LG_ROB_ENTRIES+1:0] r_cp0_alloc_seq, n_cp0_alloc_seq;
-   logic [`LG_ROB_ENTRIES+1:0] r_cp0_retire_seq, n_cp0_retire_seq;
-   logic        r_retire_cp0_valid, r_retire_cp0_staged;
-   logic [`LG_ROB_ENTRIES-1:0] r_retire_cp0_rob_ptr;
    
    /* single-step: one architectural commit per 0->1 edge on `step` */
    logic        r_step_d, r_step_credit, n_step_credit;
@@ -1100,36 +975,10 @@ module core(clk,
    /* freeze when the store DATA is a small int (below bp_wp_val threshold) = the corruption. */
    wire		w_wp_match      = w_wp_data_here & (lsu_sb.data[31:0] < bp_wp_val);
 
-   /* resettable fault-trap: while armed (bp_enable), the FIRST fatal USERSPACE arch-fault
-    * (AdEL/AdES/IBE/DBE, EPC in useg) latches {epc,cause,badvaddr} + sets r_fault_hit,
-    * which folds into w_step_ok to FREEZE so the ARM can read a coherent fault state (the
-    * latched taps override the live outputs below).  fault_clear clears + re-arms. */
-   logic		r_fault_hit;
-   logic [`M_WIDTH-1:0] r_fault_epc, r_fault_badv;
-   logic [4:0]	r_fault_cause;
-   /* RI (cause 10) is deliberately NOT here: this kernel emulates RDHWR via the RI
-    * handler, so userspace takes an RI on every TLS access -- ~1600 per 10M instrs
-    * measured on the binutils workload.  Including it latched the trap milliseconds
-    * into the run and made bp_enable unusable (arming bp_pc also arms this trap).
-    * The remaining causes -- AdEL/AdES/IBE/DBE -- do not occur in healthy userspace,
-    * so they are a real corruption signature. */
-   /* 2026-09-10: cause 10 (RI) was STILL in this list -- present since the debug
-    * interface landed (9e64731/ca2e5c7) -- even though the comment above says it is
-    * "deliberately NOT here".  The comment recorded the diagnosis; the fix was never
-    * applied.  Consequence, observed on silicon: arming bp_enable for an ARMSIG
-    * capture latched HDR-FAULT cause=10 EPC=77bef8cc within ~1s (RDHWR/TLS
-    * emulation), froze the core, and swapsoak then reprogrammed the PL -- so the
-    * retire-match at force_sig_info could never be reached.  Removing it makes the
-    * code match its own comment and is what makes bp_enable usable at all. */
-   wire		w_fatal_cause = (n_cause == 5'd4) | (n_cause == 5'd5) | (n_cause == 5'd6) |
-		(n_cause == 5'd7);
-   /* in fault-only mode the pipe freeze comes from w_bp_match (fault AT bp_pc); suppress the
-    * general fatal-fault trap so routine cause-4/5 emulation faults elsewhere don't freeze. */
-   wire		w_fault_match = bp_enable & ~bp_fault_only & ~r_fault_hit & t_arch_fault & w_fatal_cause & ~n_epc[31];
 
    /* this gets consumed by retirement logic */
-   wire		w_step_ok   = (r_single_step | r_bp_hit | r_wp_hit | r_fault_hit) ? (t_step_edge) : 1'b1;
-   assign dbg_frozen = {r_bp_hit, r_wp_hit, r_fault_hit};
+   wire		w_step_ok   = (r_single_step | r_bp_hit | r_wp_hit) ? (t_step_edge) : 1'b1;
+   assign dbg_frozen = {r_bp_hit, r_wp_hit, 1'b0};
 `else
    /* debug watchpoint/fault-trap compiled out -- ports tied off, no compare logic generated */
    wire		w_step_ok   = r_single_step ? (t_step_edge) : 1'b1;
@@ -1189,29 +1038,6 @@ module core(clk,
 `endif
      end
 
-`ifdef ENABLE_DEBUG_WATCHPOINT
-   always_ff@(posedge clk)
-     begin
-	if(reset)
-	  begin
-	     r_fault_hit   <= 1'b0;
-	     r_fault_epc   <= 'd0;
-	     r_fault_badv  <= 'd0;
-	     r_fault_cause <= 5'd0;
-	  end // if (reset)
-	else if(fault_clear)
-	  begin
-	     r_fault_hit <= 1'b0;   /* clear + re-arm; latched values held until the next hit */
-	  end
-	else if(w_fault_match)
-	  begin
-	     r_fault_hit   <= 1'b1;
-	     r_fault_epc   <= n_epc;
-	     r_fault_badv  <= n_badvaddr;
-	     r_fault_cause <= n_cause;
-	  end // if (w_fault_match)
-     end // always_ff@ (posedge clk)
-`endif
 
    logic [31:0] r_restart_cycles, n_restart_cycles;
    logic t_divide_ready;
@@ -1250,44 +1076,6 @@ module core(clk,
 					 & t_rob_head.has_delay_slot
 					 & ~t_rob_head.has_nullifying_delay_slot;
 
-   always_comb
-     begin
-	n_cp0_alloc_seq = r_cp0_alloc_seq
-			  + ((t_alloc & is_cp0_wr(t_uop.op)) ? 'd1 : 'd0)
-			  + ((t_alloc_two & is_cp0_wr(t_uop2.op)) ? 'd1 : 'd0);
-	n_cp0_retire_seq = r_cp0_retire_seq
-			   + ((t_retire & is_cp0_wr(t_rob_head.opcode)) ? 'd1 : 'd0);
-	if(t_clr_rob)
-	  begin
-	     n_cp0_alloc_seq = n_cp0_retire_seq;
-	  end
-     end // always_comb
-
-   always_ff@(posedge clk)
-     begin
-	r_cp0_alloc_seq <= reset ? 'd0 : n_cp0_alloc_seq;
-	r_cp0_retire_seq <= reset ? 'd0 : n_cp0_retire_seq;
-	/* commit handshake to exec: one CP0 writer retires per cycle (t_retire_two) */
-	r_retire_cp0_valid <= reset ? 1'b0 : (t_retire & is_cp0_wr(t_rob_head.opcode));
-	r_retire_cp0_staged <= reset ? 1'b0 : (t_retire & ((t_rob_head.opcode == MTC0) | (t_rob_head.opcode == DMTC0)));
-	r_retire_cp0_rob_ptr <= r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
-     end
-
-`ifdef VERILATOR
-   always_ff@(posedge clk)
-     begin
-	if(!reset && t_rob_empty && (r_cp0_alloc_seq != r_cp0_retire_seq))
-	  begin
-	     $display("[CP0SEQ] cycle %d: ROB empty but alloc seq %d != retire seq %d", r_cycle, r_cp0_alloc_seq, r_cp0_retire_seq);
-	     $stop();
-	  end
-	if(!reset && t_retire_two && is_cp0_wr(t_rob_next_head.opcode))
-	  begin
-	     $display("[CP0SEQ] cycle %d: CP0 writer retired in the second slot", r_cycle);
-	     $stop();
-	  end
-     end
-`endif
 				      
    assign flush_req_l1d = r_flush_req_l1d;
    assign flush_req_l1i = r_flush_req_l1i;
@@ -1302,17 +1090,7 @@ module core(clk,
    assign got_break = r_got_break;
    assign got_ud = r_got_ud;
    assign got_bad_addr = r_got_bad_addr;
-`ifdef ENABLE_DEBUG_WATCHPOINT
-   /* when the fault-trap is frozen, expose the LATCHED fault state on the live taps
-    * so the ARM reads a stable {epc,cause,badvaddr} (not clobbered by the handler). */
-   assign epc      = r_fault_hit ? r_fault_epc   : r_epc;
-   assign badvaddr = r_fault_hit ? r_fault_badv  : r_badvaddr;
-   assign cause    = r_fault_hit ? r_fault_cause : r_cause;
-`else
    assign epc = r_epc;
-   assign badvaddr = r_badvaddr;
-   assign cause = r_cause;
-`endif
 
    assign dbg_head_pc              = t_rob_head.pc[31:0];
    /* why is the head stuck? read-only debug packing of existing head signals.
@@ -1408,78 +1186,8 @@ module core(clk,
     * (a comb read would form a t_bump_rob_head/t_retire UNOPTFLAT loop). */
    wire 	      w_wild_restart = n_restart_valid &
 				       (n_restart_pc[(`M_WIDTH-1):12] == 'd0);
-   /* KERNEL NULL-PAGE FAULT.  The four kernel-mode events (__split_vma,
-    * filp_flush x2, __get_unmapped_area) all reached PC=0 yet tripped NONE of the
-    * triggers above -- so whatever takes the kernel to 0 is not a committed
-    * indirect resolving to 0, and w_null_pc_head did not fire either.  Rather than
-    * keep guessing at the route, trigger on the CONSEQUENCE: an arch fault taken
-    * in kernel mode whose BadVA is in the never-mapped null page.  A kernel-mode
-    * access to page 0 is always a bug, and ordinary user demand-paging cannot trip
-    * it (that faults in user mode), so this cannot fire on normal activity.
-    * Consumed only by always_ff below -- reading n_* in a comb block that assigns
-    * them would form an UNOPTFLAT loop. */
-   wire 	      w_kernel_null_fault = t_bump_rob_head & in_kernel_mode &
-					    (n_badvaddr[(`M_WIDTH-1):12] == 'd0) &
-					    ((n_cause == 5'd2) | (n_cause == 5'd3));
-   /* WILD EPC -- the actual silicon twin of the pre-existing sim assertion
-    * `if(n_epc < 'd1000) $stop()` in the arch-fault path.
-    *
-    * WHY this and not the others: all FOUR kernel events (__split_vma,
-    * filp_flush x2, anon_pipe_read) report epc=0, yet NO trigger that detects a
-    * real path to PC 0 ever fires -- not a committed indirect with target 0, not
-    * a restart into the null page, and not a ROB entry committing with pc==0
-    * (which DOES fire in sim for a genuine null jump).  The consistent reading is
-    * that the kernel never executes at 0 at all and the EXCEPTION STATE is what
-    * is wrong -- which would also explain ra values matching no call site in the
-    * faulting function.  So trigger on the EPC being written wild, regardless of
-    * how control got there. */
-   /* ARMING GATE: at reset the ROB arrays are uninitialised (BRAM reads 0 on
-    * FPGA), so n_epc computes as 0 and this fires during boot firmware -- observed
-    * on 6d1f30fc, frozen at wptr=38 with the ring still showing 0xbfc000xx.  Arm
-    * only after the machine is well past reset.  Default is small enough for the
-    * directed sim test (which faults at ~16.7k cycles); silicon overrides it via
-    * SV2V_DEFINES with a value far past boot. */
-   /* Arm the wild-EPC trigger on the first USER-mode retire, not on a cycle count.
-    * The old `WILD_EPC_ARM_CYCLES 10000` arm fired during the FSBL -- which runs
-    * legitimately with EPC=0 -- so the trigger tripped at boot and latched the ring
-    * shut at wptr=38 before the workload started.  v5, v6 and 5004523d were all
-    * blinded this way, and 5004523d soaked for hours past three real userspace
-    * SIGSEGVs (one with epc=0) without recording a single retire.  Arming on the
-    * first user-mode commit is workload-relative, so it cannot race the firmware. */
-   logic 	      r_wild_epc_armed;
-   always_ff@(posedge clk)
-     begin
-	if(reset)
-	  begin
-	     r_wild_epc_armed <= 1'b0;
-	  end
-	else
-	  begin
-	     if(w_head_commit & !in_kernel_mode)
-	       begin
-		  r_wild_epc_armed <= 1'b1;
-	       end
-	  end
-     end // always_ff
-
-   wire 	      w_wild_epc = t_bump_rob_head & (n_epc[(`M_WIDTH-1):12] == 'd0) &
-				   r_wild_epc_armed;
-   /* USER-MODE BREAKPOINT EXCEPTION (ExcCode 09) -- the SIGFPE face of the bug.
-    * A userspace `break 0x7' (the compiler's divide-by-zero guard) firing where it
-    * is UNREACHABLE.  Captured TWICE on 03702fef (2026-09-06, both in `wc',
-    * epc 0x40801c) with IDENTICAL operands t2=28 a3=10, and BOTH times the ring
-    * did not freeze: every trigger above keys on reaching PC 0 / a null restart /
-    * a wild EPC, and a break trap is none of those.  Two evidence windows lost.
-    * TRADE-OFF: a break CAN fire legitimately (a real divide by zero) and the
-    * freeze is sticky until the PL is reprogrammed, so a false trigger blinds the
-    * board.  Accepted -- the soak workload has no legitimate div-by-zero.
-    * USER mode only: the kernel's BUG()/BRK paths use break legitimately. */
-   wire 	      w_user_break = t_bump_rob_head & (~in_kernel_mode) &
-				     (n_cause == 5'd9);
    wire 	      w_null_target = w_null_tgt_head | w_null_tgt_two |
-				      w_null_pc_head | w_wild_restart |
-				      w_kernel_null_fault | w_wild_epc |
-				      w_user_break;
+				      w_null_pc_head | w_wild_restart;
 
    /* The retire ring is a flight recorder: it NEVER back-pressures retirement.
     * (debug-infra defined this alongside its own ring; the merged tree uses the
@@ -1760,7 +1468,7 @@ module core(clk,
    /* DEBUG: index[14]&index[4] snarfs the last-restart record, word = index[2:0].
     * word0's 0x5A top byte is the live-probe discriminator. */
    wire w_rst_sel = dbg_trace_index[14] & dbg_trace_index[4];
-   wire [31:0] w_rst_word0 = {8'h5A, 8'd0, {(8-`LG_ROB_ENTRIES){1'b0}}, r_restart_head_ptr, r_cause, r_restart_why};
+   wire [31:0] w_rst_word0 = {8'h5A, 8'd0, {(8-`LG_ROB_ENTRIES){1'b0}}, r_restart_head_ptr, 5'd0, r_restart_why};
    wire [31:0] w_rst_word = (dbg_trace_index[2:0] == 3'd0) ? w_rst_word0 :
 			    (dbg_trace_index[2:0] == 3'd1) ? r_restart_pc[31:0] :
 			    (dbg_trace_index[2:0] == 3'd2) ? r_restart_src_pc[31:0] :
@@ -1797,7 +1505,7 @@ module core(clk,
 	  end
      end // always_ff
 
-   wire 	      w_trace_we   = (t_retire | (t_arch_fault & (|n_cause))) & (r_state != DEAD) & !r_trace_frozen;
+   wire 	      w_trace_we   = (t_retire | (t_arch_fault & (r_state == ARCH_FAULT))) & (r_state != DEAD) & !r_trace_frozen;
 
 `ifdef VERILATOR
    /* make the event loud in sim too -- on silicon it shows up by itself as
@@ -1805,25 +1513,10 @@ module core(clk,
     * reveal it via the frozen-ring bit, which nobody thinks to read. */
    always_ff@(posedge clk)
      begin
-	/* only the FIRST event -- w_null_target is driven by sticky sources
-	 * (w_user_break among them), so an unqualified print emits every cycle
+	/* only the FIRST event -- w_null_target can be driven by sticky sources, so an unqualified print emits every cycle
 	 * for the rest of the run (8.9GB of log in two minutes of a Linux boot). */
 	if(w_null_target & (~r_trace_frozen))
 	  begin
-	     if(w_wild_epc)
-	       begin
-		  $display("[WILD-EPC] cyc=%d n_epc=%x cause=%d kernel=%b head_pc=%x",
-			   r_cycle, n_epc, n_cause, in_kernel_mode, t_rob_head.pc);
-	       end
-	     if(w_kernel_null_fault)
-	       begin
-		  $display("[KERN-NULL] cyc=%d badvaddr=%x cause=%d", r_cycle, n_badvaddr, n_cause);
-	       end
-	     if(w_user_break)
-	       begin
-		  $display("[USER-BREAK] cyc=%d head_pc=%x cause=%d kernel=%b",
-			   r_cycle, t_rob_head.pc, n_cause, in_kernel_mode);
-	       end
 	     if(w_wild_restart)
 	       begin
 		  $display("[WILD-RESTART] cyc=%d restart_pc=%x (head pc=%x op=%d in_ds=%b)",
@@ -1844,7 +1537,7 @@ module core(clk,
 	  end
      end // always_ff
 `endif
-   wire [31:0] 	      w_head_flags = {25'd0, (t_retire | t_arch_fault), t_arch_fault, n_cause};
+   wire [31:0] 	      w_head_flags = {25'd0, (t_retire | t_arch_fault), t_arch_fault, 5'd0};
    wire [31:0] 	      w_next_flags = {25'd0, t_retire_two, 1'b0, 5'd0};
    always_ff@(posedge clk)
      begin
@@ -1888,9 +1581,6 @@ module core(clk,
    assign dbg_trace_data = 'd0;
 `endif
 
-   assign took_irq  = t_wr_epc & (r_cause == 5'd0);
-   assign cp0_count = w_cp0_count;
-   assign cp0_random = w_cp0_random;
    assign l1i_flush_done = n_l1i_flush_complete;
    assign l1d_flush_done = n_l1d_flush_complete;
    assign l2_flush_done = n_l2_flush_complete;
@@ -1940,7 +1630,6 @@ module core(clk,
    
    logic [63:0] r_cycle;
    logic [31:0] r_serialize_cycle;
-   logic [31:0] r_daddiu_decode_cycle;
    always_ff@(posedge clk)
      begin
 	r_cycle <= reset ? 'd0 : r_cycle + 'd1;
@@ -1959,64 +1648,10 @@ module core(clk,
 			     (r_restart_retired + {30'd0, t_retire_two, t_retire & !t_retire_two});
      end // always_ff@ (posedge clk)
 
-`ifdef VERILATOR
-   // race probe: stamp when 64b-mode (KX) flips and when the kernel_entry
-   // daddiu (0x..88300d78) allocates, to measure the decode-vs-mode margin.
-   logic r_64b_prev_dbg;
-   always_ff@(posedge clk) begin
-      if(reset) r_64b_prev_dbg <= 1'b0;
-      else begin
-	 r_64b_prev_dbg <= w_in_64b_mode;
-	 if(w_in_64b_mode != r_64b_prev_dbg)
-	   $display("[mode] cyc=%0d 64b_mode -> %b", r_cycle, w_in_64b_mode);
-	 if(t_uop.pc[31:0] == 32'h88300d78)
-	   $display("[dec0] cyc=%0d op=%0d is_ii=%b mode=%b", r_cycle, t_uop.op, (t_uop.op == II), w_in_64b_mode);
-	 if(t_uop2.pc[31:0] == 32'h88300d78)
-	   $display("[dec1] cyc=%0d op=%0d is_ii=%b mode=%b", r_cycle, t_uop2.op, (t_uop2.op == II), w_in_64b_mode);
-	 if(t_alloc && (t_alloc_uop.pc[31:0] == 32'h88300d78))
-	   $display("[daddiu] cyc=%0d slot0 op=%0d is_ii=%b mode=%b", r_cycle, t_alloc_uop.op, (t_alloc_uop.op == II), w_in_64b_mode);
-	 if(t_alloc_two && (t_alloc_uop2.pc[31:0] == 32'h88300d78))
-	   $display("[daddiu] cyc=%0d slot1 op=%0d is_ii=%b mode=%b", r_cycle, t_alloc_uop2.op, (t_alloc_uop2.op == II), w_in_64b_mode);
-      end
-   end
-`endif
 
 
 `ifdef VERILATOR
    logic [31:0] r_clear_cnt;
-   logic [31:0]	r_fault_cnt;
-   always_ff@(posedge clk)
-     begin
-	if(reset)
-	  begin
-	     r_fault_cnt <= 'd0;
-	  end
-	else
-	  begin
-	     /* DISABLED: net exception-vs-ERET count > 10 is not a reliable livelock
-	      * signal on a long healthy boot -- IRIX's R4000 clock-calibration spin
-	      * (get_r4k_counter @0x880058xx) takes a periodic timer IRQ every ~660k
-	      * cycles, and the +1/-1 accounting drifts.  The no-retire watchdog in
-	      * henry_tb (64k cycles with zero retirement) is the reliable hang detector. */
-	     // if(r_fault_cnt > 'd10)
-	     //   begin
-	     //      $display("you've recursively faulted yourself to death");
-	     //      $stop();
-	     //   end
-
-	     if(t_retire &( t_rob_head.opcode == ERET))
-	       begin
-		  if(r_fault_cnt != 32'd0)
-		    begin
-		       r_fault_cnt <= r_fault_cnt - 32'd1;
-		    end
-	       end
-	     else if(t_wr_epc)
-	       begin
-		  r_fault_cnt <= r_fault_cnt + 'd1;
-	       end
-	  end
-     end
    
    always_ff@(posedge clk)
      begin
@@ -2079,8 +1714,6 @@ module core(clk,
 	     r_ds_done <= 1'b0;
 	     drain_ds_complete <= 1'b0;
 	     r_epc <= 'd0;
-	     r_badvaddr <= 'd0;
-	     r_exc_in_delay <= 1'b0;	     
 	  end
 	else
 	  begin
@@ -2127,8 +1760,6 @@ module core(clk,
 	     r_ds_done <= n_ds_done;
 	     drain_ds_complete <= r_ds_done;
 	     r_epc <= n_epc;
-	     r_badvaddr <= n_badvaddr;	     
-	     r_exc_in_delay <= n_exc_in_delay;
 	  end
      end // always_ff@ (posedge clk)
 
@@ -2142,16 +1773,9 @@ module core(clk,
 	     r_machine_clr <= 1'b0;
 	     r_post_restart_arm <= 1'b0;
 	     r_got_restart_ack <= 1'b0;
-	     r_cause <= 5'd0;
-	     r_ce <= 2'd0;
-	     r_tlb_refill <= 1'b0;
-	     r_xtlb_refill <= 1'b0;
-	     r_save_to_tlb_regs <= 1'b0;
-	     r_has_badvaddr <= 1'b0;
 	     r_pending_fault <= 1'b0;
 	     r_oldest_first_pending <= 1'b0;
 	     r_serialize_cycle <= 32'd0;
-	     r_daddiu_decode_cycle <= 32'd0;
 	  end
 	else
 	  begin
@@ -2167,17 +1791,9 @@ module core(clk,
 		  r_post_restart_arm <= 1'b0;
 	       end
 	     r_got_restart_ack <= n_got_restart_ack;
-	     r_cause <= n_cause;
-	     r_ce <= n_ce;
-	     r_tlb_refill <= n_tlb_refill;
-	     r_xtlb_refill <= n_xtlb_refill;
-	     r_save_to_tlb_regs <= n_save_to_tlb_regs;
-	     r_has_badvaddr <= n_has_badvaddr;
 	     r_pending_fault <= n_pending_fault;
 	     r_oldest_first_pending <= n_oldest_first_pending;
 	     r_serialize_cycle <= (n_oldest_first_pending && !r_oldest_first_pending) ? r_cycle[31:0] : r_serialize_cycle;
-	     if((t_alloc && (t_alloc_uop.pc[31:0] == 32'h88300d78)) || (t_alloc_two && (t_alloc_uop2.pc[31:0] == 32'h88300d78)))
-	       r_daddiu_decode_cycle <= r_cycle[31:0];
 	  end
      end
 
@@ -2441,7 +2057,6 @@ module core(clk,
 	  end
      end // always_ff@ (negedge clk)
 `endif
-   logic t_wr_epc, t_wr_cause, t_wr_badvaddr;
    logic t_restart_complete;
    
    wire	w_rob_next_empty = (r_rob_next_head_ptr == r_rob_tail_ptr);
@@ -2459,23 +2074,14 @@ module core(clk,
 								      
    always_comb
      begin
-	t_wr_epc = 1'b0;
-	t_wr_cause = 1'b0;
-	t_wr_badvaddr = 1'b0;
-	n_has_badvaddr = r_has_badvaddr;
 	
 	t_restart_complete = 1'b0;
 	
-	n_cause = r_cause;
-	n_ce = r_ce;
-	n_tlb_refill = r_tlb_refill;
-	n_xtlb_refill = r_xtlb_refill;
 
 	n_machine_clr = r_machine_clr;
 	t_alloc = 1'b0;
 	t_alloc_two = 1'b0;
 	t_possible_to_alloc = 1'b0;
-	n_save_to_tlb_regs = 1'b0;
 	n_oldest_first_pending = r_oldest_first_pending;
 	
 	n_in_delay_slot = r_in_delay_slot;
@@ -2504,8 +2110,6 @@ module core(clk,
 
 	n_pending_fault = r_pending_fault;
 	n_epc = r_epc;
-	n_badvaddr = r_badvaddr;
-	n_exc_in_delay = r_exc_in_delay;
 	
 	
 	/* ldd's second destination takes the second slot's allocator */
@@ -2528,24 +2132,12 @@ module core(clk,
 
 	
 	t_fold_uop = (t_uop.op == NOP |
-		      t_uop.op == J  |
 		      t_uop.op == IRQ |
-		      t_uop.op == FETCH_MISALIGNED |
-		      t_uop.op == FETCH_ADDR_ERROR |
-		      t_uop.op == FETCH_TLB_MISS |
-		      t_uop.op == FETCH_TLB_INVALID |
-		      t_uop.op == CPU |
 		      t_uop.op == II);
 
 	t_fold_uop2 = (t_uop2.op == NOP |
-		       t_uop2.op == J  |
-		       t_uop2.op == IRQ |
-		       t_uop2.op == FETCH_MISALIGNED |
-		       t_uop2.op == FETCH_ADDR_ERROR |
-		       t_uop2.op == FETCH_TLB_MISS |
-		       t_uop2.op == FETCH_TLB_INVALID |
-		       t_uop2.op == CPU |
-		       t_uop2.op == II);
+		      t_uop2.op == IRQ |
+		      t_uop2.op == II);
 	
 	n_ds_done = r_ds_done;
 	n_flush_req_l1d = 1'b0;
@@ -2620,19 +2212,12 @@ module core(clk,
 
 	t_arch_fault = t_rob_head.faulted & 
 		       (t_rob_head.is_ii |
-			t_rob_head.is_cpu |
 			t_rob_head.is_fpe |
 			t_rob_head.is_bad_addr |
 			t_rob_head.is_bus_err |
 			t_rob_head.overflow | 
 			t_rob_head.trap | 
-			t_rob_head.is_irq |
-			(t_rob_head.opcode == FETCH_TLB_MISS) |
-			(t_rob_head.opcode == FETCH_MISALIGNED) |
-			(t_rob_head.opcode == FETCH_ADDR_ERROR) |
-			t_rob_head.tlb_refill |
-			t_rob_head.tlb_invalid |
-			t_rob_head.tlb_modified);
+			t_rob_head.is_irq);
 	
 	
 	unique case (r_state)
@@ -2747,7 +2332,6 @@ module core(clk,
 				   & !t_rob_next_head.valid_dst2
 				   & !t_rob_next_head.is_ret
 				   & !t_rob_next_head.is_call
-				   & !is_cp0_wr(t_rob_next_head.opcode)   /* one CP0 commit per cycle */
 		    		   & !t_rob_next_head.valid_hilo_dst
 				   & !t_rob_next_head.valid_fcr_dst 
 				   & ~single_step;
@@ -3133,14 +2717,9 @@ module core(clk,
 	    end
 	  WRITE_EPC:
 	    begin
-	       t_wr_epc = 1'b1;
-	       t_wr_cause = 1'b1;
-	       t_wr_badvaddr = r_has_badvaddr;
 	       
 	       n_machine_clr = 1'b1;
 	       
-	       /* TLB refill -> 0x000 (32-bit) or 0x080 (64-bit XTLB);
-		* all other exceptions -> 0x180 general vector. */
 	       n_restart_pc = {r_tbr_tba, r_tbr_tt, 4'd0};   /* TBR, tt just written */
 	       n_restart_src_pc = 'd0;
 	       n_restart_why = RST_WHY_EXCEPTION;
@@ -3376,8 +2955,6 @@ module core(clk,
 	
 	t_alloc_uop = t_uop;
 	t_alloc_uop2 = t_uop2;
-	t_alloc_uop.cp0_seq = r_cp0_alloc_seq;
-	t_alloc_uop2.cp0_seq = r_cp0_alloc_seq + (is_cp0_wr(t_uop.op) ? 'd1 : 'd0);
 `ifdef VERILATOR
 	t_alloc_uop.clear_id = r_clear_cnt;
 	t_alloc_uop2.clear_id = r_clear_cnt;
@@ -3674,14 +3251,9 @@ module core(clk,
 	t_rob_tail.srcA_arch = t_uop.srcA;
 	t_rob_tail.post_restart = r_post_restart_arm;
 	t_rob_tail.pc = t_alloc_uop.pc;
-	/* carry the decode-time 64b-mode flag into the ROB (the P-mode-hazard guard at
-	 * ARCH_FAULT reads t_rob_head.mode_when_fetched).  Was dropped here -> the guard
-	 * compared a stale ROB-slot value, giving spurious P-mode mismatches (and could
-	 * mask a real one). */
-	t_rob_tail.mode_when_fetched = t_alloc_uop.mode_when_fetched;
 	/* default to sequential next-PC so a serializing op restarts at pc+4;
 	 * branches overwrite this with the resolved target at completion (~1963). */
-	t_rob_tail.target_pc = (t_alloc_uop.op == J) ? t_alloc_uop.pred_target : (t_alloc_uop.pc + 'd4);
+	t_rob_tail.target_pc = t_alloc_uop.pc + 'd4;
 
 	t_rob_tail.is_call = t_alloc_uop.is_call;
 	t_rob_tail.is_irq = t_alloc_uop.op == IRQ;
@@ -3689,20 +3261,12 @@ module core(clk,
 	t_rob_tail.is_cache  = t_alloc_uop.is_cache;
 	t_rob_tail.cache_act = t_alloc_uop.cache_act;
 	t_rob_tail.is_indirect = (t_alloc_uop.op == S_JMPL);
-	t_rob_tail.is_tlbp = (t_alloc_uop.op == TLBP);
 	
 	t_rob_tail.is_ii = 1'b0;
-	t_rob_tail.is_cpu = 1'b0;
-	t_rob_tail.cpu_ce1 = 1'b0;
 	t_rob_tail.is_fpe = 1'b0;
 	t_rob_tail.fp_set_flags = 1'b0;
 	t_rob_tail.overflow = 1'b0;
 	t_rob_tail.trap = 1'b0;
-	t_rob_tail.tlb_refill = 1'b0;
-	t_rob_tail.tlb_invalid = 1'b0;
-	t_rob_tail.tlb_modified = 1'b0;
-	t_rob_tail.tlb_hit = 1'b0;
-	t_rob_tail.tlb_index = 6'd0;
 	
 	t_rob_tail.is_bad_addr = 1'b0;
 	t_rob_tail.is_bus_err = 1'b0;
@@ -3737,8 +3301,7 @@ module core(clk,
 	t_rob_next_tail.srcA_arch = t_uop2.srcA;
 	t_rob_next_tail.post_restart = r_post_restart_arm & ~t_alloc;
 	t_rob_next_tail.pc = t_alloc_uop2.pc;
-	t_rob_next_tail.mode_when_fetched = t_alloc_uop2.mode_when_fetched;   /* see slot0 note above */
-	t_rob_next_tail.target_pc = (t_alloc_uop2.op == J) ? t_alloc_uop2.pred_target : (t_alloc_uop2.pc + 'd4);
+	t_rob_next_tail.target_pc = t_alloc_uop2.pc + 'd4;
 	t_rob_next_tail.opcode = t_alloc_uop2.op;
 	t_rob_next_tail.is_call = t_alloc_uop2.is_call;
 	t_rob_next_tail.is_irq = t_alloc_uop2.op == IRQ;
@@ -3746,21 +3309,13 @@ module core(clk,
 	t_rob_next_tail.is_ret = t_alloc_uop2.is_ret;
 	t_rob_next_tail.is_cache = t_alloc_uop2.is_cache;
 	t_rob_next_tail.cache_act = t_alloc_uop2.cache_act;
-	t_rob_next_tail.is_tlbp = (t_alloc_uop2.op == TLBP);
 	t_rob_next_tail.is_indirect = (t_alloc_uop2.op == S_JMPL);
 	t_rob_next_tail.is_fpe = 1'b0;
 	t_rob_next_tail.fp_set_flags = 1'b0;
 	t_rob_next_tail.overflow = 1'b0;
 	t_rob_next_tail.trap = 1'b0;
-	t_rob_next_tail.tlb_refill = 1'b0;
-	t_rob_next_tail.tlb_invalid = 1'b0;
-	t_rob_next_tail.tlb_modified = 1'b0;
-	t_rob_next_tail.tlb_hit = 1'b0;
-	t_rob_next_tail.tlb_index = 6'd0;
 	
 	t_rob_next_tail.is_ii = 1'b0;
-	t_rob_next_tail.is_cpu = 1'b0;
-	t_rob_next_tail.cpu_ce1 = 1'b0;
 	t_rob_next_tail.is_bad_addr = 1'b0;
 	t_rob_next_tail.is_bus_err = 1'b0;
 	t_rob_next_tail.take_br = 1'b0;
@@ -3839,33 +3394,9 @@ module core(clk,
 		       t_rob_tail.is_ii = 1'b1;
 		       t_rob_tail.data = `MEM_WIDTH'(t_uop.imm[7:0]);   /* the decode trap type */
 		    end
-		  else if(t_uop.op == CPU)
-		    begin
-		       t_rob_tail.faulted = 1'b1;
-		       t_rob_tail.is_cpu = 1'b1;
-		       t_rob_tail.cpu_ce1 = t_uop.cpu_ce1;
-		    end
-		  else if(t_uop.op == FETCH_TLB_MISS)
-		    begin
-		       t_rob_tail.faulted = 1'b1;
-		       t_rob_tail.tlb_refill = 1'b1;
-		    end
-		  else if(t_uop.op == FETCH_TLB_INVALID)
-		    begin
-		       t_rob_tail.faulted = 1'b1;
-		       t_rob_tail.tlb_invalid = 1'b1;
-		    end
-		  else if(t_uop.op == FETCH_MISALIGNED || t_uop.op == FETCH_ADDR_ERROR)
-		    begin
-		       t_rob_tail.faulted = 1'b1;
-		    end		  
 		  else if(t_uop.op == IRQ)
 		    begin
 		       t_rob_tail.faulted = 1'b1;
-		    end
-		  else if(t_uop.op == J)
-		    begin
-		       t_rob_tail.take_br = 1'b1;
 		    end
 	       end
 	     
@@ -3917,33 +3448,9 @@ module core(clk,
 		       t_rob_next_tail.is_ii = 1'b1;
 		       t_rob_next_tail.data = `MEM_WIDTH'(t_uop2.imm[7:0]);
 		    end
-		  else if(t_uop2.op == CPU)
-		    begin
-		       t_rob_next_tail.faulted = 1'b1;
-		       t_rob_next_tail.is_cpu = 1'b1;
-		       t_rob_next_tail.cpu_ce1 = t_uop2.cpu_ce1;
-		    end
-		  else if(t_uop2.op == FETCH_TLB_MISS)
-		    begin
-		       t_rob_next_tail.faulted = 1'b1;
-		       t_rob_next_tail.tlb_refill = 1'b1;
-		    end
-		  else if(t_uop2.op == FETCH_TLB_INVALID)
-		    begin
-		       t_rob_next_tail.faulted = 1'b1;
-		       t_rob_next_tail.tlb_invalid = 1'b1;
-		    end
-		  else if(t_uop2.op == FETCH_MISALIGNED || t_uop2.op == FETCH_ADDR_ERROR)
-		    begin
-		       t_rob_next_tail.faulted = 1'b1;
-		    end
 		  else if(t_uop2.op == IRQ)
 		    begin
 		       t_rob_next_tail.faulted = 1'b1;
-		    end
-		  else if(t_uop2.op == J)
-		    begin
-		       t_rob_next_tail.take_br = 1'b1;
 		    end
 	       end // if (t_fold_uop2)
 	  end // if (t_alloc_two)
@@ -4210,12 +3717,7 @@ module core(clk,
 	       begin
 		  if(core_mem_rsp.rob_ptr[0]) begin
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.tlb_refill | core_mem_rsp.tlb_invalid | core_mem_rsp.tlb_modified;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_refill <= core_mem_rsp.tlb_refill;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_invalid <= core_mem_rsp.tlb_invalid;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_modified <= core_mem_rsp.tlb_modified;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_hit <= core_mem_rsp.tlb_hit;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_index <= core_mem_rsp.tlb_index;
+		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bus_err <= core_mem_rsp.bus_err;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -4226,12 +3728,7 @@ module core(clk,
 		  end
 		  else begin
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.tlb_refill | core_mem_rsp.tlb_invalid | core_mem_rsp.tlb_modified;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_refill <= core_mem_rsp.tlb_refill;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_invalid <= core_mem_rsp.tlb_invalid;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_modified <= core_mem_rsp.tlb_modified;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_hit <= core_mem_rsp.tlb_hit;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].tlb_index <= core_mem_rsp.tlb_index;
+		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bus_err <= core_mem_rsp.bus_err;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -4785,40 +4282,6 @@ module core(clk,
    //t_push_dq_two
 
    
-`ifdef R4K_HAZARD_BEHAV
-   /* R4400 MTC0->Status[IE] CP0 hazard (Uman Appendix F, Table F-2): a real
-    * R4x00 does NOT accept a pending interrupt for 3 instructions after an mtc0
-    * that writes c0_sr.  r9999 is precise (0-cycle), which breaks the ~32
-    * "mtc0 c0_sr next to a stack switch" sites IRIX/Linux rely on (the IRIX
-    * bad-istack panic).  Replicate it: after a decoded mtc0/dmtc0 to CP0 reg 12
-    * (Status), suppress decode-side irq injection for 4 more decoded insns.
-    * Detected from the raw insn (COP0=0x10, rs=MT/DMT=4/5, rd=12), so no
-    * dependence on the decode output.  NB: REDUNDANT on r9999 -- mtc0 is a
-    * serializing_op that drains the pipe, so a post-mtc0 interrupt already sees the
-    * committed Status (R10000 "handled in hardware").  Kept for R4K-exact study. */
-   wire w_dec0_wr_c0sr = t_push_dq_one & (insn.data[31:26]==6'h10) &
-        ((insn.data[25:21]==5'd4)|(insn.data[25:21]==5'd5)) & (insn.data[15:11]==5'd12);
-   wire w_dec1_wr_c0sr = t_push_dq_two & (insn_two.data[31:26]==6'h10) &
-        ((insn_two.data[25:21]==5'd4)|(insn_two.data[25:21]==5'd5)) & (insn_two.data[15:11]==5'd12);
-   logic [2:0] r_sr_haz, n_sr_haz;
-   always_comb
-     begin
-	n_sr_haz = r_sr_haz;
-	if(t_push_dq_one & t_push_dq_two)
-	  n_sr_haz = (r_sr_haz > 3'd2) ? (r_sr_haz - 3'd2) : 3'd0;
-	else if(t_push_dq_one | t_push_dq_two)
-	  n_sr_haz = (r_sr_haz > 3'd0) ? (r_sr_haz - 3'd1) : 3'd0;
-	if(w_dec0_wr_c0sr | w_dec1_wr_c0sr)
-	  n_sr_haz = 3'd4;
-     end
-   always_ff@(posedge clk)
-     r_sr_haz <= reset ? 3'd0 : n_sr_haz;
- `define R4K_IRQ_G0 & (r_sr_haz == 3'd0)
- `define R4K_IRQ_G1 & (r_sr_haz == 3'd0) & !w_dec0_wr_c0sr
-`else
- `define R4K_IRQ_G0
- `define R4K_IRQ_G1
-`endif
 
    /* SPARC state outside the renamed registers (icc rides in the integer PRF,
     * Y on the HILO rename).  Committed values, changed at retire: SAVE/RESTORE
@@ -5037,7 +4500,7 @@ module core(clk,
 		      .cwp(r_dec_cwp),
 		      .wim(r_wim),
 		      .irq(1'b0),
-		      .iacc_exc(insn.tlb_miss | insn.tlb_invalid | insn.bad_va),
+		      .iacc_exc(insn.tlb_miss | insn.bad_va),
 		      .iacc_err(1'b0),
 		      .insn(insn.data),
 		      .pc(insn.pc),
@@ -5057,7 +4520,7 @@ module core(clk,
 		      .cwp(w_dec0_next_cwp),
 		      .wim(r_wim),
 		      .irq(1'b0),
-		      .iacc_exc(insn_two.tlb_miss | insn_two.tlb_invalid | insn_two.bad_va),
+		      .iacc_exc(insn_two.tlb_miss | insn_two.bad_va),
 		      .iacc_err(1'b0),
 		      .insn(insn_two.data),
 		      .pc(insn_two.pc),
@@ -5081,28 +4544,6 @@ module core(clk,
 	t_push_2 = t_alloc_two && !t_fold_uop2;
      end
 
-   logic t_wr_tlbp;
-   logic t_tlbp_hit;
-   logic [5:0] t_tlbp_index;
-
-   always_comb
-     begin
-	t_wr_tlbp = 1'b0;
-	t_tlbp_hit = 1'b0;
-	t_tlbp_index = 6'd0;
-	if(t_retire_two & t_rob_next_head.is_tlbp)
-	  begin
-	     t_wr_tlbp = 1'b1;
-	     t_tlbp_hit = t_rob_next_head.tlb_hit;
-	     t_tlbp_index = t_rob_next_head.tlb_index;	     
-	  end
-	else if (t_retire & t_rob_head.is_tlbp)
-	  begin
-	     t_wr_tlbp = 1'b1;	     
-	     t_tlbp_hit = t_rob_head.tlb_hit;
-	     t_tlbp_index = t_rob_head.tlb_index;
-	  end
-     end // always_comb
    
    
    logic [319:0] w_dbg_exec_snap;
@@ -5117,50 +4558,10 @@ module core(clk,
 	   .dbg_exec_snap(w_dbg_exec_snap),
 	   .clk(clk), 
 	   .reset(reset),
-	   .ip6(ip6),
-	   .ip5(ip5),
-	   .ip4(ip4),
-	   .ip3(ip3),
-	   .ip2(ip2),
-	   .retire(t_retire),
-	   .retire_two(t_retire_two),
-	   .single_step(single_step),
-	   .core_epc(r_epc),
-	   .core_wr_epc(t_wr_epc),
-	   .core_cause(r_cause),
-	   .cause_ip(cause_ip),
-	   .core_ce(r_ce),
-	   .exec_epc(w_exec_epc),
-	   .core_wr_tlbp(t_wr_tlbp),
-	   .core_tlbp_hit(t_tlbp_hit),
-	   .core_tlbp_index(t_tlbp_index),
-	   .asid(asid),
-	   .tlb_entry_out_valid(tlb_entry_out_valid),
-	   .tlb_entry_out(tlb_entry_out),	   
-	   .sr_bev(w_sr_bev),
-	   .sr_exl(w_sr_exl),
-	   .core_wr_cause(t_wr_cause),
-	   .core_wr_badvaddr(t_wr_badvaddr),
-	   .core_badvaddr(r_badvaddr),
 	   .core_fcsr_we(core_fcsr_we),
 	   .core_fcsr_cause6(core_fcsr_cause6),
 	   .core_fcsr_flags5(core_fcsr_flags5),
-	   .save_to_tlb_regs(r_save_to_tlb_regs),
-	   .exc_in_delay(r_exc_in_delay),
-	   .in_kernel_mode(in_kernel_mode),
-	   .in_supervisor_mode(in_supervisor_mode),
-	   .in_user_mode(in_user_mode),
-	   .in_64b_kernel_mode(w_in_64b_kernel_mode),
-	   .in_64b_supervisor_mode(w_in_64b_supervisor_mode),
-	   .in_64b_user_mode(w_in_64b_user_mode),
-	   .cu1(w_cu1),
-	   .fr(w_fr),
 
-	   .putchar_fifo_out(putchar_fifo_out),
-	   .putchar_fifo_empty(putchar_fifo_empty),
-	   .putchar_fifo_pop(putchar_fifo_pop),
-	   .putchar_fifo_wptr(putchar_fifo_wptr),
-	   .putchar_fifo_rptr(putchar_fifo_rptr),
 	   .divide_ready(t_divide_ready),
 `ifdef VERILATOR
 	   .clear_cnt(r_clear_cnt),
@@ -5171,10 +4572,6 @@ module core(clk,
 	   .head_of_rob_ptr(head_of_rob_ptr),
 	   .next_head_of_rob_ptr(next_head_of_rob_ptr),
 	   .head_of_rob_ds_committable(head_of_rob_ds_committable),
-	   .retire_cp0_valid(r_retire_cp0_valid),
-	   .retire_cp0_staged(r_retire_cp0_staged),
-	   .retire_cp0_rob_ptr(r_retire_cp0_rob_ptr),
-	   .cpr0_status_reg(status_reg),
 	   .mq_wait(mq_wait),
 	   .uq_wait(uq_wait),
 	   .fp_uq_wait(fp_uq_wait),
@@ -5222,10 +4619,7 @@ module core(clk,
 	   .retired_rob_ptr_valid(retired_rob_ptr_valid),
 	   .retired_rob_ptr_two_valid(retired_rob_ptr_two_valid),
 	   .retired_rob_ptr(retired_rob_ptr),
-	   .retired_rob_ptr_two(retired_rob_ptr_two),
-	   .irq_pending(w_irq_pending),
-	   .cp0_count(w_cp0_count),
-	   .cp0_random(w_cp0_random)
+	   .retired_rob_ptr_two(retired_rob_ptr_two)
 	   );
 
 
@@ -5488,11 +4882,6 @@ module core(clk,
    always_ff@(posedge clk)
      if(!reset && w_frst_wait)
        assert(n_restart_pc == r_last_branch_target);
-   // P-mode-hazard: a Reserved-Instruction fault must commit in the mode it was
-   // fetched in; a mismatch is a stale-mode RI restart-on-commit should have squashed.
-   always_ff@(posedge clk)
-     if(!reset && (r_state == ARCH_FAULT) && t_rob_head.is_ii)
-       assert(t_rob_head.mode_when_fetched == w_in_64b_mode);
    // cover: can the BMC reach a committed Reserved Instruction (the P-mode-hazard gate)?
    always_ff@(posedge clk)
      if(!reset)

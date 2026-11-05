@@ -35,11 +35,6 @@ extern "C" {
   int       have_ckpt_t(void)                   { return 0; }
   long long loadgpr(int regid)                  { (void)regid; return 0; }
   long long loadfpr(int regid)                  { (void)regid; return 0; }
-  int       loadcp0(int regid)                  { (void)regid; return 0; }
-  long long loadcp0_64(int regid)               { (void)regid; return 0; }
-  long long loadhilo(int half)                  { (void)half;  return 0; }
-  int       loadfcsr(void)                      { return 0; }
-  long long loadtlb(int entry, int field)       { (void)entry; (void)field; return 0; }
 }
 
 /* l1d.sv's co-sim hooks (ENABLE_STORE_CHECK etc.); no SPARC consumer yet */
@@ -638,7 +633,7 @@ int main(int argc, char **argv) {
   uint64_t last_retired_pc = 0;
   uint64_t mismatches = 0, n_stores = 0, n_loads = 0;
   uint64_t n_branches = 0, n_mispredicts = 0, n_checks = 0, n_flush_cycles = 0;
-  bool incorrect = false, got_putchar = false;
+  bool incorrect = false;
 
   //assert reset
   tb->retire_allowed = 1;
@@ -647,7 +642,6 @@ int main(int argc, char **argv) {
     contextp->timeInc(1);
     tb->mem_rsp_valid = 0;
     tb->reset = 1;
-    tb->ip6 = tb->ip5 = tb->ip4 = tb->ip3 = tb->ip2 = 0;
     clock_tb(tb.get());
     ++globals::cycle;
   }
@@ -687,16 +681,6 @@ int main(int argc, char **argv) {
     contextp->timeInc(1);
     tb->clk = 1;
     tb->eval();
-
-    if(not(tb->putchar_fifo_empty)) {
-      char putch = (char)tb->putchar_fifo_out;
-      std::cout << putch;
-      if(putch == '\n') {
-	std::cout.flush();
-      }
-      got_putchar = true;
-      tb->putchar_fifo_pop = 1;
-    }
 
     if(tb->retire_reg_valid) {
       s->r[tb->retire_reg_ptr] = tb->retire_reg_data;
@@ -917,10 +901,6 @@ int main(int argc, char **argv) {
 
     tb->clk = 0;
     tb->eval();
-    if(got_putchar) {
-      tb->putchar_fifo_pop = 0;
-      got_putchar = false;
-    }
     ++globals::cycle;
   }
 

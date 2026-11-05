@@ -27,9 +27,6 @@
 //`define ENABLE_DEBUG_WATCHPOINT 1  // OFF for verilator TLB-dump run
 // Tiny 8-line L2 (congestion experiment; no real LUT win -- the FPU dominates).  OFF by default.
 //`define TINY_DEBUG_L2 1
-// R4400-exact CP0 hazard: defer irq injection after mtc0 c0_sr. REDUNDANT (mtc0 serializes); study only.
-//`define R4K_HAZARD_BEHAV 1
-//`define DUMP_TLB_WRITES 1  // (off for FPGA synth)
 
 `define FPGA 1
 
@@ -529,7 +526,6 @@ typedef enum logic [5:0] {
    MEM_SB   = 6'd5,
    MEM_SH   = 6'd6,
    MEM_SW   = 6'd7,
-   MEM_TLBP = 6'd13,
    MEM_LD   = 6'd14,
    MEM_SD   = 6'd15,
    MEM_INVL = 6'd24,   /* L2 line invalidate -- CACHE DMA-in drop; a dirty L2 line (or a dirty

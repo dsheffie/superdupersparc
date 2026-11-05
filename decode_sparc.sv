@@ -305,7 +305,6 @@ module decode_sparc(
 	uop.is_call = 1'b0;
 	uop.is_ret = 1'b0;
 	uop.is_fp = 1'b0;
-	uop.cpu_ce1 = 1'b0;
 	uop.has_delay_slot = 1'b0;
 	uop.has_nullifying_delay_slot = 1'b0;
 	uop.imm = t_imm32[15:0];
@@ -316,7 +315,6 @@ module decode_sparc(
 	uop.must_restart = 1'b0;
 	uop.oldest_first = 1'b0;
 	uop.rob_ptr = 'd0;
-	uop.cp0_seq = 'd0;
 	uop.br_pred = 1'b0;
 	uop.is_br = 1'b0;
 	uop.bpu_idx = bpu_idx;
@@ -329,7 +327,6 @@ module decode_sparc(
 `ifdef ENABLE_CYCLE_ACCOUNTING
 	uop.fetch_cycle = fetch_cycle;
 `endif
-	uop.mode_when_fetched = 1'b0;
 	next_cwp = cwp;
 
 	/* `trap(tt)': op stays II, the trap type rides imm */

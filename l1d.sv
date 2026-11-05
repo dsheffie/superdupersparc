@@ -64,13 +64,7 @@ module l1d(clk,
 	   fml_pre_data,
 `endif
 	   reset,
-	   asid,
-	   tlb_entry_in,
-	   tlb_entry_in_valid,
 	   state,
-	   in_kernel_mode,
-	   in_supervisor_mode,
-	   in_user_mode,
 	   head_of_rob_ptr,
 	   head_of_rob_ptr_valid,
 	   head_of_rob_has_delay_slot,
@@ -140,14 +134,8 @@ module l1d(clk,
    
    input logic clk;
    input logic reset;
-   input logic [7:0] asid;
-   input	     tlb_data_t tlb_entry_in;
-   input logic	     tlb_entry_in_valid;
    
    output logic [3:0] state;
-   input logic			in_kernel_mode;
-   input logic			in_supervisor_mode;
-   input logic			in_user_mode;
 
 
    input logic [`LG_ROB_ENTRIES-1:0] head_of_rob_ptr;
@@ -498,12 +486,7 @@ endfunction
    logic [`LG_MEM_SCHED_ENTRIES-1:0] 	  n_core_mem_st_done_idx, r_core_mem_st_done_idx;
    mem_rsp_t n_core_mem_rsp, r_core_mem_rsp;
 
-   logic [5:0] w_tlb_index;
-   logic       w_tlb_dirty;
-   logic       w_tlb_valid;
-   logic [2:0] w_tlb_c;     /* dtlb: matched page cacheability (EntryLo C/CCA) */
-   logic       w_tlb_hit;
-   logic       w_tlb_oor;   /* dtlb: matched entry's PFN exceeds MAX_PA(36b) -> Addr Error */
+   logic [2:0] w_tlb_c;     /* translated page cacheability (CCA encoding) */
 
       
    mem_req_t n_req, r_req, t_req;
@@ -2199,17 +2182,12 @@ endfunction
 
    
    /* SPARC, SRMMU not yet wired: the MMU-off translation (PA = VA), registered
-    * like tlb.sv's outputs (read the cycle after the request).  The MIPS dTLB is
-    * gone; tlb_entry_in is unused until the SRMMU's TLB takes its place. */
+    * like a TLB's outputs (read the cycle after the request), until the SRMMU's
+    * TLB takes its place. */
    always_ff@(posedge clk)
      begin
-	w_tlb_hit <= ~reset;
-	w_tlb_index <= 'd0;
-	w_tlb_dirty <= ~reset;
-	w_tlb_valid <= ~reset;
 	w_tlb_c <= 3'd3;
 	w_mapped_addr <= `PA_WIDTH'(core_mem_req.addr);
-	w_tlb_oor <= 1'b0;
      end
    
 
@@ -2326,11 +2304,6 @@ endfunction
 	n_core_mem_rsp.bad_addr = 1'b0;
 	n_core_mem_rsp.bus_err = 1'b0;
 	
-	n_core_mem_rsp.tlb_refill = 1'b0;
-	n_core_mem_rsp.tlb_invalid = 1'b0;
-	n_core_mem_rsp.tlb_modified = 1'b0;
-	n_core_mem_rsp.tlb_hit = 1'b0;
-	n_core_mem_rsp.tlb_index = 6'd0;
 	n_core_mem_rsp.lsu_hold = r_req.lsu_hold;
 	n_core_mem_rsp.lsu_idx = r_req.lsu_idx;
 	n_core_mem_rsp.blk = BLK_NONE;
@@ -2457,13 +2430,6 @@ endfunction
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			 n_core_mem_rsp_valid = 1'b1;
 		      end
-		    else if(r_req2.op == MEM_TLBP)
-		      begin
-			 n_core_mem_rsp.dst_valid = 1'b0;
-			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			 n_core_mem_rsp.tlb_index = w_tlb_index;
-			 n_core_mem_rsp_valid = 1'b1;			 
-		      end
 		    else if(r_req2.bad_addr)
 		      begin
 			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
@@ -2471,60 +2437,6 @@ endfunction
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
 			 n_core_mem_rsp_valid = 1'b1;			 
 		      end
-		    else if(w_tlb_hit==1'b0)
-		       begin
-			  /* BadVAddr = the faulting VIRTUAL address (r_req2.addr), NOT the
-		   * translated PA: on a TLB miss w_mapped_addr is garbage, and
-		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
-		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
-		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
-			  n_core_mem_rsp.dst_valid = 1'b0;
-			  n_core_mem_rsp.bad_addr = 1'b0;
-			  n_core_mem_rsp.tlb_refill = 1'b1;
-			  n_core_mem_rsp_valid = 1'b1;
-		       end
-		    else if(w_tlb_valid == 1'b0)
-		       begin
-			  /* R4400: matching entry, V=0 -> TLB Invalid (TLBL/TLBS), common vector */
-			  /* BadVAddr = the faulting VIRTUAL address (r_req2.addr), NOT the
-		   * translated PA: on a TLB miss w_mapped_addr is garbage, and
-		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
-		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
-		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
-			  n_core_mem_rsp.dst_valid = 1'b0;
-			  n_core_mem_rsp.bad_addr = 1'b0;
-			  n_core_mem_rsp.tlb_invalid = 1'b1;
-			  n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			  n_core_mem_rsp.tlb_index = w_tlb_index;
-			  n_core_mem_rsp_valid = 1'b1;
-		       end
-		    else if(r_req2.is_store && (w_tlb_dirty == 1'b0) && !w_is_chop2)   /* CACHE ops don't write the page: no TLB-Mod */
-		       begin
-			  /* R4400: store to valid-but-not-dirty page -> TLB Modified (Mod), common vector; no write */
-			  /* BadVAddr = the faulting VIRTUAL address (r_req2.addr), NOT the
-		   * translated PA: on a TLB miss w_mapped_addr is garbage, and
-		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
-		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
-		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
-			  n_core_mem_rsp.dst_valid = 1'b0;
-			  n_core_mem_rsp.bad_addr = 1'b0;
-			  n_core_mem_rsp.tlb_modified = 1'b1;
-			  n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			  n_core_mem_rsp.tlb_index = w_tlb_index;
-			  n_core_mem_rsp_valid = 1'b1;
-		       end
-		    else if(w_tlb_oor)
-		       begin
-			  /* Sail TLBTranslateC: valid+dirty entry whose PFN maps beyond
-			   * MAX_PA(36b) -> Address Error (AdEL/AdES); BadVAddr = the VA. */
-			  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
-			  n_core_mem_rsp.dst_valid = 1'b0;
-			  n_core_mem_rsp.bad_addr = 1'b1;
-			  n_core_mem_rsp_valid = 1'b1;
-		       end
 		    else if(t_remapped_req2.cached && `IS_IO_PA(t_remapped_req2.addr[`PA_WIDTH-1:0]) && !w_is_chop2
 `ifndef ENABLE_R10000
 			    && !r_req2.is_store
@@ -2545,8 +2457,6 @@ endfunction
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 `endif
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
-			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			 n_core_mem_rsp.tlb_index = w_tlb_index;
 			 n_core_mem_rsp_valid = 1'b1;
 		      end
 		    else if(r_req2.is_store && r_req2.lsu_hold && !w_is_chop2)
@@ -2556,8 +2466,6 @@ endfunction
 			  * retires, then commits it */
 			 t_sb_wr = 1'b1;
 			 n_core_mem_rsp.dst_valid = 1'b0;
-			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			 n_core_mem_rsp.tlb_index = w_tlb_index;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
 			 n_core_mem_rsp_valid = 1'b1;
 		      end
@@ -2581,8 +2489,6 @@ endfunction
 			 n_core_mem_rsp.data = t_rsp_data2[`MEM_WIDTH-1:0];
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
-			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			 n_core_mem_rsp.tlb_index = w_tlb_index;
 			 n_core_mem_rsp_valid = 1'b1;
 		      end
 		    else if(w_is_chop2)
@@ -2623,9 +2529,7 @@ endfunction
 			 n_core_mem_rsp.fp_pres = r_req2.fp_pres;
                          n_cache_hits = r_cache_hits + 'd1;
                          n_core_mem_rsp_valid = 1'b1;
-			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
-			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
-			 n_core_mem_rsp.tlb_index = w_tlb_index;			 
+			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;			 
 		      end
 		    else
 		      begin

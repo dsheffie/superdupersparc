@@ -6,8 +6,6 @@
 typedef struct packed {
    logic       faulted;
    logic       is_ii;
-   logic       is_cpu;   /* coprocessor unusable (CpU, cause 11) */
-   logic       cpu_ce1;  /* the CpU is for CP1 (FPU, CU1=0) -> Cause.CE=1 (else CP0 CpU = CE=0) */
    logic       is_fpe;   /* FP exception (FPE, cause 15): denorm/enabled IEEE flag */
    logic       fp_set_flags; /* completed on FP port 2 (arith/cmp/cvt): update FCSR Cause/Flags at retire */
    logic       overflow;
@@ -18,7 +16,6 @@ typedef struct packed {
    logic       is_call;
    logic       is_irq;
    logic       is_store;
-   logic       is_tlbp;
    logic       valid_dst;
    logic       valid_hilo_dst;
    logic       valid_fp_dst;   /* dst is an FP physical reg (free into the FP free list at retire) */
@@ -64,12 +61,6 @@ typedef struct packed {
    logic 			 br_pred;
    logic                         oldest_first;
 
-   logic       tlb_refill;
-   logic       tlb_invalid;
-   logic       tlb_modified;   
-   logic       tlb_hit;
-   logic [5:0] tlb_index;
-   logic       mode_when_fetched;
    /* Low 8 bits of the free-running cycle counter, stamped when the uop COMPLETES
     * (for a load: when its memory response lands).  Deliberately OUTSIDE the
     * ENABLE_CYCLE_ACCOUNTING guard -- the 64-bit fetch/alloc/complete cycles below
@@ -100,13 +91,10 @@ typedef struct packed {
  * alloc live in crob_entry_t (multi-ported flops).  rob_entry_t stays the merged
  * view every reader uses (core.sv rob_to_mrob/rob_to_crob/rob_merge). */
 typedef struct packed {
-   logic is_cpu;
-   logic cpu_ce1;
    logic is_ret;
    logic is_call;
    logic is_irq;
    logic is_store;
-   logic is_tlbp;
    logic valid_dst;
    logic valid_hilo_dst;
    logic valid_fp_dst;
@@ -135,7 +123,6 @@ typedef struct packed {
    logic [`LG_BPU_TBL_SZ-1:0] bpu_idx;
    logic br_pred;
    logic oldest_first;
-   logic mode_when_fetched;
    logic post_restart;
 `ifdef ENABLE_CYCLE_ACCOUNTING
    logic [63:0] fetch_cycle;
@@ -155,11 +142,6 @@ typedef struct packed {
    logic [(`M_WIDTH-1):0] target_pc;
    logic take_br;
    logic [(`MEM_WIDTH-1):0] data;
-   logic tlb_refill;
-   logic tlb_invalid;
-   logic tlb_modified;
-   logic tlb_hit;
-   logic [5:0] tlb_index;
    logic [7:0] exec_cycle;
    logic [1:0] fwd_sel;
    logic [1:0] fwd_selB;
@@ -207,7 +189,6 @@ typedef struct packed {
    logic		    misaligned;
    logic		    bad_va;       /* i-side AdEL: mipsseg bad_perms (access-level / VA out-of-range) */
    logic		    tlb_miss;
-   logic		    tlb_invalid;
    logic		    is_branch;
 `ifdef ENABLE_CYCLE_ACCOUNTING
    logic [63:0] 	    fetch_cycle;
@@ -311,11 +292,6 @@ typedef struct packed {
    logic [31:0]		       fp_pres;
    logic 		       bad_addr;
    logic 		       bus_err;    /* the bus answered with an error (MC): DBE */
-   logic		       tlb_refill;
-   logic		       tlb_invalid;
-   logic		       tlb_modified;
-   logic		       tlb_hit;
-   logic [5:0]		       tlb_index;
    logic 		       lsu_hold;   /* echo of mem_req_t.lsu_hold */
    logic [`LG_MEM_SCHED_ENTRIES-1:0] lsu_idx;
    blk_code_t		       blk;        /* valid with core_mem_blk_valid */

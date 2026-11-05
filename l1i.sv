@@ -25,14 +25,7 @@ endmodule
 
 module l1i(clk,
 	   state,
-	   asid,
 	   reset,
-	   in_kernel_mode,
-	   in_supervisor_mode,
-	   in_user_mode,
-	   in_64b_kernel_mode,
-	   in_64b_supervisor_mode,
-	   in_64b_user_mode,
 	   flush_req,
 	   flush_complete,
 	   flush_line_req,
@@ -81,23 +74,13 @@ module l1i(clk,
 	   mem_rsp_valid,
 	   mem_rsp_load_data,
 	   cache_accesses,
-	   cache_hits,
-	   // I-side TLB entry write port (shared with D-side)
-	   tlb_entry_in_valid,
-	   tlb_entry_in
+	   cache_hits
 	   );
 
    input logic clk;
    output logic [3:0] state;
-   input logic [7:0]  asid;
    
    input logic reset;
-   input logic			in_kernel_mode;
-   input logic			in_supervisor_mode;
-   input logic			in_user_mode;
-   input logic			in_64b_kernel_mode;
-   input logic			in_64b_supervisor_mode;
-   input logic			in_64b_user_mode;
    
    input logic 	      flush_req;
    output logic       flush_complete;
@@ -195,8 +178,6 @@ module l1i(clk,
    input logic [L1I_CL_LEN_BITS-1:0] 	  mem_rsp_load_data;
    output logic [63:0] 			  cache_accesses;
    output logic [63:0] 			  cache_hits;
-   input logic 				  tlb_entry_in_valid;
-   input 				  tlb_data_t tlb_entry_in;
       
    logic [N_TAG_BITS-1:0] 		  t_cache_tag, r_cache_tag, r_tag_out0, r_tag_out1;
 
@@ -1361,7 +1342,6 @@ endfunction
 	t_insn.data = t_insn_data;
 	t_insn.misaligned  = r_req & (r_cache_pc[1:0] != 2'b00);
 	t_insn.tlb_miss    = r_mapped & r_req & !w_eff_hit & (r_cache_pc[1:0] == 2'b00);
-	t_insn.tlb_invalid = r_mapped & r_req &  w_eff_hit & !w_eff_valid;
 	t_insn.bad_va      = r_req & r_bad_va;   /* AdEL; decode prioritizes over tlb_miss */
 	t_insn.pc = r_cache_pc;
 	t_insn.pred_target = n_pc;
@@ -1374,7 +1354,6 @@ endfunction
 	t_insn2.data = t_insn_data2;
 	t_insn2.misaligned = 1'b0;
 	t_insn2.tlb_miss = 1'b0;
-	t_insn2.tlb_invalid = 1'b0;
 	t_insn2.bad_va = 1'b0;
 	t_insn2.pc = r_cache_pc + 'd4;
 	t_insn2.pred_target = t_gb_take1 ? n_pc : 'd0;
