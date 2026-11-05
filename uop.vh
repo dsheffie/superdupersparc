@@ -3,7 +3,7 @@
 
 `include "machine.vh"
 
-typedef enum logic [7:0]
+typedef enum logic [8:0]
   {
    SLL = 'd0, //0
    SRL = 'd1, //1
@@ -319,7 +319,111 @@ typedef enum logic [7:0]
     * mem uop each, carried to the L2 as MEM_BLK_* for the 128-byte block */
    CHBWBINV,   /* 0x17 Hit WB-Inv S */
    CHBINV,     /* 0x13 Hit Inv S */
-   CHBIDX      /* 0x03 Index WB-Inv S */
+   CHBIDX,     /* 0x03 Index WB-Inv S */
+   /* ---- SPARC V8 (decode_sparc.sv).  Conventions shared by every S_* op:
+    *   operand 2 = srcB_valid ? R[srcB] : the sign-extended 32-bit immediate in
+    *   {jmp_imm[15:0], imm} (simm13 / sethi imm22<<10 / a branch or call byte
+    *   displacement);
+    *   icc lives in the integer PRF beside the value (as r_prf_zero does): an
+    *   icc writer sets flags_dst_valid and writes NZVC into its own dst physical
+    *   register, and always has dst_valid (rd = %g0, e.g. cmp, still allocates a
+    *   register; rename just leaves %g0 unmapped).  A flags RAT names the youngest
+    *   icc writer.  Every icc writer writes all of NZVC, so no writer reads the
+    *   old icc to merge.  An icc reader sets flags_src_valid and srcC_valid: rename
+    *   fills srcC from the flags RAT, not the GPR RAT, and exec reads its icc;
+    *   fcc stays on the FCR rename (fcr_src_valid / fcr_dst_valid);
+    *   Y is the HILO rename (hilo_src_valid / hilo_dst_valid);
+    *   Bicc/FBfcc/Ticc carry their condition in uop.cond;
+    *   memory ops use the LSU's layout: address = srcA + (srcC_valid ? R[srcC] :
+    *   sext(imm)), and store (or swap) data in srcB (fp_srcB_valid for stf/stdf);
+    *   every memory op carries its ASI in uop.asi;
+    *   the plain integer loads and stores are the LSU's own ops (ld LW, ldub LBU,
+    *   ldsb LB, lduh LHU, ldsh LH, st SW, stb SB, sth SH): exec.sv's mem pipe and
+    *   the LSU classify by op, and these behave exactly as those (big-endian);
+    *   ldd is the 64-bit LD with a second destination: dst = rd gets the word at
+    *   the address, dst2 = rd+1 (flat index dst+1) the next one.  It allocates
+    *   alone (core.sv: its second register takes the second slot's allocator);
+    *   std is the 64-bit SD: data {R[srcB] = rd, R[srcD] = rd+1}, the two read
+    *   through the one store-data port on consecutive cycles (exec.sv).
+    * Register specifiers are flat windowed arch indices (machine.vh NWINDOWS). */
+   S_ADD,
+   S_ADDCC,
+   S_ADDX,
+   S_ADDXCC,
+   S_SUB,
+   S_SUBCC,
+   S_SUBX,
+   S_SUBXCC,
+   S_AND,
+   S_ANDCC,
+   S_ANDN,
+   S_ANDNCC,
+   S_OR,
+   S_ORCC,
+   S_ORN,
+   S_ORNCC,
+   S_XOR,
+   S_XORCC,
+   S_XNOR,
+   S_XNORCC,
+   S_TADDCC,
+   S_TSUBCC,
+   S_TADDCCTV,
+   S_TSUBCCTV,
+   S_MULSCC,     /* serializing (reads and writes rd, Y, icc) */
+   S_SLL,
+   S_SRL,
+   S_SRA,
+   S_UMUL,       /* rd and Y */
+   S_SMUL,
+   S_UMULCC,
+   S_SMULCC,
+   S_UDIV,       /* reads Y (the dividend's high word) */
+   S_SDIV,
+   S_UDIVCC,
+   S_SDIVCC,
+   S_SETHI,      /* rd = {jmp_imm, imm} */
+   S_SAVE,       /* rd (new window) = rs1 + op2 (old window); CWP-1 */
+   S_RESTORE,    /* CWP+1 */
+   /* state registers: all but RDY/WRY are serializing */
+   S_RDY,
+   S_WRY,
+   S_RDPSR,
+   S_WRPSR,
+   S_RDWIM,
+   S_WRWIM,
+   S_RDTBR,
+   S_WRTBR,
+   S_RDASR,      /* asr number in imm (from rs1) */
+   S_WRASR,      /* asr number in srcC (from rd), not renamed */
+   /* control transfer */
+   S_BICC,       /* target pc + {jmp_imm, imm} */
+   S_FBFCC,
+   S_CALL,       /* %o7 = pc, target pc + {jmp_imm, imm} */
+   S_JMPL,       /* rd = pc, target rs1 + op2 (prediction in pred_target) */
+   S_RETT,       /* serializing; CWP+1, ET=1, S=PS, target rs1 + op2 */
+   S_TICC,       /* trap 0x80 + ((rs1 + op2) & 0x7f) if cond(icc) */
+   S_FLUSH,      /* serializing: I-cache coherence at rs1 + op2 */
+   /* memory: address rs1 + op2, ASI in uop.asi */
+   S_LDSTUB,
+   S_SWAP,
+   S_LDF,
+   S_LDDF,
+   S_LDFSR,
+   S_STF,
+   S_STDF,
+   S_STFSR,
+   S_STDFQ,
+   /* FP ops without a MIPS twin (the rest reuse SP_ADD, CVT_S_W, ...) */
+   S_FSMULD,
+   S_FCMPS,      /* imm[0] = fcmpe (signal on unordered) */
+   S_FCMPD,
+   /* SPARC trap entry (core.sv): injected ahead of the handler, they write the
+    * trapped instruction's PC to %l1 and nPC to %l2 of the new window (the value
+    * in {jmp_imm, imm}, executed as a sethi).  TRAP_L2 retires as the trapped
+    * instruction (its pc); TRAP_L1 is not an architectural retirement. */
+   TRAP_L1,
+   TRAP_L2
    } opcode_t;
 
 function logic is_mult(opcode_t op);
@@ -332,6 +436,14 @@ function logic is_mult(opcode_t op);
      DMULT:
        x = 1'b1;
      DMULTU:
+       x = 1'b1;
+     S_UMUL:
+       x = 1'b1;
+     S_SMUL:
+       x = 1'b1;
+     S_UMULCC:
+       x = 1'b1;
+     S_SMULCC:
        x = 1'b1;
      default:
        x = 1'b0;
@@ -411,6 +523,14 @@ function logic is_div(opcode_t op);
      DDIV:
        x = 1'b1;
      DDIVU:
+       x = 1'b1;
+     S_UDIV:
+       x = 1'b1;
+     S_SDIV:
+       x = 1'b1;
+     S_UDIVCC:
+       x = 1'b1;
+     S_SDIVCC:
        x = 1'b1;
      default:
        x = 1'b0;
@@ -511,8 +631,12 @@ typedef struct packed {
    logic [`LG_PRF_ENTRIES-1:0] srcC;
    logic 		       srcC_valid;
    logic 		       fp_srcC_valid;
+   logic [`LG_PRF_ENTRIES-1:0] srcD;        /* SPARC std: rd+1 (the low data word) */
+   logic 		       srcD_valid;
    logic [`LG_PRF_ENTRIES-1:0] dst;
    logic 		       dst_valid;
+   logic [`LG_PRF_ENTRIES-1:0] dst2;        /* ldd: rd+1 */
+   logic 		       dst2_valid;
    logic 		       fp_dst_valid;
    logic 		       fcr_dst_valid;
 
@@ -522,6 +646,11 @@ typedef struct packed {
    logic 			    hilo_src_valid;
    logic [`LG_HILO_PRF_ENTRIES-1:0] hilo_src;
    logic 			    fcr_src_valid;
+   logic 			    flags_src_valid;   /* SPARC: srcC is the icc (flags RAT) */
+   logic 			    flags_dst_valid;   /* SPARC: dst also takes icc */
+   logic [3:0] 		    cond;              /* SPARC Bicc/FBfcc/Ticc condition */
+   logic 			    is_call;           /* SPARC call / jmpl rd=%o7 (return stack push) */
+   logic 			    is_ret;            /* SPARC ret / retl: jmpl %i7+8 / %o7+8, rd %g0 */
      
    logic 		       has_delay_slot;
    logic 		       has_nullifying_delay_slot;
@@ -544,6 +673,7 @@ typedef struct packed {
    logic 		       is_fp;   /* compute FP op (routes to the FP issue queue) */
    logic 		       cpu_ce1; /* CpU is for CP1 (Status.CU1=0) -> Cause.CE=1 (vs CP0 CpU = CE=0) */
    logic [`LG_BPU_TBL_SZ-1:0]      bpu_idx;
+   logic [7:0] 	       asi;        /* SPARC memory ops: the address space identifier */
    logic		       mode_when_fetched;
 `ifdef VERILATOR
    logic [31:0] 	       clear_id;

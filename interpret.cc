@@ -316,6 +316,7 @@ static void st_mem(state_t *s, uint32_t asi, uint32_t va, T v) {
 /* ---------------------------------------------------------------- traps */
 
 static void take_trap(state_t *s, uint32_t tt) {
+  s->last_tt = tt;
   if(s->user_emu) {
     fprintf(stderr, "ISS: unhandled trap tt 0x%x at pc 0x%x (user emulation)\n", tt, s->pc);
     s->brk = true;

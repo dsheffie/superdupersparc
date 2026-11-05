@@ -91,10 +91,21 @@ gen_html : gen_html.cc pipeline_record.hh
 
 
 clean:
-	rm -rf $(EXE) $(OBJ) $(DEP) obj_dir
+	rm -rf $(EXE) $(OBJ) $(DEP) obj_dir obj_dec decode_test tb_decode_sparc.o tb_decode_sparc.d
 
 # standalone SPARC V8 ISS (no verilator)
 ISS_OBJ = iss_main.o interpret.o sun4m.o disassemble.o loadelf.o helper.o sparse_mem.o
 sparc_iss : $(ISS_OBJ)
 	$(CXX) -o $@ $(ISS_OBJ) $(LIBS)
 -include $(ISS_OBJ:.o=.d)
+
+# decode_sparc.sv unit test against the ISS (sparc_tests/tb_decode_sparc.cc)
+DEC_OBJ = tb_decode_sparc.o verilated.o interpret.o sun4m.o disassemble.o helper.o sparse_mem.o
+obj_dec/Vtb_decode_sparc__ALL.a : sparc_tests/tb_decode_sparc.sv decode_sparc.sv machine.vh uop.vh rob.vh
+	$(VERILATOR) -cc sparc_tests/tb_decode_sparc.sv decode_sparc.sv -I. --top-module tb_decode_sparc --Mdir obj_dec
+	$(MAKE) OPT_FAST="-O2" -C obj_dec -f Vtb_decode_sparc.mk
+tb_decode_sparc.o : sparc_tests/tb_decode_sparc.cc obj_dec/Vtb_decode_sparc__ALL.a
+	$(CXX) -MMD $(CXXFLAGS) -I. -Iobj_dec -c $< -o $@
+decode_test : $(DEC_OBJ) obj_dec/Vtb_decode_sparc__ALL.a
+	$(CXX) $(CXXFLAGS) $(DEC_OBJ) obj_dec/*.o $(LIBS) -o $@
+-include tb_decode_sparc.d

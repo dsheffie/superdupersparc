@@ -1,11 +1,5 @@
 `include "machine.vh"
 
-`ifdef VERILATOR
-/* checkpoint resume: seed the integer PRF from the ISS state at reset (Verilator
- * only -- stripped from synth). Mirrors rv64core rf6r3w. */
-import "DPI-C" function longint loadgpr(input int regid);
-`endif
-
 module rf4r2w(clk, reset,
 	      rdptr0,rdptr1,rdptr2,rdptr3,rdptr4,
 	      wrptr0,wrptr1,wen0,wen1,
@@ -15,12 +9,12 @@ module rf4r2w(clk, reset,
    parameter WIDTH = 1;
    parameter LG_DEPTH = 1;
    input logic clk;
-   input logic reset;   /* only consumed by the VERILATOR checkpoint seed below */
+   input logic reset;
    input logic [LG_DEPTH-1:0] rdptr0;
    input logic [LG_DEPTH-1:0] rdptr1;
    input logic [LG_DEPTH-1:0] rdptr2;
    input logic [LG_DEPTH-1:0] rdptr3;
-   input logic [LG_DEPTH-1:0] rdptr4;   /* ENABLE_MIPS4: the mem pipe's index (srcC) read */
+   input logic [LG_DEPTH-1:0] rdptr4;   /* the mem pipe's index (srcC) read */
 
    input logic [LG_DEPTH-1:0] wrptr0;
    input logic [LG_DEPTH-1:0] wrptr1;
@@ -47,20 +41,6 @@ module rf4r2w(clk, reset,
 
    always_ff@(posedge clk)
      begin
-`ifdef VERILATOR
-	if(reset)
-	  begin
-	     /* seed phys reg i = arch reg i (initial RAT is identity); both banks
-	      * so whichever the RAT points at carries the value. i=0 stays 0. */
-	     for(integer i = 1; i < 32; i=i+1)
-	       begin
-		  r_ram_alu[i] <= loadgpr(i);
-		  r_ram_mem[i] <= loadgpr(i);
-	       end
-	  end
-	else
-	  begin
-`endif //  `ifdef VERILATOR
 `ifdef FPGA
 	/* FPGA/sim: the RF powers up to 0 (BRAM/bitstream INIT; Verilator zeroes
 	 * state) and phys reg 0 ($0) is provably never written (dst_valid=(rd!=0);
@@ -83,12 +63,16 @@ module rf4r2w(clk, reset,
 	rd4 <= rdptr4=='d0 ? 'd0 : (rdptr4[LG_DEPTH-1] ? r_ram_mem[rdptr4[LG_DEPTH-2:0]] : r_ram_alu[rdptr4[LG_DEPTH-2:0]]);
 `endif
 	/* NEVER write phys reg 0 ($0): the FPGA read path dropped the rdptr==0->0 mux
-	 * on the invariant that $0 is never written, but an r0-dest op (e.g. ssnop =
-	 * sll $0,$0,1) reaches here with wrptr0==0 & wen0.  This gate enforces it. */
+	 * on the invariant that $0 is never written, but an r0-dest op reaches here
+	 * with wrptr0==0 & wen0.  This gate enforces it. */
 	if(wen0 & (wrptr0 != 'd0))
-	  r_ram_alu[wrptr0[LG_DEPTH-2:0]] <= wr0;
+	  begin
+	     r_ram_alu[wrptr0[LG_DEPTH-2:0]] <= wr0;
+	  end
 	if(wen1)
-	  r_ram_mem[wrptr1[LG_DEPTH-2:0]] <= wr1;
+	  begin
+	     r_ram_mem[wrptr1[LG_DEPTH-2:0]] <= wr1;
+	  end
 `ifdef VERILATOR
 	/* BANK INVARIANT.  Writes choose the bank by PORT (port0->alu, port1->mem) and
 	 * ignore the pointer MSB; reads choose it by the pointer MSB.  So an ALU result
@@ -107,9 +91,6 @@ module rf4r2w(clk, reset,
 	     $display("[RF-BANK] MEM-port write to ALU-bank pdst: wrptr1=%d", wrptr1);
 	  end
 `endif
-`ifdef VERILATOR
-	  end // else: !if(reset)
-`endif
-     end
+     end // always_ff@ (posedge clk)
 
-endmodule
+endmodule // rf4r2w

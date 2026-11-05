@@ -226,6 +226,16 @@ module decode_mips(
 `ifdef ENABLE_CYCLE_ACCOUNTING
 	uop.fetch_cycle = fetch_cycle;
 `endif
+	uop.asi = 8'd0;
+	uop.flags_src_valid = 1'b0;
+	uop.flags_dst_valid = 1'b0;
+	uop.cond = 4'd0;
+	uop.dst2 = 'd0;
+	uop.srcD = 'd0;
+	uop.srcD_valid = 1'b0;
+	uop.dst2_valid = 1'b0;
+	uop.is_call = 1'b0;
+	uop.is_ret = 1'b0;
 	uop.mode_when_fetched = w_in_64b_mode;
 	if(irq)
 	  begin

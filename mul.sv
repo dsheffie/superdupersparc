@@ -20,11 +20,17 @@ module mul(clk,
 	   is_32b,
 	   rob_ptr_in,
 	   hilo_prf_ptr_in,
+	   dst_ptr_in,
+	   dst_val_in,
+	   cc_in,
 	   y,
 	   complete,
 	   rob_ptr_out,
 	   hilo_prf_ptr_val_out,
-	   hilo_prf_ptr_out);
+	   hilo_prf_ptr_out,
+	   dst_ptr_out,
+	   dst_val_out,
+	   cc_out);
    
    parameter W = 32;   
    input logic clk;
@@ -37,6 +43,11 @@ module mul(clk,
    input logic	       is_32b;
    input logic [`LG_ROB_ENTRIES-1:0] rob_ptr_in;
    input logic [`LG_HILO_PRF_ENTRIES-1:0] hilo_prf_ptr_in;
+   /* SPARC: rd (the low word) and whether icc is written, carried to the
+    * writeback like the ROB and HILO pointers */
+   input logic [`LG_PRF_ENTRIES-1:0] dst_ptr_in;
+   input logic 			     dst_val_in;
+   input logic 			     cc_in;
    
    
    output logic [(2*W)-1:0]		  y;
@@ -44,12 +55,18 @@ module mul(clk,
    output logic [`LG_ROB_ENTRIES-1:0] 	  rob_ptr_out;
    output logic 			  hilo_prf_ptr_val_out;
    output logic [`LG_HILO_PRF_ENTRIES-1:0] hilo_prf_ptr_out;
+   output logic [`LG_PRF_ENTRIES-1:0] 	  dst_ptr_out;
+   output logic 			  dst_val_out;
+   output logic 			  cc_out;
    
    logic [`MUL_LAT:0] 			   r_complete;
    logic [`MUL_LAT:0]			   r_is_32b;
    logic [`MUL_LAT:0] 			   r_hilo_val;
    logic [`LG_HILO_PRF_ENTRIES-1:0] 	   r_hilo_ptr[`MUL_LAT:0];
    logic [`LG_ROB_ENTRIES-1:0] 		   r_rob_ptr[`MUL_LAT:0];
+   logic [`LG_PRF_ENTRIES-1:0] 		   r_dst_ptr[`MUL_LAT:0];
+   logic [`MUL_LAT:0] 			   r_dst_val;
+   logic [`MUL_LAT:0] 			   r_cc;
   
 
    assign complete = r_complete[`MUL_LAT];
@@ -57,6 +74,9 @@ module mul(clk,
    
    assign hilo_prf_ptr_val_out = r_hilo_val[`MUL_LAT];
    assign hilo_prf_ptr_out = r_hilo_ptr[`MUL_LAT];
+   assign dst_ptr_out = r_dst_ptr[`MUL_LAT];
+   assign dst_val_out = r_dst_val[`MUL_LAT];
+   assign cc_out = r_cc[`MUL_LAT];
 
    logic [(2*W)-1:0] 			   t_mul;
    logic [(2*W)-1:0]			   r_mul[`MUL_LAT:0];
@@ -138,9 +158,11 @@ module mul(clk,
 	       begin
 		  r_rob_ptr[i] <= 'd0;
 		  r_hilo_ptr[i] <= 'd0;
-
+		  r_dst_ptr[i] <= 'd0;
 	       end
 	     r_complete <= 'd0;
+	     r_dst_val <= 'd0;
+	     r_cc <= 'd0;
 	     r_hilo_val <= 'd0;
 	     r_is_32b <= 'd0;
 	  end
@@ -155,6 +177,9 @@ module mul(clk,
 		       r_hilo_val[0] <= go;
 		       r_hilo_ptr[0] <= hilo_prf_ptr_in;
 		       r_is_32b[0] <= is_32b;
+		       r_dst_ptr[0] <= dst_ptr_in;
+		       r_dst_val[0] <= go & dst_val_in;
+		       r_cc[0] <= cc_in;
 		    end
 		  else
 		    begin
@@ -163,6 +188,9 @@ module mul(clk,
 		       r_hilo_val[i] <= r_hilo_val[i-1];
 		       r_hilo_ptr[i] <= r_hilo_ptr[i-1];
 		       r_is_32b[i] <= r_is_32b[i-1];
+		       r_dst_ptr[i] <= r_dst_ptr[i-1];
+		       r_dst_val[i] <= r_dst_val[i-1];
+		       r_cc[i] <= r_cc[i-1];
 		    end
 	       end
 	  end

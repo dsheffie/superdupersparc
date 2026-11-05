@@ -116,7 +116,7 @@
  * in l1d.sv -- this only changes which one drives the output. */
 `define REG_L1D_RSP 1
 
-`define LG_M_WIDTH 6
+`define LG_M_WIDTH 5
 
 `define BIG_ENDIAN 1
 
@@ -165,9 +165,24 @@
 //page size
 `define LG_PG_SZ 12
 
-`define LG_PRF_ENTRIES 7
+/* 256: the SPARC windowed arch registers (8 globals + 16*NWINDOWS = 136) plus
+ * the in-flight destinations; 256x32 is the same bit count as r9999's 128x64 */
+`define LG_PRF_ENTRIES 8
 
-`define LG_HILO_PRF_ENTRIES 2
+/* SPARC register windows (power of two: the flat arch index wraps mod 16*NWINDOWS) */
+`define LG_NWINDOWS 3
+`define NWINDOWS (1 << `LG_NWINDOWS)
+`define N_INT_ARCH_REGS (8 + 16 * `NWINDOWS)
+
+/* committed reference count per integer physical register (core.sv): a register
+ * is held by its GPR mapping and/or the flags RAT (icc rides in the PRF beside
+ * the value), so 2 bits.  Widen for move elimination (a register mapped by
+ * several GPRs). */
+`define LG_PRF_REFCNT 2
+
+/* SPARC Y rides the MIPS HILO rename (its own register file, wakeup and
+ * forwarding): every umul/smul writes it, so 16 versions, not MIPS's 4 */
+`define LG_HILO_PRF_ENTRIES 4
 
 //queue between decode and alloc
 `define LG_DQ_ENTRIES 2
@@ -316,10 +331,24 @@
 
 `define M_WIDTH (1 << `LG_M_WIDTH)
 
-/* Physical address width. VAs stay `M_WIDTH (64); physical addresses (cache tags,
- * the memory bus, TLB PA, L2) are PA_WIDTH. R4000 = 36; IRIX/Indy needs only 29
- * (kseg0 mask is 0x1fffffff = 29 bits). Shmoo {29,32,36} for the area/timing curve. */
+/* SPARC V8: the integer datapath (registers, ALU, PC, virtual addresses) is
+ * M_WIDTH = 32.  Two things stay 64 bits wide:
+ *   FP_WIDTH   an FP physical register holds a double (the FPU is 64-bit);
+ *   MEM_WIDTH  the L1D data path (lddf/stdf move 64 bits in one access) and the
+ *              ROB's result field, which carries FP results to retirement. */
+`define FP_WIDTH 64
+
+/* the int scheduler's third source (srcC) and the LSU's index operand: SPARC
+ * needs both (icc readers take the flags register in srcC; reg+reg addressing).
+ * They were the MIPS IV movn/movz and COP1X paths. */
+`define ENABLE_INT_SRCC 1
+`define MEM_WIDTH 64
+
+/* Physical address width: cache tags, the memory bus, the L2.  sun4m (SRMMU)
+ * physical addresses are 36 bits, wider than a VA (M_WIDTH), so a memory request's
+ * address field, which carries the VA and then the PA, is REQ_ADDR_WIDTH. */
 `define PA_WIDTH 36
+`define REQ_ADDR_WIDTH ((`PA_WIDTH > `M_WIDTH) ? `PA_WIDTH : `M_WIDTH)
 
 /* Supported virtual-address bits within a region (MIPS SEGBITS). A non-compat 64b
  * VA must fit in SEGBITS, i.e. VA[61:SEGBITS]==0, else Address Error (Sail
@@ -497,7 +526,7 @@
  * a privilege AdEL, changing the fault class in exactly the squash window
  * under investigation; an unaligned one may not fault cleanly at all (see the
  * Sail conformance gap on address-errors for out-of-range fetch). */
-`define BTB_POISON_PC 64'h00000000deadcafc
+`define BTB_POISON_PC 32'hdeadcafc
 
 typedef enum logic [5:0] {
    MEM_LB   = 6'd0,

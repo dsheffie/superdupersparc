@@ -326,7 +326,7 @@ module uni_divider(clk,
      begin
 	t_lo = (r_is_signed & r_sign)     ? ((~r_q) + 'd1)            : r_q;
 	t_hi = (r_is_signed & r_rem_sign) ? ((~r_rem[W-1:0]) + 'd1)  : r_rem[W-1:0];
-	if(r_is_32b & (`M_WIDTH == 64))
+	if(r_is_32b)
 	  begin
 	     t_lo = { {32{t_lo[31]}}, t_lo[31:0] };
 	     t_hi = { {32{t_hi[31]}}, t_hi[31:0] };

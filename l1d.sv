@@ -450,7 +450,7 @@ endfunction
    
    
    logic [`LG_L1D_NUM_SETS-1:0] 	  t_miss_idx, r_miss_idx;
-   logic [`M_WIDTH-1:0] 		  t_miss_addr, r_miss_addr;
+   logic [`REQ_ADDR_WIDTH-1:0] 	  t_miss_addr, r_miss_addr;
 
    //write port   
    logic [`LG_L1D_NUM_SETS-1:0] 	  t_array_wr_addr;
@@ -469,13 +469,14 @@ endfunction
    logic [LG_PG_LINES-1:0] 		  r_pg_off, n_pg_off;
    logic [15:0] 			  r_pg_dirty_cnt, n_pg_dirty_cnt;
    assign pg_drop_dirty_cnt = r_pg_dirty_cnt;
-   wire [`PA_WIDTH-1:0] 		  w_pg_line = {flush_cl_addr[`PA_WIDTH-1:`LG_PG_SZ], r_pg_off, {`LG_L1D_CL_LEN{1'b0}}};
-   wire [`PA_WIDTH-1:0] 		  w_pg_line_nxt = {flush_cl_addr[`PA_WIDTH-1:`LG_PG_SZ], r_pg_off + 1'b1, {`LG_L1D_CL_LEN{1'b0}}};
-   wire [`PA_WIDTH-1:0] 		  w_pg_line0 = {flush_cl_addr[`PA_WIDTH-1:`LG_PG_SZ], {`LG_PG_SZ{1'b0}}};
+   wire [`PA_WIDTH-1:0] 		  w_flush_pa = `PA_WIDTH'(flush_cl_addr);
+   wire [`PA_WIDTH-1:0] 		  w_pg_line = {w_flush_pa[`PA_WIDTH-1:`LG_PG_SZ], r_pg_off, {`LG_L1D_CL_LEN{1'b0}}};
+   wire [`PA_WIDTH-1:0] 		  w_pg_line_nxt = {w_flush_pa[`PA_WIDTH-1:`LG_PG_SZ], r_pg_off + 1'b1, {`LG_L1D_CL_LEN{1'b0}}};
+   wire [`PA_WIDTH-1:0] 		  w_pg_line0 = {w_flush_pa[`PA_WIDTH-1:`LG_PG_SZ], {`LG_PG_SZ{1'b0}}};
    wire 				  w_pg_hit = r_valid_out & (r_tag_out == w_pg_line[`PA_WIDTH-1:TAG_LSB]);
    assign dma_inval_ack = r_dma_inval_ack;
    /* arbitrated line address/op: the CPU CACHE-op wins; DMA is always invalidate */
-   wire [`M_WIDTH-1:0] 			  w_cl_addr  = r_cl_is_dma ? {{(`M_WIDTH-`PA_WIDTH){1'b0}}, dma_inval_addr} : flush_cl_addr;
+   wire [`PA_WIDTH-1:0] 		  w_cl_addr  = r_cl_is_dma ? dma_inval_addr : w_flush_pa;
    wire 				  w_cl_inval = r_cl_is_dma ? 1'b1 : flush_cl_inval;
    logic 				  r_flush_complete, n_flush_complete;
    
@@ -500,6 +501,7 @@ endfunction
    
    logic 				  t_hit_cache2;
    logic 				  t_rsp_dst_valid2;
+   logic 				  t_rsp_dst2;   /* the answered request is an ldd */
    logic 				  t_rsp_fp_dst_valid2;
    logic [63:0] 			  t_rsp_data2;
 
@@ -507,7 +509,7 @@ endfunction
    
    logic [L1D_CL_LEN_BITS-1:0] 		  t_array_data;
    
-   logic [`M_WIDTH-1:0] 		  t_addr;
+   logic [`REQ_ADDR_WIDTH-1:0] 	  t_addr;
    logic 				  t_got_req, t_got_req2;
    logic 				  t_got_miss;
    logic 				  t_push_miss;
@@ -533,12 +535,12 @@ endfunction
    logic [`LG_MEM_SCHED_ENTRIES-1:0] 	  n_core_mem_st_done_idx, r_core_mem_st_done_idx;
    mem_rsp_t n_core_mem_rsp, r_core_mem_rsp;
 
-   wire [5:0] w_tlb_index;
-   wire        w_tlb_dirty;
-   wire        w_tlb_valid;
-   wire [2:0]  w_tlb_c;     /* dtlb: matched page cacheability (EntryLo C/CCA) */
-   wire	      w_tlb_hit;
-   wire	      w_tlb_oor;   /* dtlb: matched entry's PFN exceeds MAX_PA(36b) -> Addr Error */
+   logic [5:0] w_tlb_index;
+   logic       w_tlb_dirty;
+   logic       w_tlb_valid;
+   logic [2:0] w_tlb_c;     /* dtlb: matched page cacheability (EntryLo C/CCA) */
+   logic       w_tlb_hit;
+   logic       w_tlb_oor;   /* dtlb: matched entry's PFN exceeds MAX_PA(36b) -> Addr Error */
 
       
    mem_req_t n_req, r_req, t_req;
@@ -675,7 +677,7 @@ endfunction
    logic [63:0] 	       n_cache_accesses, r_cache_accesses;
    logic [63:0] 	       n_cache_hits, r_cache_hits;
 
-   wire [`PA_WIDTH-1:0]      w_mapped_addr;
+   logic [`PA_WIDTH-1:0]     w_mapped_addr;
    /* port-2 tag is the TLB-TRANSLATED physical tag (w_mapped_addr), not the VA
     * tag (r_cache_tag2).  For unmapped accesses w_mapped_addr == va (1:1) so this
     * is equivalent; for mapped accesses it is the real physical tag.  Aligned
@@ -1024,7 +1026,7 @@ endfunction
    always_comb
      begin
 	t_remapped_req2 = r_req2;
-	t_remapped_req2.addr = {{(`M_WIDTH-`PA_WIDTH){1'b0}}, w_mapped_addr};
+	t_remapped_req2.addr = `REQ_ADDR_WIDTH'(w_mapped_addr);
 `ifdef L1D_PA_INDEX
 	t_req2_idx = w_mapped_addr[IDX_STOP-1:IDX_START];   /* (old behaviour) the PA set */
 `else
@@ -1179,7 +1181,7 @@ endfunction
 	if(r_req2.commit)
 	  begin
 	     t_mq_push_req = r_req2;
-	     t_mq_push_req.addr = {{(`M_WIDTH-`PA_WIDTH){1'b0}}, r_sb_pa[r_req2.lsu_idx]};
+	     t_mq_push_req.addr = `REQ_ADDR_WIDTH'(r_sb_pa[r_req2.lsu_idx]);
 	     t_mq_push_idx = r_sb_idx[r_req2.lsu_idx];
 	     t_mq_push_req.op = r_sb_op[r_req2.lsu_idx];
 	     t_mq_push_req.data = r_sb_data[r_req2.lsu_idx];
@@ -2595,27 +2597,19 @@ endfunction
 
 
    
-   tlb dtlb (
-	     .clk(clk),
-	     .reset(reset),
-	     .asid(asid),
-	     .active(core_mem_req.mapped),
-	     /* translate whatever is presented, NOT only an accepted request: the
-	      * registered outputs are read only in the cycle after an accept, when
-	      * this is that request's address anyway.  Keeps the port-2 accept
-	      * decision (store-buffer compare, fill start, ...) off the CAM path. */
-	     .req(core_mem_req_valid),
-	     .va(core_mem_req.addr),
-	     .pa(w_mapped_addr),
-	     .hit(w_tlb_hit),
-	     .hit_index(w_tlb_index),
-	     .dirty(w_tlb_dirty),
-	     .valid(w_tlb_valid),
-	     .cache_attr(w_tlb_c),
-	     .out_of_range(w_tlb_oor),
-	     .tlb_entry_in_valid(tlb_entry_in_valid),
-	     .tlb_entry_in(tlb_entry_in)
-	     );
+   /* SPARC, SRMMU not yet wired: the MMU-off translation (PA = VA), registered
+    * like tlb.sv's outputs (read the cycle after the request).  The MIPS dTLB is
+    * gone; tlb_entry_in is unused until the SRMMU's TLB takes its place. */
+   always_ff@(posedge clk)
+     begin
+	w_tlb_hit <= ~reset;
+	w_tlb_index <= 'd0;
+	w_tlb_dirty <= ~reset;
+	w_tlb_valid <= ~reset;
+	w_tlb_c <= 3'd3;
+	w_mapped_addr <= `PA_WIDTH'(core_mem_req.addr);
+	w_tlb_oor <= 1'b0;
+     end
    
 
 
@@ -2718,9 +2712,11 @@ endfunction
 	/* whole-struct default first: every field is set just below, but Verilator 4.200's
 	 * latch check does not count field-by-field assignment as assigning the struct */
 	n_core_mem_rsp = 'd0;
-	n_core_mem_rsp.data = r_req.addr;
+	n_core_mem_rsp.data = `MEM_WIDTH'(r_req.addr);
 	n_core_mem_rsp.rob_ptr = r_req.rob_ptr;
 	n_core_mem_rsp.dst_ptr = r_req.dst_ptr;
+	n_core_mem_rsp.dst2_ptr = r_req.dst2_ptr;
+	t_rsp_dst2 = r_req.dst2_valid;
 	n_core_mem_rsp.dst_valid = 1'b0;
 	n_core_mem_rsp.fp_dst = r_req.fp_dst;
 	n_core_mem_rsp.fp_merge = r_req.fp_merge;   /* FR=0 lwc1 merge (carried to writeback) */
@@ -2809,7 +2805,7 @@ endfunction
 	 * above; a deferred one (r_fill_rsp_pend) goes out in the always-free next slot */
 	n_fill_rsp_pend = 1'b0;
 	t_fill_rsp = n_core_mem_rsp;
-	t_fill_rsp.data = t_rsp_data[`M_WIDTH-1:0];
+	t_fill_rsp.data = t_rsp_data[`MEM_WIDTH-1:0];
 	t_fill_rsp.dst_valid = r_req.dst_valid;
 	t_fill_rsp.bad_addr = r_req.bad_addr;
 	if(r_fill_rsp_pend)
@@ -2824,9 +2820,11 @@ endfunction
 	 * being filled is treated as a miss (r_fill_conflict2). */
 	if(r_got_req2 && ((r_state == ACTIVE) || (r_state == INJECT_RELOAD)))
 		 begin
-		    n_core_mem_rsp.data = r_req2.addr;
+		    n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 		    n_core_mem_rsp.rob_ptr = r_req2.rob_ptr;
 		    n_core_mem_rsp.dst_ptr = r_req2.dst_ptr;
+		    n_core_mem_rsp.dst2_ptr = r_req2.dst2_ptr;
+		    t_rsp_dst2 = r_req2.dst2_valid;
 		    /* port2 response routes to FP-vs-int by THIS port's req (the
 		     * default at the top uses r_req = port1, wrong for a port2 rsp) */
 		    n_core_mem_rsp.fp_dst = r_req2.fp_dst;
@@ -2867,7 +2865,7 @@ endfunction
 		      end
 		    else if(r_req2.bad_addr)
 		      begin
-			 n_core_mem_rsp.data = r_req2.addr;
+			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
 			 n_core_mem_rsp_valid = 1'b1;			 
@@ -2879,7 +2877,7 @@ endfunction
 		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
 		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
 		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = r_req2.addr;
+		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			  n_core_mem_rsp.dst_valid = 1'b0;
 			  n_core_mem_rsp.bad_addr = 1'b0;
 			  n_core_mem_rsp.tlb_refill = 1'b1;
@@ -2893,7 +2891,7 @@ endfunction
 		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
 		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
 		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = r_req2.addr;
+		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			  n_core_mem_rsp.dst_valid = 1'b0;
 			  n_core_mem_rsp.bad_addr = 1'b0;
 			  n_core_mem_rsp.tlb_invalid = 1'b1;
@@ -2909,7 +2907,7 @@ endfunction
 		   * zero-extending it to PA_WIDTH drops the high 64-bit VA bits.  The
 		   * R4000 refill/kmiss reads BadVAddr (+Context) to find the PTE, so it
 		   * must be the full VA (e.g. kseg2 0xffffffffc0000000). */
-		  n_core_mem_rsp.data = r_req2.addr;
+		  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			  n_core_mem_rsp.dst_valid = 1'b0;
 			  n_core_mem_rsp.bad_addr = 1'b0;
 			  n_core_mem_rsp.tlb_modified = 1'b1;
@@ -2921,7 +2919,7 @@ endfunction
 		       begin
 			  /* Sail TLBTranslateC: valid+dirty entry whose PFN maps beyond
 			   * MAX_PA(36b) -> Address Error (AdEL/AdES); BadVAddr = the VA. */
-			  n_core_mem_rsp.data = r_req2.addr;
+			  n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			  n_core_mem_rsp.dst_valid = 1'b0;
 			  n_core_mem_rsp.bad_addr = 1'b1;
 			  n_core_mem_rsp_valid = 1'b1;
@@ -2938,7 +2936,7 @@ endfunction
 			  * IP22: a load reads 0; a store takes its normal address pass and is
 			  * dropped when it commits (the port-1 arm below). */
 `ifdef ENABLE_R10000
-			 n_core_mem_rsp.data = r_req2.addr;
+			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
 			 n_core_mem_rsp.dst_valid = 1'b0;
 			 n_core_mem_rsp.bus_err = 1'b1;
 `else
@@ -2962,7 +2960,7 @@ endfunction
 			      /* SC/SCD: answer the reservation (link) now; the commit writes
 			       * only if it held (sc_ok). Do NOT require a cache hit, else a
 			       * conflict-displaced line livelocks the SC (rv64core MEM_SCD). */
-			      n_core_mem_rsp.data = {{(`M_WIDTH-1){1'b0}}, w_match_link2};
+			      n_core_mem_rsp.data = {{(`MEM_WIDTH-1){1'b0}}, w_match_link2};
 			      n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			   end
 			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
@@ -2987,7 +2985,7 @@ endfunction
 		      begin
 			 /* store->load forward (t_data2 already merged) */
 			 t_pt2 = "V";
-			 n_core_mem_rsp.data = t_rsp_data2[`M_WIDTH-1:0];
+			 n_core_mem_rsp.data = t_rsp_data2[`MEM_WIDTH-1:0];
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
 			 n_core_mem_rsp.tlb_hit = w_tlb_hit;
@@ -3024,7 +3022,7 @@ endfunction
 				  r_cycle, r_req2.uuid, r_req2.addr, t_rsp_data2);
 `endif
 			 t_pt2 = "H";
-			 n_core_mem_rsp.data = t_rsp_data2[`M_WIDTH-1:0];
+			 n_core_mem_rsp.data = t_rsp_data2[`MEM_WIDTH-1:0];
                          n_core_mem_rsp.dst_valid = t_rsp_dst_valid2;
 			 n_core_mem_rsp.fp_dst = r_req2.fp_dst;   /* port2: route FP loads to the FP PRF */
 			 n_core_mem_rsp.fp_merge = r_req2.fp_merge;   /* FR=0 lwc1 merge */
@@ -3281,7 +3279,7 @@ endfunction
 			 else
 			   begin
 			      t_pt1 = "P";
-			      n_core_mem_rsp.data = t_rsp_data[`M_WIDTH-1:0];
+			      n_core_mem_rsp.data = t_rsp_data[`MEM_WIDTH-1:0];
 			      n_core_mem_rsp.dst_valid = t_rsp_dst_valid;
 			      n_core_mem_rsp_valid = 1'b1;
 			      n_core_mem_rsp.bad_addr = r_req.bad_addr;
@@ -3591,7 +3589,7 @@ endfunction
 		 begin
 		    //$display("data returns for uncached load");
 		    t_pt1 = "P";
-		    n_core_mem_rsp.data = t_rsp_data[`M_WIDTH-1:0];
+		    n_core_mem_rsp.data = t_rsp_data[`MEM_WIDTH-1:0];
                     n_core_mem_rsp.dst_valid = r_req.dst_valid & !mem_rsp_bad;
 		    n_core_mem_rsp.bad_addr = r_req.bad_addr;		    
 		    n_core_mem_rsp.bus_err = mem_rsp_bad;   /* DBE at retirement */
@@ -3860,6 +3858,9 @@ endfunction
 		  
 		  n_cache_accesses =  r_cache_accesses + 'd1;
 	  end
+	/* SPARC ldd: its second destination rides with the first (whichever
+	 * port's request this response answers) */
+	n_core_mem_rsp.dst2_valid = n_core_mem_rsp.dst_valid & t_rsp_dst2;
      end // always_comb
 
 `ifdef VERILATOR

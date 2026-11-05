@@ -1,4 +1,5 @@
 #include "top.hh"
+#include <cstring>
 #include <deque>
 
 /* SPARC V8 Verilator testbench.  s = the architectural state the RTL's retire
@@ -798,6 +799,9 @@ int main(int argc, char **argv) {
     if(tb->retire_reg_two_valid) {
       s->r[tb->retire_reg_two_ptr] = tb->retire_reg_two_data;
     }
+    if(tb->retire_y_valid) {
+      s->y = tb->retire_y_data;
+    }
 
     /* architectural compare once the cycle's writebacks have landed: the RTL's
      * retired registers (s) against the ISS (ss) */
@@ -812,7 +816,16 @@ int main(int argc, char **argv) {
 	  incorrect = true;
 	}
       }
+      if(s->y != ss->y) {
+	++mismatches;
+	std::cout << "Y does not match : rtl " << std::hex << s->y << " simulator " << ss->y << std::dec
+		  << " after " << std::hex << last_match_pc << std::dec
+		  << " : " << getAsmString(get_insn(last_match_pc, s), last_match_pc) << "\n";
+	incorrect = true;
+      }
       if(incorrect) {
+	std::cout << "iss: pc " << std::hex << ss->pc << " npc " << ss->npc << " psr " << ss->get_psr()
+		  << " wim " << ss->wim << std::dec << "\n";
 	std::cout << "rtl registers:\n";
 	dump_regs(s);
 	break;
@@ -828,7 +841,44 @@ int main(int argc, char **argv) {
       break;
     }
     if(tb->got_break) {
-      std::cout << "got break, epc = " << std::hex << tb->epc << std::dec << "\n";
+      /* the RTL halted in error mode (a trap with ET=0) at epc, without retiring
+       * that instruction: the ISS must take the same trap into error mode */
+      std::cout << "RTL error mode at pc " << std::hex << tb->epc << std::dec << "\n";
+      if(enable_checker) {
+	if(ss->pc == static_cast<uint32_t>(tb->epc)) {
+	  execSparc(ss);
+	}
+	/* the L1D and L2 were flushed (FLUSH_FOR_HALT) before got_break, so sm0 is
+	 * the RTL's final memory.  It must match the ISS's byte for byte: the
+	 * register compare never sees a bad store that is not loaded back (a dead
+	 * window spill, say) */
+	uint64_t n_bad_pages = 0, first_bad = 0;
+	for(uint64_t pa = 0; pa < sparse_mem::sz; pa += sparse_mem::pgsize) {
+	  if(memcmp(sm0->mem + pa, sm1->mem + pa, sparse_mem::pgsize) != 0) {
+	    if(n_bad_pages == 0) {
+	      first_bad = pa;
+	      while(sm0->mem[first_bad] == sm1->mem[first_bad]) {
+		++first_bad;
+	      }
+	    }
+	    ++n_bad_pages;
+	  }
+	}
+	if(n_bad_pages != 0) {
+	  std::cout << "FAIL: memory differs in " << n_bad_pages << " pages, first at "
+		    << std::hex << first_bad << " : rtl " << static_cast<uint32_t>(sm0->mem[first_bad])
+		    << " simulator " << static_cast<uint32_t>(sm1->mem[first_bad]) << std::dec << "\n";
+	  incorrect = true;
+	}
+	else if(ss->error_mode) {
+	  std::cout << "PASS: RTL and ISS halt in error mode at the same pc\n";
+	}
+	else {
+	  std::cout << "FAIL: the ISS is at pc " << std::hex << ss->pc << std::dec
+		    << ", not in error mode at the RTL's\n";
+	  incorrect = true;
+	}
+      }
       break;
     }
     else if(tb->got_ud) {

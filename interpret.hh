@@ -131,6 +131,7 @@ public:
   uint32_t irl = 0;          /* external interrupt request level, 0 = none */
   bool brk = false;          /* halted (exit syscall or error mode) */
   bool error_mode = false;
+  uint32_t last_tt = 0;      /* trap type of the most recent trap, error mode included (tb_decode_sparc) */
   int exit_code = 0;
   uint64_t icnt = 0;
 

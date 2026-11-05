@@ -42,6 +42,8 @@ module l1i(clk,
 	   blk_inv_addr,
 	   blk_inv_done,
 	   restart_pc,
+	   restart_npc,
+	   restart_npc_valid,
 	   dbg_arch_hist,
 	   dbg_spec_hist,
 	   restart_valid,
@@ -114,6 +116,10 @@ module l1i(clk,
    output logic       blk_inv_done;
    //restart signals
    input logic [`M_WIDTH-1:0] restart_pc;
+   /* SPARC jmpl;rett: the restart's NEXT pc -- fetch one instruction at
+    * restart_pc, then continue at restart_npc (a restart into a delay slot) */
+   input logic [`M_WIDTH-1:0] restart_npc;
+   input logic 	      restart_npc_valid;
    /* Global history, read back over the existing trace-index debug port.
     * ARCH is the RETIRED history (updated at branch retirement); SPEC is the
     * speculative copy the PHT is actually indexed with.  Dumping BOTH lets a
@@ -130,7 +136,7 @@ module l1i(clk,
    input logic 			retired_call;
    input logic 			retired_ret;
 
-   input logic [4:0] 		retire_reg_ptr;
+   input logic [`LG_PRF_ENTRIES-1:0] retire_reg_ptr;
    input logic [`M_WIDTH-1:0]	retire_reg_data;
    input logic 			retire_reg_valid;
 
@@ -410,6 +416,8 @@ endfunction
    
    logic 		  r_restart_req, n_restart_req;
    logic 		  r_restart_ack, n_restart_ack;
+   logic 		  r_npc_pend, n_npc_pend;
+   logic [`M_WIDTH-1:0]   r_npc, n_npc, r_npc_l1, n_npc_l1;
    logic 		  r_req, n_req;
    logic 		  r_valid_out0, r_valid_out1;
    /* L1I way select / replacement: r_lru_out = the set's LRU way (read with the arrays),
@@ -457,7 +465,6 @@ endfunction
    //end
    
    
-   localparam SEXT = `M_WIDTH-16;
    insn_fetch_t t_insn, t_insn2;
    logic [3:0] t_pd, r_pd;
 
@@ -719,58 +726,20 @@ endfunction
      end
 
 
-   mipsseg seg0 (
-		 .v_addr(n_cache_pc),
-		 .l_addr(w_la_pc),
-		 .cache(w_cached),
-		 .mapped(w_mapped),
-		 .seg(w_seg),
-		 .bad_perms(w_bad_perms),    /* i-side AdEL: harvested below into r_bad_va */
-		 .erl(1'b0),                 /* TODO: ERL kuseg fetch (unmapped) is not wired to the I-side */
-		 .in_kernel_mode(in_kernel_mode),
-		 .in_supervisor_mode(in_supervisor_mode),
-		 .in_user_mode(in_user_mode),
-		 .in_64b_kernel_mode(in_64b_kernel_mode),
-		 .in_64b_supervisor_mode(in_64b_supervisor_mode),
-		 .in_64b_user_mode(in_64b_user_mode)
-		 );
+   /* SPARC, SRMMU not yet wired: fetch runs as with the MMU off (MCR.E = 0),
+    * PA = VA, cached.  The MIPS segment map and I-TLB are gone; the mapped paths
+    * below stay dead (r_mapped = 0) until the SRMMU's TLB takes their place. */
+   assign w_la_pc = n_cache_pc;
+   assign w_cached = 1'b1;
+   assign w_mapped = 1'b0;
+   assign w_seg = 2'd0;
+   assign w_bad_perms = 1'b0;
 
-   /* I-side TLB: translates kuseg/kseg2 fetch addresses */
-   wire [`PA_WIDTH-1:0] w_itlb_pa;
-   wire 		w_itlb_hit;
-   wire 		w_itlb_valid;   /* V bit of matched page */
-
-   /* micro-ITLB fast path: combinational lookup (w_ufast_*, aligned to w_la_pc =
-    * seg(n_cache_pc)), registered to r_ufast_* to line up with r_cache_pc/r_mapped
-    * one stage later.  install_en re-loads the micro-TLB from the 48-way when a
-    * prime lands a hit (r_itlb_ready & w_itlb_hit). */
-   wire 		w_ufast_hit, w_ufast_valid;
-   wire [`PA_WIDTH-1:0] w_ufast_pa;
+   wire [`PA_WIDTH-1:0] w_itlb_pa = 'd0;
+   wire 		w_itlb_hit = 1'b0;
+   wire 		w_itlb_valid = 1'b0;
    logic 		r_ufast_hit, r_ufast_valid;
    logic [`PA_WIDTH-1:0] r_ufast_pa;
-   wire 		w_itlb_install = r_itlb_ready & w_itlb_hit;
-
-   itlb u_itlb (
-		       .clk(clk),
-		       .reset(reset),
-		       .asid(asid),
-		       .active(w_mapped),
-		       .req(1'b1),
-		       .va(w_la_pc),
-		       .pa(w_itlb_pa),
-		       .hit(w_itlb_hit),
-		       .hit_index(),
-		       .dirty(),
-		       .valid(w_itlb_valid),
-		       .cache_attr(),     /* i-side cacheability unused (i-fetch cached) */
-		       .out_of_range(),   /* i-side address-error: TODO (d-side first) */
-		       .tlb_entry_in_valid(tlb_entry_in_valid),
-		       .tlb_entry_in(tlb_entry_in),
-		       .install_en(w_itlb_install),
-		       .ufast_hit(w_ufast_hit),
-		       .ufast_pa(w_ufast_pa),
-		       .ufast_valid(w_ufast_valid)
-		       );
 
    always@(posedge clk)
      begin
@@ -781,12 +750,11 @@ endfunction
 	r_bad_va <= reset ? 1'b0 : w_bad_perms;
      end
 
-   /* register the micro-TLB lookup one stage so it aligns with r_cache_pc/r_mapped */
    always_ff@(posedge clk)
      begin
-	r_ufast_hit   <= reset ? 1'b0 : w_ufast_hit;
-	r_ufast_valid <= reset ? 1'b0 : w_ufast_valid;
-	r_ufast_pa    <= reset ? 'd0  : w_ufast_pa;
+	r_ufast_hit   <= 1'b0;
+	r_ufast_valid <= 1'b0;
+	r_ufast_pa    <= 'd0;
      end
 
    /* effective (source-agnostic) itlb result: a micro-TLB hit short-circuits the
@@ -796,7 +764,7 @@ endfunction
    wire [`PA_WIDTH-1:0] w_eff_pa = r_ufast_hit ? r_ufast_pa : w_itlb_pa;
 
    /* For mapped (kuseg) addresses use TLB-translated PA; unmapped uses mipsseg output directly */
-   assign w_tlb_pc = (r_mapped && w_eff_hit) ? w_eff_pa : r_la_pc[`PA_WIDTH-1:0];
+   assign w_tlb_pc = (r_mapped && w_eff_hit) ? w_eff_pa : `PA_WIDTH'(r_la_pc);
    
    wire w_hit0 = r_valid_out0 & (r_tag_out0 == w_tlb_pc[(`PA_WIDTH-1):TAG_LSB]);
    wire w_hit1 = r_valid_out1 & (r_tag_out1 == w_tlb_pc[(`PA_WIDTH-1):TAG_LSB]);
@@ -823,6 +791,9 @@ endfunction
 	n_cache_pc = 'd0;
 	n_state = r_state;
 	n_restart_ack = 1'b0;
+	n_npc_pend = r_npc_pend;
+	n_npc = r_npc;
+	n_npc_l1 = r_npc_l1;
 	n_flush_req = r_flush_req | flush_req;
 	n_fline_req = r_fline_req | flush_line_req;
 	n_fline_idx = flush_line_req ? flush_line_idx : r_fline_idx;
@@ -920,9 +891,8 @@ endfunction
 	 * idx == 2) is fetched sequentially next cycle, then the target. */
 	t_gb_pd1 = select_pd(t_jump_out, t_insn_idx + 2'd1);
 	t_gb_pc1 = r_cache_pc + 'd4;
-	t_gb_simm1 = {{SEXT{t_insn_data2[15]}},t_insn_data2[15:0]};
-	t_gb_target1 = (t_gb_pd1 == 4'd3) ? {t_gb_pc1[`M_WIDTH-1:28], t_insn_data2[25:0], 2'd0} :
-		       ((t_gb_pc1 + 'd4) + {t_gb_simm1[`M_WIDTH-3:0], 2'd0});
+	t_gb_simm1 = {{(`M_WIDTH-24){t_insn_data2[21]}}, t_insn_data2[21:0], 2'd0};
+	t_gb_target1 = t_gb_pc1 + t_gb_simm1;
 	t_gb_ok1 = (t_first_branch == 'd1) && (t_insn_idx <= 2'd2) && !fq_full2 &&
 		   ((t_gb_pd1 == 4'd1) || (t_gb_pd1 == 4'd2) || (t_gb_pd1 == 4'd3) || (t_gb_pd1 == 4'd8));
 
@@ -932,7 +902,8 @@ endfunction
 		       {2'd0, select_pd(t_jump_out, 'd3) != 4'd0};
 	
 		
-	t_simm = {{SEXT{t_insn_data[15]}},t_insn_data[15:0]};
+	/* SPARC Bicc/FBfcc: the byte displacement sext(disp22)*4, from the branch's own pc */
+	t_simm = {{(`M_WIDTH-24){t_insn_data[21]}}, t_insn_data[21:0], 2'd0};
 	t_clear_fq = 1'b0;
 	t_push_insn = 1'b0;
 	t_push_insn2 = 1'b0;
@@ -974,11 +945,20 @@ endfunction
 	  ACTIVE:
 	    begin
 	       t_cache_idx = r_pc[IDX_STOP-1:IDX_START];
-	       t_cache_tag = r_pc[(`PA_WIDTH-1):TAG_LSB];
+	       t_cache_tag = N_TAG_BITS'(r_pc[(`M_WIDTH-1):TAG_LSB]);
 	       /* accessed with this address */
 	       n_cache_pc = r_pc;
 	       n_req = 1'b1;
 	       n_pc = r_pc + 'd4;
+	       /* a restart into a delay slot (jmpl;rett): the restart pc is looked up
+		* now, the one after it is restart_npc, and it is consumed as a delay
+		* slot (pushed alone) */
+	       if(r_npc_pend && (r_pc == r_npc_l1))
+		 begin
+		    n_pc = r_npc;
+		    n_delay_slot = 1'b1;
+		    n_npc_pend = 1'b0;
+		 end
 	       if(r_resteer_bubble)
 		 begin
 		    //do nothing?
@@ -1066,14 +1046,21 @@ endfunction
 			 t_is_call = (t_pd == 4'd5);
 			 //if(t_is_call) $display("predict jal at %x will return to %x",
 			 //r_cache_pc, r_cache_pc+'d8);
-			 n_pc = {r_cache_pc[`M_WIDTH-1:28], t_insn_data[25:0], 2'd0};
+			 n_pc = r_cache_pc + {t_insn_data[29:0], 2'd0};   /* call: pc + disp30*4 */
+		      end
+		    else if(t_pd == 4'd10)
+		      begin
+			 /* ba,a: a jump with no delay slot -- straight to the target */
+			 t_is_cflow = 1'b1;
+			 t_take_br = 1'b1;
+			 n_pc = r_cache_pc + t_simm;
 		      end
 		    else if(t_pd == 4'd8)
 		      begin
 			 t_is_cflow = 1'b1;			 
 			 n_delay_slot = 1'b1;
 			 t_take_br = 1'b1;
-			 n_pc = ((r_cache_pc + 'd4) + {t_simm[`M_WIDTH-3:0], 2'd0});
+			 n_pc = r_cache_pc + t_simm;
 		      end
 		    else if(t_pd == 4'd2)
 		      begin
@@ -1082,7 +1069,7 @@ endfunction
 			 t_is_cflow = 1'b1;			 
 			 n_delay_slot = 1'b1;
 			 t_take_br = 1'b1;
-			 n_pc = ((r_cache_pc + 'd4) + {t_simm[`M_WIDTH-3:0], 2'd0});
+			 n_pc = r_cache_pc + t_simm;
 		      end
 		    else if(t_pd == 4'd9)
 		      begin
@@ -1097,7 +1084,7 @@ endfunction
 			   begin
 			      t_is_cflow = 1'b1;
 			      n_delay_slot = 1'b1;			      
-			      n_pc = ((r_cache_pc + 'd4) + {t_simm[`M_WIDTH-3:0], 2'd0});
+			      n_pc = r_cache_pc + t_simm;
 			      t_is_call = 1'b1;
 			      t_take_br = 1'b1;
 			      //$display("some flavor of branch and link, predicting target %x", n_pc);
@@ -1108,7 +1095,7 @@ endfunction
 			 t_is_cflow = 1'b1;			 
 			 n_delay_slot = 1'b1;
 			 t_take_br = 1'b1;
-			 n_pc = ((r_cache_pc + 'd4) + {t_simm[`M_WIDTH-3:0], 2'd0});
+			 n_pc = r_cache_pc + t_simm;
 			 //if(t_insn_idx != 'd3 && !fq_full2)
 			 //begin
 			 //t_push_insn2 = 1'b1;
@@ -1154,7 +1141,7 @@ endfunction
 			      t_update_spec_hist = 1'b1;
 			      n_delay_slot = 1'b1;
 			      n_cache_pc = r_cache_pc + 'd8;
-			      t_cache_tag = n_cache_pc[(`PA_WIDTH-1):TAG_LSB];
+			      t_cache_tag = N_TAG_BITS'(n_cache_pc[(`M_WIDTH-1):TAG_LSB]);
 			      n_pc = t_gb_target1;
 			      if(t_insn_idx == 2'd2)
 				begin
@@ -1167,7 +1154,7 @@ endfunction
 			       * idx <= 2 here since the 16B line end bounds t_first_branch */
 			      t_push_insn2 = 1'b1;
 			      n_cache_pc = r_cache_pc + 'd8;
-			      t_cache_tag = n_cache_pc[(`PA_WIDTH-1):TAG_LSB];
+			      t_cache_tag = N_TAG_BITS'(n_cache_pc[(`M_WIDTH-1):TAG_LSB]);
 			      n_pc = r_cache_pc + 'd12;
 			      if(t_insn_idx == 2'd2)
 				begin
@@ -1206,7 +1193,7 @@ endfunction
 	  RELOAD_TURNAROUND:
 	    begin
 	       t_cache_idx = r_miss_pc[IDX_STOP-1:IDX_START];
-	       t_cache_tag = r_miss_pc[(`PA_WIDTH-1):TAG_LSB];
+	       t_cache_tag = N_TAG_BITS'(r_miss_pc[(`M_WIDTH-1):TAG_LSB]);
 	       if(n_flush_req)
 		 begin
 		    n_flush_req = 1'b0;
@@ -1260,7 +1247,7 @@ endfunction
 	  WAIT_FOR_NOT_FULL:
 	    begin
 	       t_cache_idx = r_miss_pc[IDX_STOP-1:IDX_START];
-	       t_cache_tag = r_miss_pc[(`PA_WIDTH-1):TAG_LSB];
+	       t_cache_tag = N_TAG_BITS'(r_miss_pc[(`M_WIDTH-1):TAG_LSB]);
 	       n_cache_pc = r_miss_pc;
 	       if(!fq_full)
 		 begin
@@ -1302,7 +1289,7 @@ endfunction
 	        * (!w_itlb_busy) return to ACTIVE with r_itlb_ready=1 so the normal
 	        * consume runs against the now-valid registered itlb outputs. */
 	       t_cache_idx = r_miss_pc[IDX_STOP-1:IDX_START];
-	       t_cache_tag = r_miss_pc[(`PA_WIDTH-1):TAG_LSB];
+	       t_cache_tag = N_TAG_BITS'(r_miss_pc[(`M_WIDTH-1):TAG_LSB]);
 	       n_cache_pc = r_miss_pc;
 	       n_pc = r_pc;
 	       n_req = 1'b1;
@@ -1347,6 +1334,12 @@ endfunction
 	    begin
 	    end
 	endcase // case (r_state)
+	if(n_restart_ack)
+	  begin
+	     n_npc_pend = restart_npc_valid;
+	     n_npc = restart_npc;
+	     n_npc_l1 = restart_pc;
+	  end
      end // always_comb
 
    always_comb
@@ -1374,7 +1367,7 @@ endfunction
 	t_insn.pred_target = n_pc;
 	t_insn.pred = t_take_br;
 	t_insn.bpu_idx = r_bpu_idx;
-	t_insn.is_branch = (t_pd != 4'd0);
+	t_insn.is_branch = (t_pd != 4'd0) && (t_pd != 4'd10);   /* a delay slot follows */
 `ifdef	ENABLE_CYCLE_ACCOUNTING
 	t_insn.fetch_cycle = r_cycle;
 `endif
@@ -1392,7 +1385,8 @@ endfunction
 	 * predicted-taken grouping they can, and they then trained entry 0 -- 2.85
 	 * -> 18.8 mispredicts/kiloinsn. */
 	t_insn2.bpu_idx = r_bpu_idx;
-	t_insn2.is_branch = (select_pd(t_jump_out, t_insn_idx + 2'd1) != 4'd0);
+	t_insn2.is_branch = (select_pd(t_jump_out, t_insn_idx + 2'd1) != 4'd0) &&
+			    (select_pd(t_jump_out, t_insn_idx + 2'd1) != 4'd10);
 `ifdef	ENABLE_CYCLE_ACCOUNTING
 	t_insn2.fetch_cycle = r_cycle;
 `endif
@@ -1969,16 +1963,17 @@ endfunction
 	     /* the mispredicted call's own arch push lands this same cycle */
 	     if(retire_reg_valid && retire_valid && retired_call)
 	       begin
-		  r_spec_return_stack[r_arch_rs_tos] <= retire_reg_data;
+		  r_spec_return_stack[r_arch_rs_tos] <= retire_reg_data + 'd8;
 	       end
 	  end
      end // always_ff@ (posedge clk)
    
    always_ff@(posedge clk)
      begin
+	/* a SPARC call links its OWN pc (%o7); ret / retl go to %o7 + 8 */
 	if(retire_reg_valid && retire_valid && retired_call)
 	  begin
-	     r_arch_return_stack[r_arch_rs_tos] <= retire_reg_data;
+	     r_arch_return_stack[r_arch_rs_tos] <= retire_reg_data + 'd8;
 	  end
      end
    always_comb
@@ -2058,6 +2053,7 @@ endfunction
 	     r_fq_next_tail_ptr <= 'd1;
 	     r_fq_tail_ptr <= 'd0;
 	     r_restart_req <= 1'b0;
+	     r_npc_pend <= 1'b0;
 	     r_flush_req <= 1'b0;
 	     r_flush_complete <= 1'b0;
 	     r_fline_req <= 1'b0;
@@ -2095,6 +2091,9 @@ endfunction
 	     r_fq_next_tail_ptr <= t_clear_fq ? 'd1 : n_fq_next_tail_ptr;
 	     r_fq_tail_ptr <= t_clear_fq ? 'd0 : n_fq_tail_ptr;
 	     r_restart_req <= n_restart_req;
+	     r_npc_pend <= n_npc_pend;
+	     r_npc <= n_npc;
+	     r_npc_l1 <= n_npc_l1;
 	     r_flush_req <= n_flush_req;
 	     r_flush_complete <= n_flush_complete;
 	     r_fline_req <= n_fline_req;

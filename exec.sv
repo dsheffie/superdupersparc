@@ -23,6 +23,11 @@ import "DPI-C" function int     loadfcsr();
 `endif
 
 module exec(clk, 
+	    ldd_lo_done,
+	    ldd_lo_rob,
+	    sparc_psr,
+	    sparc_wim,
+	    sparc_tbr,
 	    reset,
 	    ip6,
 	    ip5,
@@ -101,9 +106,11 @@ module exec(clk,
 	    //tell rob store data has been read
 	    core_store_data_ptr,
 	    core_store_data_ptr_valid,
-	    mem_rsp_dst_ptr,
-	    mem_rsp_dst_valid,
-	    mem_rsp_fp_dst,
+	    mem_rsp_dst_ptr_in,
+	    mem_rsp_dst2_ptr,
+	    mem_rsp_dst2_valid,
+	    mem_rsp_dst_valid_in,
+	    mem_rsp_fp_dst_in,
 	    mem_rsp_fp_merge,
 	    mem_rsp_fp_hi,
 	    mem_rsp_fp_pres,
@@ -138,6 +145,14 @@ module exec(clk,
    input logic ip4;
    input logic ip3;
    input logic ip2;
+   /* SPARC committed state for rdpsr/rdwim/rdtbr (core.sv): the PSR with its icc
+    * and CWP fields zero -- icc comes from the flags register, CWP from the uop */
+   input logic [31:0] sparc_psr;
+   input logic [31:0] sparc_wim;
+   input logic [31:0] sparc_tbr;
+   /* SPARC ldd: its parked rd+1 was written; completes the ldd's ROB entry */
+   output logic ldd_lo_done;
+   output logic [`LG_ROB_ENTRIES-1:0] ldd_lo_rob;
    input logic retire;
    input logic retire_two;
    input logic single_step;
@@ -242,13 +257,15 @@ module exec(clk,
    output logic 		      core_store_data_ptr_valid;
    
    
-   input logic [`LG_PRF_ENTRIES-1:0] mem_rsp_dst_ptr;
-   input logic 			     mem_rsp_dst_valid;
-   input logic 			     mem_rsp_fp_dst;
+   input logic [`LG_PRF_ENTRIES-1:0] mem_rsp_dst_ptr_in;
+   input logic [`LG_PRF_ENTRIES-1:0] mem_rsp_dst2_ptr;   /* SPARC ldd: rd+1 */
+   input logic 			     mem_rsp_dst2_valid;
+   input logic 			     mem_rsp_dst_valid_in;
+   input logic 			     mem_rsp_fp_dst_in;
    input logic 			     mem_rsp_fp_merge;   /* FR=0 lwc1 merge */
    input logic 			     mem_rsp_fp_hi;
    input logic [31:0]		     mem_rsp_fp_pres;
-   input logic [`M_WIDTH-1:0]	     mem_rsp_load_data;
+   input logic [`MEM_WIDTH-1:0]	     mem_rsp_load_data;
    input logic [`LG_ROB_ENTRIES-1:0] mem_rsp_rob_ptr;
    /* LSU: a completing simple load frees its entry (mem_rsp_valid & lsu_hold);
     * a block parks it with a code; a wakeup makes it issuable again */
@@ -286,8 +303,54 @@ module exec(clk,
     * loads plus SC/SCD/MFC1/DMFC1 set dst_valid=(rt!='d0)), which is the point --
     * it makes the invariant STRUCTURAL instead of resting on ~68 per-arm guards,
     * two of which were already found missing this month. */
+   /* SPARC ldd: one 64-bit response on the single writeback path.  rd takes the
+    * word at the address (the high half, big-endian) at once; rd+1 (the low half)
+    * is parked and written through the same PRF port on the next cycle with no
+    * load response.  The parked write is presented as a load response
+    * (mem_rsp_dst_* below), so the wakeups and forwards treat it like one.  The
+    * LSU has at most one ldd past issue at a time, so one parked entry suffices,
+    * and the ldd completes in the ROB only once rd+1 is written (ldd_lo_done):
+    * before that its rd+1 register could be freed and reused under the late
+    * write. */
+   logic r_park_valid;
+   logic [`LG_PRF_ENTRIES-1:0] r_park_ptr;
+   logic [31:0] r_park_data;
+   logic [`LG_ROB_ENTRIES-1:0] r_park_rob;
+   wire w_park_in = mem_rsp_valid & mem_rsp_dst_valid_in & mem_rsp_dst2_valid & ~mem_rsp_fp_dst_in;
+   wire w_park_go = r_park_valid & !mem_rsp_dst_valid_in;
+   always_ff@(posedge clk)
+     begin
+	if(reset | t_flash_clear)
+	  begin
+	     r_park_valid <= 1'b0;
+	  end
+	else if(w_park_in)
+	  begin
+	     r_park_valid <= 1'b1;
+	  end
+	else if(w_park_go)
+	  begin
+	     r_park_valid <= 1'b0;
+	  end
+	if(w_park_in)
+	  begin
+	     r_park_ptr <= mem_rsp_dst2_ptr;
+	     r_park_data <= mem_rsp_load_data[31:0];
+	     r_park_rob <= mem_rsp_rob_ptr;
+	  end
+     end // always_ff@ (posedge clk)
+   assign ldd_lo_done = w_park_go;
+   assign ldd_lo_rob = r_park_rob;
+
+   /* the effective load response: the real one, or the parked rd+1 */
+   wire [`LG_PRF_ENTRIES-1:0] mem_rsp_dst_ptr = w_park_go ? r_park_ptr : mem_rsp_dst_ptr_in;
+   wire mem_rsp_dst_valid = mem_rsp_dst_valid_in | w_park_go;
+   wire mem_rsp_fp_dst = mem_rsp_fp_dst_in & !w_park_go;
    wire w_mem_rsp_int_valid = mem_rsp_dst_valid & ~mem_rsp_fp_dst &
 			      (mem_rsp_dst_ptr != 'd0);
+   wire [`M_WIDTH-1:0] w_mem_rsp_int_data = w_park_go ? r_park_data :
+					    mem_rsp_dst2_valid ? mem_rsp_load_data[63:32] :
+					    mem_rsp_load_data[`M_WIDTH-1:0];
    
 
    output tlb_data_t	             tlb_entry_out;
@@ -321,9 +384,9 @@ module exec(clk,
     * All four read ports are SYNCHRONOUS (registered inside the module): rd0/rd1 =
     * fpu operand reads (consumed one cycle later in the FP read stage); rd2 = mfc1
     * source (srcB); rd3 = FP store data (dq).  No flat r_fp_prf flop array anymore. */
-   logic [`M_WIDTH-1:0] 	  w_fp_srcA, w_fp_srcB;     // fpu reads  (rd0/rd1)
-   logic [`M_WIDTH-1:0] 	  w_fp_srcC;                // ENABLE_MIPS4 madd fr (rd4)
-   logic [`M_WIDTH-1:0] 	  r_fp_rd_srcB, r_fp_rd_dq; // mem reads (rd2/rd3)
+   logic [`FP_WIDTH-1:0] 	  w_fp_srcA, w_fp_srcB;     // fpu reads  (rd0/rd1)
+   logic [`FP_WIDTH-1:0] 	  w_fp_srcC;                // ENABLE_MIPS4 madd fr (rd4)
+   logic [`FP_WIDTH-1:0] 	  r_fp_rd_srcB, r_fp_rd_dq; // mem reads (rd2/rd3)
    logic [N_INT_PRF_ENTRIES-1:0]  r_fp_prf_inflight, n_fp_prf_inflight;
 
    logic 			  t_wr_int_prf, t_wr_cpr0, t_wr_cpr0_64;
@@ -334,6 +397,10 @@ module exec(clk,
    wire 			  w_cp0_wr = retire_cp0_valid & retire_cp0_staged;
    wire [4:0] 			  w_cp0_wr_reg = r_cp0_stage_reg[retire_cp0_rob_ptr];
    wire [`M_WIDTH-1:0] 		  w_cp0_wr_data = r_cp0_stage_data[retire_cp0_rob_ptr];
+   /* MIPS CP0 (until the SPARC state registers replace it): its 64-bit fields
+    * read zero-extended */
+   wire [63:0] 			  w_cp0_wr_data64 = 64'(w_cp0_wr_data);
+   wire [63:0] 			  w_badvaddr64 = 64'(core_badvaddr);
    wire 			  w_cp0_wr_64 = r_cp0_stage_64[retire_cp0_rob_ptr];
    /* CP0 writers retired AND committed; a CP0 reader issues when this reaches its
     * uop.cp0_seq (the writers allocated before it) */
@@ -440,6 +507,14 @@ module exec(clk,
 
    logic 	t_start_mul;
    logic 	t_mul_complete;
+   logic [`LG_PRF_ENTRIES-1:0] w_mul_dst;
+   logic 	w_mul_dst_val, w_mul_cc;
+   logic 	t_iwb, t_iwb_flags;
+   logic [`LG_PRF_ENTRIES-1:0] t_iwb_dst;
+   logic [`M_WIDTH-1:0] t_iwb_data;
+   logic [3:0] 	t_iwb_icc;
+   logic [31:0] w_s_op2;	/* SPARC operand 2 (the datapath below) */
+   logic [127:0] w_div_y;	/* uni_divider: {remainder, quotient} */
    logic [(`M_WIDTH*2)-1:0] t_mul_result;
    
    logic 	t_hilo_prf_ptr_val_out;
@@ -453,7 +528,6 @@ module exec(clk,
    /* divider */
    logic 	t_div_ready, t_signed_div, t_start_div32, t_start_div64;
    logic [`LG_ROB_ENTRIES-1:0] t_div_rob_ptr_out;
-   logic [(`M_WIDTH*2)-1:0] 	       t_div_result;
    logic [`LG_HILO_PRF_ENTRIES-1:0] t_div_hilo_prf_ptr_out;
    /* unified divider, FP side (uni_divider.sv).
     * t_fdiv_pop = an FP div/sqrt pops from fp_uq THIS cycle (it starts NEXT cycle) */
@@ -537,7 +611,12 @@ module exec(clk,
    logic 	r_restart_color;
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_uq_older_st, r_mem_uq_older_ep;
    /* store data capture */
-   logic 	t_sd_go, r_sd_go, r_sd_fp, r_sd_fp_hi, r_sd_zero;
+   logic 	t_sd_go, r_sd_go, r_sd_fp, r_sd_fp_hi, r_sd_zero, r_sd_std;
+   /* SPARC std reads its two data registers through the one store-data port on
+    * consecutive cycles: r_sd_std_ph2 = this cycle reads rd+1 (r_sd_hi holds rd) */
+   logic 	r_sd_std_ph2;
+   logic [N_MEM_SCHED_ENTRIES-1:0] t_mem_ldd_out;   /* ldds the l1d still owes a response */
+   logic [31:0] r_sd_hi;
    logic [`LG_PRF_ENTRIES-1:0] t_sd_src;
    logic [`LG_MEM_SCHED_ENTRIES-1:0] r_sd_idx;
    logic [`LG_ROB_ENTRIES-1:0] r_sd_rob;
@@ -940,13 +1019,15 @@ module exec(clk,
 				   r_alu_fcr_rdy;
    /* srcC (movn/movz rt) ready, or no srcC */
    logic [N_INT_SCHED_ENTRIES-1:0] t_alu_srcC_ok;
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
    /* movn/movz: rt is only a condition, "is its physical register zero" -- one
     * flag bit per int physical register, written with every int PRF write (never
     * physreg 0, which rf4r2w does not write either: its flag stays 1), and a
     * third ready bit that wakes on the same producers as srcA/srcB.  A consumer
     * selected on a writeback match executes the next cycle, after the flag write. */
    logic [N_INT_PRF_ENTRIES-1:0]   r_prf_zero;
+   logic [3:0] 			   r_prf_icc[N_INT_PRF_ENTRIES-1:0];   /* {N, Z, V, C} */
+   logic [3:0] 			   t_icc_out;
    logic [N_INT_SCHED_ENTRIES-1:0] r_alu_srcC_rdy, t_alu_srcC_match;
    logic 			   t_alu_alloc_srcC_match, t_alu_alloc2_srcC_match;
 `endif
@@ -1097,45 +1178,43 @@ module exec(clk,
 	//allocation forwarding
 	t_alu_alloc_srcA_match = uq.srcA_valid && (
 						   (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq.srcA)) ||
-						   (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq.srcA))
+						   (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq.srcA))
 						   );
 	t_alu_alloc_srcB_match = uq.srcB_valid && (
 						   (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq.srcB)) ||
-						   (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq.srcB))
+						   (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq.srcB))
 						   );
 
 	t_alu_alloc_hilo_match = uq.hilo_src_valid && (
 						       (t_hilo_prf_ptr_val_out & (t_hilo_prf_ptr_out == uq.hilo_src)) ||
-						       (t_div_complete && (t_div_hilo_prf_ptr_out == uq.hilo_src)) ||
 						       (r_start_int && t_wr_hilo && (int_uop.hilo_dst == uq.hilo_src))
 						       );
 	/* FCR source (BC1x): wakes on the fpu compare writing the same FCR phys reg */
 	t_alu_alloc_fcr_match = uq.fcr_src_valid &&
-				(w_fpu_fcr_valid & (w_fpu_fcr_ptr == uq.hilo_src));
+				(w_fpu_fcr_valid & (w_fpu_fcr_ptr == uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]));
 
 	t_alu_alloc2_srcA_match = uq2.srcA_valid && (
 						     (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq2.srcA)) ||
-						     (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq2.srcA))
+						     (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq2.srcA))
 						     );
 	t_alu_alloc2_srcB_match = uq2.srcB_valid && (
 						     (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq2.srcB)) ||
-						     (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq2.srcB))
+						     (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq2.srcB))
 						     );
 	t_alu_alloc2_hilo_match = uq2.hilo_src_valid && (
 							 (t_hilo_prf_ptr_val_out & (t_hilo_prf_ptr_out == uq2.hilo_src)) ||
-							 (t_div_complete && (t_div_hilo_prf_ptr_out == uq2.hilo_src)) ||
 							 (r_start_int && t_wr_hilo && (int_uop.hilo_dst == uq2.hilo_src))
 							 );
 	t_alu_alloc2_fcr_match = uq2.fcr_src_valid &&
-				 (w_fpu_fcr_valid & (w_fpu_fcr_ptr == uq2.hilo_src));
-`ifdef ENABLE_MIPS4
+				 (w_fpu_fcr_valid & (w_fpu_fcr_ptr == uq2.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]));
+`ifdef ENABLE_INT_SRCC
 	t_alu_alloc_srcC_match = uq.srcC_valid && (
 						   (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq.srcC)) ||
-						   (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq.srcC))
+						   (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq.srcC))
 						   );
 	t_alu_alloc2_srcC_match = uq2.srcC_valid && (
 						     (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq2.srcC)) ||
-						     (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == uq2.srcC))
+						     (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == uq2.srcC))
 						     );
 `endif
 
@@ -1191,24 +1270,23 @@ module exec(clk,
 	     begin
 		t_alu_srcA_match[i] = r_alu_sched_uops[i].srcA_valid && (
 									 (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == r_alu_sched_uops[i].srcA)) ||
-									 (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == r_alu_sched_uops[i].srcA))
+									 (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == r_alu_sched_uops[i].srcA))
 									 );
 		t_alu_srcB_match[i] = r_alu_sched_uops[i].srcB_valid && (
 									 (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == r_alu_sched_uops[i].srcB)) ||
-									 (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == r_alu_sched_uops[i].srcB))
+									 (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == r_alu_sched_uops[i].srcB))
 									 );
 		
 		t_alu_hilo_match[i] = r_alu_sched_uops[i].hilo_src_valid && (
 									     (t_hilo_prf_ptr_val_out & (t_hilo_prf_ptr_out == r_alu_sched_uops[i].hilo_src)) ||
-									     (t_div_complete && (t_div_hilo_prf_ptr_out == r_alu_sched_uops[i].hilo_src)) ||
 									     (r_start_int && t_wr_hilo && (int_uop.hilo_dst == r_alu_sched_uops[i].hilo_src))
 									     );
 		t_alu_fcr_match[i] = r_alu_sched_uops[i].fcr_src_valid &&
-				     (w_fpu_fcr_valid & (w_fpu_fcr_ptr == r_alu_sched_uops[i].hilo_src));
-`ifdef ENABLE_MIPS4
+				     (w_fpu_fcr_valid & (w_fpu_fcr_ptr == r_alu_sched_uops[i].hilo_src[`LG_FCR_PRF_ENTRIES-1:0]));
+`ifdef ENABLE_INT_SRCC
 		t_alu_srcC_match[i] = r_alu_sched_uops[i].srcC_valid && (
 									 (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == r_alu_sched_uops[i].srcC)) ||
-									 (r_start_int && t_wr_int_prf & (int_uop.dst != 'd0) & (int_uop.dst == r_alu_sched_uops[i].srcC))
+									 (t_iwb & (t_iwb_dst != 'd0) & (t_iwb_dst == r_alu_sched_uops[i].srcC))
 									 );
 		t_alu_srcC_ok[i] = t_alu_srcC_match[i] | r_alu_srcC_rdy[i];
 `else
@@ -1219,7 +1297,7 @@ module exec(clk,
 		//is_mult(r_alu_sched_uops[i].op);
 		
 		t_alu_entry_rdy[i] = r_alu_sched_valid[i] &&
-				     (is_div(r_alu_sched_uops[i].op) ?  (t_div_ready & !t_fdiv_pop) :  (is_mult(r_alu_sched_uops[i].op) ?  !r_wb_bitvec[`MUL_LAT+2] : !r_wb_bitvec[1]))
+				     (is_div(r_alu_sched_uops[i].op) ?  (t_div_ready & !t_fdiv_pop & !r_wb_bitvec[1]) :  (is_mult(r_alu_sched_uops[i].op) ?  !r_wb_bitvec[`MUL_LAT+2] : !r_wb_bitvec[1]))
 				     ? (
 					(t_alu_srcA_match[i] |r_alu_srcA_rdy[i]) &
 					(t_alu_srcB_match[i] |r_alu_srcB_rdy[i]) &
@@ -1258,14 +1336,14 @@ module exec(clk,
 			  r_alu_srcA_rdy[i] <= uq.srcA_valid ? (!r_prf_inflight[uq.srcA] | t_alu_alloc_srcA_match) : 1'b1;
 			  r_alu_srcB_rdy[i] <= uq.srcB_valid ? (!r_prf_inflight[uq.srcB] | t_alu_alloc_srcB_match) : 1'b1;
 			  r_alu_hilo_rdy[i] <= uq.hilo_src_valid ? (!r_hilo_inflight[uq.hilo_src] | t_alu_alloc_hilo_match) : 1'b1;
-			  r_alu_fcr_rdy[i] <= uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src] | t_alu_alloc_fcr_match) : 1'b1;
+			  r_alu_fcr_rdy[i] <= uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] | t_alu_alloc_fcr_match) : 1'b1;
 		       end
 		     else if(t_alu_alloc2_entry[i])
 		       begin
 			  r_alu_srcA_rdy[i] <= uq2.srcA_valid ? (!r_prf_inflight[uq2.srcA] | t_alu_alloc2_srcA_match) : 1'b1;
 			  r_alu_srcB_rdy[i] <= uq2.srcB_valid ? (!r_prf_inflight[uq2.srcB] | t_alu_alloc2_srcB_match) : 1'b1;
 			  r_alu_hilo_rdy[i] <= uq2.hilo_src_valid ? (!r_hilo_inflight[uq2.hilo_src] | t_alu_alloc2_hilo_match) : 1'b1;
-			  r_alu_fcr_rdy[i] <= uq2.fcr_src_valid ? (!r_fcr_prf_inflight[uq2.hilo_src] | t_alu_alloc2_fcr_match) : 1'b1;
+			  r_alu_fcr_rdy[i] <= uq2.fcr_src_valid ? (!r_fcr_prf_inflight[uq2.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] | t_alu_alloc2_fcr_match) : 1'b1;
 		       end
 		     else if(t_alu_select_entry[i])
 		       begin
@@ -1284,7 +1362,7 @@ module exec(clk,
 		     
 		  end // else: !if(reset)
 	     end // always_ff@ (posedge clk)
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
 	   always_ff@(posedge clk)
 	     begin
 		if(reset)
@@ -1340,7 +1418,7 @@ module exec(clk,
 		      (uq.srcB_valid ? (!r_prf_inflight[uq.srcB] | t_alu_alloc_srcB_match) : 1'b1) &&
 		      (uq.hilo_src_valid ? (!r_hilo_inflight[uq.hilo_src] | t_alu_alloc_hilo_match) : 1'b1) &&
 		      (uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src] | t_alu_alloc_fcr_match) : 1'b1)
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
 		      && (uq.srcC_valid ? (!r_prf_inflight[uq.srcC] | t_alu_alloc_srcC_match) : 1'b1)
 `endif
 		      ;
@@ -1422,26 +1500,93 @@ module exec(clk,
    mul #(.W(`M_WIDTH)) m(
 			 .clk(clk),
 			 .reset(reset),
-			 .is_signed(int_uop.op != MULTU && int_uop.op != DMULTU),
+			 .is_signed((int_uop.op == S_SMUL) || (int_uop.op == S_SMULCC)),
 			 .go(t_start_mul&r_start_int),
-			 .is_32b(int_uop.op == MULT || int_uop.op == MULTU),
+			 .is_32b(1'b0),
 			 .src_A(t_srcA),
-			 .src_B(t_srcB),
+			 .src_B(w_s_op2),
 			 .rob_ptr_in(int_uop.rob_ptr),
 			 .hilo_prf_ptr_in(int_uop.hilo_dst),
+			 .dst_ptr_in(int_uop.dst),
+			 .dst_val_in(int_uop.dst_valid),
+			 .cc_in(int_uop.flags_dst_valid),
 			 .y(t_mul_result),
 			 .complete(t_mul_complete),
 			 .rob_ptr_out(t_rob_ptr_out),
 			 .hilo_prf_ptr_val_out(t_hilo_prf_ptr_val_out),
-			 .hilo_prf_ptr_out(t_hilo_prf_ptr_out)
+			 .hilo_prf_ptr_out(t_hilo_prf_ptr_out),
+			 .dst_ptr_out(w_mul_dst),
+			 .dst_val_out(w_mul_dst_val),
+			 .cc_out(w_mul_cc)
 	 );
+
+   /* ---- SPARC multiply / divide writeback ----
+    * umul/smul: rd = the low word (+ icc), Y = the high word (the HILO port),
+    * both at the multiplier's completion.  udiv/sdiv: rd = the quotient of
+    * {Y, rs1} / operand 2, saturated (+ icc, V = overflow); they do not write Y.
+    * One divide is in flight (uni_divider): its rd and saturation rules are held
+    * here from its start. */
+   logic [`LG_PRF_ENTRIES-1:0] r_div_dst;
+   logic 		       r_div_dst_val, r_div_cc, r_div_signed, r_div_min_m1;
+   always_ff@(posedge clk)
+     begin
+	if(t_start_div64)
+	  begin
+	     r_div_dst <= int_uop.dst;
+	     r_div_dst_val <= int_uop.dst_valid;
+	     r_div_cc <= int_uop.flags_dst_valid;
+	     r_div_signed <= t_signed_div;
+	     /* INT64_MIN / -1: the only quotient past int64 (interpret.cc) */
+	     r_div_min_m1 <= ({t_src_hilo[31:0], t_srcA[31:0]} == 64'h8000000000000000) &&
+			     (w_s_op2 == 32'hffffffff);
+	  end
+     end // always_ff@ (posedge clk)
+   wire [63:0] w_div_q = w_div_y[63:0];
+   wire        w_div_ovf = r_div_signed ? (r_div_min_m1 | (w_div_q[63:31] != {33{w_div_q[63]}})) :
+		 (w_div_q[63:32] != 32'd0);
+   wire [31:0] w_div_rd = !w_div_ovf ? w_div_q[31:0] :
+		 !r_div_signed ? 32'hffffffff :
+		 (r_div_min_m1 | !w_div_q[63]) ? 32'h7fffffff :
+		 32'h80000000;
+   wire        w_mul_wb = t_mul_complete & w_mul_dst_val;
+   /* Y lives in the low half of a HILO register (S_RDY / S_WRY) */
+   wire [(`M_WIDTH*2)-1:0] w_mul_y = {{`M_WIDTH{1'b0}}, t_mul_result[63:32]};
+   wire        w_div_wb = t_div_complete & r_div_dst_val;
+
+   /* integer writeback port 0 (and its wakeup / forwarding): the ALU, or a
+    * multiply or divide completing.  They are exclusive -- r_wb_bitvec reserves
+    * the multiplier's slot, and uni_divider drains only into a free one. */
+   always_comb
+     begin
+	t_iwb = (r_start_int & t_wr_int_prf) | w_mul_wb | w_div_wb;
+	t_iwb_dst = w_mul_wb ? w_mul_dst : w_div_wb ? r_div_dst : int_uop.dst;
+	t_iwb_data = w_mul_wb ? t_mul_result[`M_WIDTH-1:0] : w_div_wb ? w_div_rd : t_result;
+	t_iwb_flags = w_mul_wb ? w_mul_cc : w_div_wb ? r_div_cc : int_uop.flags_dst_valid;
+	t_iwb_icc = w_mul_wb ? {t_mul_result[31], (t_mul_result[31:0] == 32'd0), 2'b00} :
+		    w_div_wb ? {w_div_rd[31], (w_div_rd == 32'd0), w_div_ovf, 1'b0} :
+		    t_icc_out;
+     end // always_comb
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset && ((r_start_int & t_alu_valid & (t_mul_complete | t_div_complete)) ||
+		      (t_mul_complete & t_div_complete)))
+	  begin
+	     $display("[IWB] cyc=%0d writeback collision: alu %b mul %b div %b",
+		      r_cycle, r_start_int & t_alu_valid, t_mul_complete, t_div_complete);
+	     $stop;
+	  end
+     end
+`endif
 
    /* CLZ-accelerated divider (ported from rv64core/nu_divider). It finishes
     * early and holds the result until a HILO writeback slot is free; the other
     * two HILO writers are the multiplier (t_hilo_prf_ptr_val_out) and int->HILO
     * ops (r_start_int & t_wr_hilo). The DIV32/64_LAT reservation above is the
     * backstop that guarantees a free slot by the worst-case latency. */
-   uni_divider #(.LG_W(`LG_M_WIDTH))
+   /* 64 bits wide whatever M_WIDTH is: the FP divides need it, and a SPARC
+    * udiv/sdiv divides the 64-bit {Y, rs1} */
+   uni_divider #(.LG_W(6))
    d0 (
        .clk(clk),
        .reset(reset),
@@ -1455,13 +1600,14 @@ module exec(clk,
 	* restores rv64core's `r_start_int | t_mul_complete` guard.) */
        .wb_slot_used(t_hilo_prf_ptr_val_out | r_start_int),
        .is_32b(t_start_div32),
-       .srcA(t_srcA),
-       .srcB(t_srcB),
+       /* {Y, rs1} by operand 2, sign- or zero-extended */
+       .srcA({t_src_hilo[31:0], t_srcA[31:0]}),
+       .srcB(t_signed_div ? {{32{w_s_op2[31]}}, w_s_op2} : {32'd0, w_s_op2}),
        .rob_ptr_in(int_uop.rob_ptr),
        .hilo_prf_ptr_in(int_uop.hilo_dst),
        .is_signed_div(t_signed_div),
        .start_div(t_start_div32 | t_start_div64),
-       .y(t_div_result),
+       .y(w_div_y),
        .rob_ptr_out(t_div_rob_ptr_out),
        .hilo_prf_ptr_out(t_div_hilo_prf_ptr_out),
        .complete(t_div_complete),
@@ -1608,7 +1754,7 @@ module exec(clk,
     * mem_dq exactly as before.  read-before-write on a same-cycle collision is a
     * non-issue: inflight pop-gating never lets a source be read the cycle it is
     * written. */
-   fp_regfile #(.WIDTH(`M_WIDTH), .LG_DEPTH(`LG_PRF_ENTRIES))
+   fp_regfile #(.WIDTH(`FP_WIDTH), .LG_DEPTH(`LG_PRF_ENTRIES))
    fpprf (.clk(clk),
 	  .reset(reset),
 	  .rdptr0(fp_uq.srcA),
@@ -1650,6 +1796,10 @@ module exec(clk,
 	  begin
 	     n_prf_inflight[uq_uop.dst] = 1'b1;
 	  end
+	if(uq_push && uq_uop.dst2_valid)
+	  begin
+	     n_prf_inflight[uq_uop.dst2] = 1'b1;
+	  end
 	if(uq_push_two && uq_uop_two.dst_valid)
 	  begin
 	     n_prf_inflight[uq_uop_two.dst] = 1'b1;
@@ -1667,6 +1817,7 @@ module exec(clk,
 	     else
 	       n_prf_inflight[mem_rsp_dst_ptr] = 1'b0;
 	  end
+
 	/* the unified divider's FP result clears its FP-dst inflight bit */
 	if(w_fdiv_complete)
 	  n_fp_prf_inflight[w_fdiv_dst_ptr] = 1'b0;
@@ -1676,9 +1827,9 @@ module exec(clk,
 	/* single-cycle convert result clears its FP-dst inflight bit */
 	if(r_cvt_valid)
 	  n_fp_prf_inflight[r_cvt_dst] = 1'b0;
-	if(r_start_int && t_wr_int_prf)
+	if(t_iwb)
 	  begin
-	     n_prf_inflight[int_uop.dst] = 1'b0;
+	     n_prf_inflight[t_iwb_dst] = 1'b0;
 	  end
      end // always_comb
 
@@ -1885,7 +2036,7 @@ module exec(clk,
      begin
 	t_fpu_srcA_rdy = fp_uq.fp_srcA_valid ? !r_fp_prf_inflight[fp_uq.srcA] : 1'b1;
 	t_fpu_srcB_rdy = fp_uq.fp_srcB_valid ? !r_fp_prf_inflight[fp_uq.srcB] : 1'b1;
-	t_fpu_fcr_rdy  = fp_uq.fcr_src_valid ? !r_fcr_prf_inflight[fp_uq.hilo_src] : 1'b1;
+	t_fpu_fcr_rdy  = fp_uq.fcr_src_valid ? !r_fcr_prf_inflight[fp_uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] : 1'b1;
 	t_fpu_srcs_rdy = t_fpu_srcA_rdy && t_fpu_srcB_rdy && t_fpu_fcr_rdy;
 `ifdef ENABLE_MIPS4
 	/* madd's fr */
@@ -1987,7 +2138,7 @@ module exec(clk,
    always_ff@(posedge clk)
      begin
 	r_fp_iss_uop <= fp_uq;
-	r_fp_iss_fcr <= r_fcr_prf[fp_uq.hilo_src];
+	r_fp_iss_fcr <= r_fcr_prf[fp_uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]];
      end
 `ifdef ENABLE_MIPS4
    /* movz/movn.fmt condition: rt's zero flag, read with the FCC at issue */
@@ -2011,7 +2162,7 @@ module exec(clk,
    fpu0(
 	.clk(clk),
 	.reset(reset),
-	.pc(r_fp_iss_uop.pc),
+	.pc(64'(r_fp_iss_uop.pc)),
 	.opcode(r_fp_iss_uop.op),
 	.start(r_fp_iss_valid & ~w_iss_is_sc & ~w_iss_is_ds),   /* converts + sign-ops bypass the fpu (single-cycle path); div/sqrt -> d0 */
 	.src_a(w_fp_srcA),
@@ -2019,13 +2170,13 @@ module exec(clk,
 `ifdef ENABLE_MIPS4
 	.src_c(w_fp_srcC),          /* madd fr */
 `else
-	.src_c({`M_WIDTH{1'b0}}),
+	.src_c({`FP_WIDTH{1'b0}}),
 `endif
 	.src_fcr(r_fp_iss_fcr),
 	.rm(r_fcsr[1:0]),   /* FCSR.RM; CTC1 serializes so this is stable per FP op */
 	.rob_ptr_in(r_fp_iss_uop.rob_ptr),
 	.dst_ptr_in(r_fp_iss_uop.dst),
-	.fcr_ptr_in(r_fp_iss_uop.hilo_dst),
+	.fcr_ptr_in(r_fp_iss_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]),
 	.fcr_sel(r_fp_iss_uop.imm[2:0]),
 	.cmp_cond(r_fp_iss_uop.imm[6:3]),   /* C.cond predicate */
 	.val(w_fpu_result_valid),
@@ -2102,16 +2253,16 @@ module exec(clk,
      begin
 	n_fcr_prf_inflight = r_fcr_prf_inflight;
 	if(uq_push && uq_uop.fcr_dst_valid)
-	  n_fcr_prf_inflight[uq_uop.hilo_dst] = 1'b1;
+	  n_fcr_prf_inflight[uq_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] = 1'b1;
 	if(uq_push_two && uq_uop_two.fcr_dst_valid)
-	  n_fcr_prf_inflight[uq_uop_two.hilo_dst] = 1'b1;
+	  n_fcr_prf_inflight[uq_uop_two.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] = 1'b1;
 	if(w_fpu_fcr_valid)
 	  n_fcr_prf_inflight[w_fpu_fcr_ptr] = 1'b0;
 	/* CTC1 produces an FCR value from the INT pipe and must clear its own
 	 * inflight bit, or every later FCR reader waits for an FP completion
 	 * that never comes. */
 	if(r_start_int & t_wr_fcsr)
-	  n_fcr_prf_inflight[int_uop.hilo_dst] = 1'b0;
+	  n_fcr_prf_inflight[int_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] = 1'b0;
      end
    always_ff@(posedge clk)
      begin
@@ -2130,7 +2281,7 @@ module exec(clk,
 	else if(w_fpu_fcr_valid)
 	  r_fcr_prf[w_fpu_fcr_ptr] <= w_fpu_result[7:0];
 	else if(r_start_int & t_wr_fcsr)
-	  r_fcr_prf[int_uop.hilo_dst] <= {t_srcA[31:25], t_srcA[23]};
+	  r_fcr_prf[int_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] <= {t_srcA[31:25], t_srcA[23]};
      end
 
    // ---- FP completion -> ROB port 2 ----
@@ -2182,10 +2333,6 @@ module exec(clk,
 	if(t_hilo_prf_ptr_val_out)
 	  begin
 	     n_hilo_inflight[t_hilo_prf_ptr_out] = 1'b0;
-	  end
-	if(t_div_complete)
-	  begin
-	     n_hilo_inflight[t_div_hilo_prf_ptr_out] = 1'b0;
 	  end
 	if(r_start_int && t_wr_hilo)
 	  begin
@@ -2268,6 +2415,49 @@ module exec(clk,
 	end
    endgenerate
 
+   /* ---- SPARC integer datapath (the S_* ops, uop.vh) ---- */
+   /* operand 2: rs2, or the sign-extended immediate in {jmp_imm[15:0], imm} */
+   assign w_s_op2 = int_uop.srcB_valid ? t_srcB[31:0] : {int_uop.jmp_imm[15:0], int_uop.imm};
+   /* the incoming icc: srcC is the flags register (flags_src_valid) */
+   wire [3:0]  w_s_icc = r_prf_icc[int_uop.srcC];
+   wire        w_s_cin = int_uop.flags_src_valid & w_s_icc[0] &
+			 ((int_uop.op == S_ADDX) | (int_uop.op == S_ADDXCC) |
+			  (int_uop.op == S_SUBX) | (int_uop.op == S_SUBXCC));
+   wire [32:0] w_s_add = {1'b0, t_srcA[31:0]} + {1'b0, w_s_op2} + {32'd0, w_s_cin};
+   wire [32:0] w_s_sub = {1'b0, t_srcA[31:0]} - {1'b0, w_s_op2} - {32'd0, w_s_cin};
+   wire        w_s_add_v = (t_srcA[31] == w_s_op2[31]) & (w_s_add[31] != t_srcA[31]);
+   wire        w_s_sub_v = (t_srcA[31] != w_s_op2[31]) & (w_s_sub[31] != t_srcA[31]);
+   wire        w_s_tag = (t_srcA[1:0] != 2'd0) | (w_s_op2[1:0] != 2'd0);
+   /* mulscc: {N ^ V, rs1 >> 1} + (Y[0] ? operand 2 : 0) */
+   wire [31:0] w_s_ms_a = {w_s_icc[3] ^ w_s_icc[1], t_srcA[31:1]};
+   wire [31:0] w_s_ms_b = t_src_hilo[0] ? w_s_op2 : 32'd0;
+   wire [32:0] w_s_ms = {1'b0, w_s_ms_a} + {1'b0, w_s_ms_b};
+   wire        w_s_ms_v = (w_s_ms_a[31] == w_s_ms_b[31]) & (w_s_ms[31] != w_s_ms_a[31]);
+   wire [31:0] w_s_logic = ((int_uop.op == S_AND) | (int_uop.op == S_ANDCC)) ? (t_srcA[31:0] & w_s_op2) :
+			   ((int_uop.op == S_ANDN) | (int_uop.op == S_ANDNCC)) ? (t_srcA[31:0] & ~w_s_op2) :
+			   ((int_uop.op == S_OR) | (int_uop.op == S_ORCC)) ? (t_srcA[31:0] | w_s_op2) :
+			   ((int_uop.op == S_ORN) | (int_uop.op == S_ORNCC)) ? (t_srcA[31:0] | ~w_s_op2) :
+			   ((int_uop.op == S_XOR) | (int_uop.op == S_XORCC)) ? (t_srcA[31:0] ^ w_s_op2) :
+			   (t_srcA[31:0] ^ ~w_s_op2);
+   wire [31:0] w_s_branch_target = int_uop.pc[31:0] + {int_uop.jmp_imm[15:0], int_uop.imm};
+   wire [31:0] w_s_pc8 = int_uop.pc[31:0] + 32'd8;
+
+   /* Bicc / Ticc condition on {N, Z, V, C} (interpret.cc eval_icc) */
+   function automatic logic eval_icc(input logic [3:0] c, input logic [3:0] icc);
+      logic r;
+      begin
+	 r = (c[2:0] == 3'd1) ? icc[2] :
+	     (c[2:0] == 3'd2) ? (icc[2] | (icc[3] ^ icc[1])) :
+	     (c[2:0] == 3'd3) ? (icc[3] ^ icc[1]) :
+	     (c[2:0] == 3'd4) ? (icc[0] | icc[2]) :
+	     (c[2:0] == 3'd5) ? icc[0] :
+	     (c[2:0] == 3'd6) ? icc[3] :
+	     (c[2:0] == 3'd7) ? icc[1] :
+	     1'b0;
+	 eval_icc = c[3] ? !r : r;
+      end
+   endfunction // eval_icc
+
    logic [5:0] r_tlb_index, n_tlb_index;
    logic n_tlb_entry_out_valid, r_tlb_entry_out_valid;
    logic n_tlbr, r_tlbr;
@@ -2319,6 +2509,7 @@ module exec(clk,
 	t_eret = 1'b0;
 	t_32b_shift = 1'b0;
 	t_shift_left = 1'b0;
+	t_icc_out = 4'd0;
 	
 	case(int_uop.op)
 	  BREAK:
@@ -2395,7 +2586,7 @@ module exec(clk,
 	  DSLL32:
 	    begin
 	       t_shift_left = 1'b1;
-	       t_shift_amt = {1'b1, int_uop.imm[4:0]};
+	       t_shift_amt = `LG_M_WIDTH'({1'b1, int_uop.imm[4:0]});
 	       t_result = w_shifter_out;
 	       t_wr_int_prf = 1'b1;
 	       t_alu_valid = 1'b1;
@@ -2409,7 +2600,7 @@ module exec(clk,
 	    end
 	  DSRL32:
 	    begin
-	       t_shift_amt = {1'b1, int_uop.imm[4:0]};
+	       t_shift_amt = `LG_M_WIDTH'({1'b1, int_uop.imm[4:0]});
 	       t_result = w_shifter_out;
 	       t_wr_int_prf = 1'b1;
 	       t_alu_valid = 1'b1;
@@ -2425,7 +2616,7 @@ module exec(clk,
 	  DSRA32:
 	    begin
 	       t_signed_shift = 1'b1;
-	       t_shift_amt = {1'b1, int_uop.imm[4:0]};
+	       t_shift_amt = `LG_M_WIDTH'({1'b1, int_uop.imm[4:0]});
 	       t_result = w_shifter_out;
 	       t_wr_int_prf = 1'b1;
 	       t_alu_valid = 1'b1;
@@ -2791,28 +2982,28 @@ module exec(clk,
 	    end // case: BRA
 	  BC1T:
 	    begin
-	       t_take_br = r_fcr_prf[int_uop.hilo_src][int_uop.srcC[2:0]];
+	       t_take_br = r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][int_uop.srcC[2:0]];
 	       t_mispred_br = int_uop.br_pred != t_take_br;
 	       t_pc = t_take_br ? (t_pc4 + {t_simm[`M_WIDTH-3:0], 2'd0}) : t_pc8;
 	       t_alu_valid = 1'b1;
 	    end
 	  BC1F:
 	    begin
-	       t_take_br = ~r_fcr_prf[int_uop.hilo_src][int_uop.srcC[2:0]];
+	       t_take_br = ~r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][int_uop.srcC[2:0]];
 	       t_mispred_br = int_uop.br_pred != t_take_br;
 	       t_pc = t_take_br ? (t_pc4 + {t_simm[`M_WIDTH-3:0], 2'd0}) : t_pc8;
 	       t_alu_valid = 1'b1;
 	    end
 	  BC1TL:
 	    begin
-	       t_take_br = r_fcr_prf[int_uop.hilo_src][int_uop.srcC[2:0]];
+	       t_take_br = r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][int_uop.srcC[2:0]];
 	       t_mispred_br = int_uop.br_pred != t_take_br || !t_take_br;
 	       t_pc = t_take_br ? (t_pc4 + {t_simm[`M_WIDTH-3:0], 2'd0}) : t_pc8;
 	       t_alu_valid = 1'b1;
 	    end
 	  BC1FL:
 	    begin
-	       t_take_br = ~r_fcr_prf[int_uop.hilo_src][int_uop.srcC[2:0]];
+	       t_take_br = ~r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][int_uop.srcC[2:0]];
 	       t_mispred_br = int_uop.br_pred != t_take_br || !t_take_br;
 	       t_pc = t_take_br ? (t_pc4 + {t_simm[`M_WIDTH-3:0], 2'd0}) : t_pc8;
 	       t_alu_valid = 1'b1;
@@ -3069,7 +3260,7 @@ module exec(clk,
 	       /* fs in srcA[4:0]: FCR0=FIR (read-only R4000 id), FCR31=FCSR */
 	       t_result = (int_uop.srcA[4:0] == 5'd0) ?
 			  sign_extend32(`FIR_VALUE) : /* FIR (machine.vh) */
-			  sign_extend32(r_fcsr | fcc_expand(r_fcr_prf[int_uop.hilo_src]));
+			  sign_extend32(r_fcsr | fcc_expand(r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]]));
 	       t_alu_valid = 1'b1;
 	       t_wr_int_prf = 1'b1;
 	    end
@@ -3180,9 +3371,214 @@ module exec(clk,
 	       /* injected ARM flush: nothing to compute (the core holds the page) */
 	       t_alu_valid = 1'b1;
 	    end
+	  /* ---- SPARC V8 ---- */
+	  S_TADDCCTV:
+	    begin
+	       /* tag_overflow (tt 0x0a) instead of any write */
+	       t_trap = w_s_add_v | w_s_tag;
+	       t_fault = t_trap;
+	       t_result = t_trap ? `M_WIDTH'(8'h0a) : `M_WIDTH'(w_s_add[31:0]);
+	       t_icc_out = {w_s_add[31], (w_s_add[31:0] == 32'd0), 1'b0, w_s_add[32]};
+	       t_wr_int_prf = int_uop.dst_valid & !t_trap;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_TSUBCCTV:
+	    begin
+	       t_trap = w_s_sub_v | w_s_tag;
+	       t_fault = t_trap;
+	       t_result = t_trap ? `M_WIDTH'(8'h0a) : `M_WIDTH'(w_s_sub[31:0]);
+	       t_icc_out = {w_s_sub[31], (w_s_sub[31:0] == 32'd0), 1'b0, w_s_sub[32]};
+	       t_wr_int_prf = int_uop.dst_valid & !t_trap;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_UMUL, S_SMUL, S_UMULCC, S_SMULCC:
+	    begin
+	       /* rd (+ icc) and Y at the multiplier's completion (t_iwb, the HILO port) */
+	       t_start_mul = r_start_int&!ds_done;
+	    end
+	  S_UDIV, S_SDIV, S_UDIVCC, S_SDIVCC:
+	    begin
+	       /* {Y, rs1} / operand 2 in uni_divider, rd (+ icc) at its completion;
+		* a zero divisor is division_by_zero (tt 0x2a) instead */
+	       t_trap = (w_s_op2 == 32'd0);
+	       t_fault = t_trap;
+	       t_result = `M_WIDTH'(8'h2a);
+	       t_alu_valid = t_trap;
+	       t_signed_div = (int_uop.op == S_SDIV) | (int_uop.op == S_SDIVCC);
+	       t_start_div64 = r_start_int & !ds_done & !t_trap;
+	    end
+	  S_MULSCC:
+	    begin
+	       t_result = `M_WIDTH'(w_s_ms[31:0]);
+	       t_icc_out = {w_s_ms[31], (w_s_ms[31:0] == 32'd0), w_s_ms_v, w_s_ms[32]};
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_hilo_result = {{`M_WIDTH{1'b0}}, t_srcA[0], t_src_hilo[31:1]};
+	       t_wr_hilo = 1'b1;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_TICC:
+	    begin
+	       /* trap_instruction: tt 0x80 + ((rs1 + op2) & 0x7f), the trap type in
+		* the result (core.sv ARCH_FAULT reads it from the ROB) */
+	       t_trap = (int_uop.cond == 4'd8) | eval_icc(int_uop.cond, w_s_icc);
+	       t_fault = t_trap;
+	       t_result = `M_WIDTH'({1'b1, w_s_add[6:0]});
+	       t_alu_valid = 1'b1;
+	    end
+	  S_ADD, S_ADDX, S_ADDCC, S_ADDXCC, S_TADDCC:
+	    begin
+	       t_result = `M_WIDTH'(w_s_add[31:0]);
+	       t_icc_out = {w_s_add[31], (w_s_add[31:0] == 32'd0),
+			    (int_uop.op == S_TADDCC) ? (w_s_add_v | w_s_tag) : w_s_add_v, w_s_add[32]};
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SUB, S_SUBX, S_SUBCC, S_SUBXCC, S_TSUBCC:
+	    begin
+	       t_result = `M_WIDTH'(w_s_sub[31:0]);
+	       t_icc_out = {w_s_sub[31], (w_s_sub[31:0] == 32'd0),
+			    (int_uop.op == S_TSUBCC) ? (w_s_sub_v | w_s_tag) : w_s_sub_v, w_s_sub[32]};
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_AND, S_ANDCC, S_ANDN, S_ANDNCC, S_OR, S_ORCC, S_ORN, S_ORNCC,
+	  S_XOR, S_XORCC, S_XNOR, S_XNORCC:
+	    begin
+	       t_result = `M_WIDTH'(w_s_logic);
+	       t_icc_out = {w_s_logic[31], (w_s_logic == 32'd0), 2'b00};
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SLL:
+	    begin
+	       t_result = `M_WIDTH'(t_srcA[31:0] << w_s_op2[4:0]);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SRL:
+	    begin
+	       t_result = `M_WIDTH'(t_srcA[31:0] >> w_s_op2[4:0]);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SRA:
+	    begin
+	       t_result = `M_WIDTH'($signed(t_srcA[31:0]) >>> w_s_op2[4:0]);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SETHI, TRAP_L1, TRAP_L2:
+	    begin
+	       t_result = `M_WIDTH'({int_uop.jmp_imm[15:0], int_uop.imm});
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_SAVE, S_RESTORE:
+	    begin
+	       /* rs1 + operand 2 in the old window, into rd in the new one (decode
+		* already named rd in the new window and checked WIM) */
+	       t_result = `M_WIDTH'(w_s_add[31:0]);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_BICC:
+	    begin
+	       /* cond ba with no slot (ba,a) and bn,a (decode: ba to pc+8) are jumps;
+		* a=1 conditionals annul a not-taken slot, as MIPS branch-likely does */
+	       t_take_br = (int_uop.cond == 4'd8) | eval_icc(int_uop.cond, w_s_icc);
+	       t_mispred_br = (int_uop.br_pred != t_take_br) |
+			      (int_uop.has_nullifying_delay_slot & !t_take_br);
+	       t_pc = `M_WIDTH'(t_take_br ? w_s_branch_target : w_s_pc8);
+	       t_alu_valid = 1'b1;
+	    end
+	  S_CALL:
+	    begin
+	       t_take_br = 1'b1;
+	       t_mispred_br = (int_uop.br_pred != 1'b1);
+	       t_pc = `M_WIDTH'(w_s_branch_target);
+	       t_result = int_uop.pc;
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_JMPL:
+	    begin
+	       t_take_br = 1'b1;
+	       t_pc = `M_WIDTH'(w_s_add[31:0]);
+	       /* a misaligned target: mem_address_not_aligned (tt 0x07), rd unwritten */
+	       t_trap = (w_s_add[1:0] != 2'd0);
+	       t_fault = t_trap;
+	       t_mispred_br = (t_pc != int_uop.pred_target);
+	       t_result = t_trap ? `M_WIDTH'(8'h07) : int_uop.pc;
+	       t_wr_int_prf = int_uop.dst_valid & !t_trap;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RDY:
+	    begin
+	       t_result = t_src_hilo[`M_WIDTH-1:0];   /* Y: the low half of the HILO rename */
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_WRY:
+	    begin
+	       t_hilo_result = {{`M_WIDTH{1'b0}}, `M_WIDTH'(t_srcA[31:0] ^ w_s_op2)};
+	       t_wr_hilo = 1'b1;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RDPSR:
+	    begin
+	       t_result = `M_WIDTH'(sparc_psr | {8'd0, w_s_icc, 15'd0, int_uop.imm[4:0]});
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RDWIM:
+	    begin
+	       t_result = `M_WIDTH'(sparc_wim);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RDTBR:
+	    begin
+	       t_result = `M_WIDTH'(sparc_tbr);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_WRPSR, S_WRWIM, S_WRTBR:
+	    begin
+	       /* rs1 xor operand 2; the core applies it at retire (from the ROB's
+		* data).  WRPSR's icc also lands in its flags register. */
+	       t_result = `M_WIDTH'(t_srcA[31:0] ^ w_s_op2);
+	       t_icc_out = t_result[23:20];
+	       /* WRPSR with CWP >= NWINDOWS: illegal_instruction (tt 0x02) */
+	       t_trap = (int_uop.op == S_WRPSR) & (t_result[4:0] >= `NWINDOWS);
+	       t_fault = t_trap;
+	       if(t_trap)
+		 begin
+		    t_result = `M_WIDTH'(8'h02);
+		 end
+	       t_wr_int_prf = int_uop.dst_valid & !t_trap;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_FLUSH:
+	    begin
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RETT:
+	    begin
+	       /* serializing: the core restarts at the target (behind its jmpl, into
+		* the delay slot -- core.sv restart_npc); a misaligned target is
+		* mem_address_not_aligned */
+	       t_take_br = 1'b1;
+	       t_pc = `M_WIDTH'(w_s_add[31:0]);
+	       t_trap = (w_s_add[1:0] != 2'd0);
+	       t_fault = t_trap;
+	       t_result = `M_WIDTH'(8'h07);
+	       t_alu_valid = 1'b1;
+	    end
 	  default:
 	    begin
+	       /* not implemented: illegal_instruction (tt 0x02) */
 	       t_unimp_op = 1'b1;
+	       t_result = `M_WIDTH'(8'h02);
 	       t_alu_valid = 1'b1;
 	    end
 	endcase // case (int_uop.op)
@@ -3197,7 +3593,7 @@ module exec(clk,
     * a three-input (carry-save) add here cost ~2.7 ns in front of the DTLB match
     * (henry 5aa9462e, WNS +5.016 -> +2.309 at 50 MHz).  index = $0 -> srcC_valid = 0 ->
     * imm, which is 0 for these ops. */
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
    wire [`M_WIDTH-1:0] w_mem_off = mem_uq.srcC_valid ? t_mem_srcC : {{E_BITS{mem_uq.imm[15]}},mem_uq.imm};
 `else
    wire [`M_WIDTH-1:0] w_mem_off = {{E_BITS{mem_uq.imm[15]}},mem_uq.imm};
@@ -3242,17 +3638,20 @@ module exec(clk,
 	   always_comb
 	     begin
 		t_mem_entry_rdy[i] = r_mem_sched_valid[i] && !r_mem_sched_issued[i] && (r_mem_sched_blk[i] == BLK_NONE) &&
+				     /* ldd: no other ldd outstanding, nothing parked or parking */
+				     (r_mem_sched_uops[i].dst2_valid ?
+				      (((t_mem_ldd_out & ~(1 << i)) == 'd0) && !r_park_valid && !w_park_in) : 1'b1) &&
 				     (!r_mem_sched_mg[i] || r_mem_sched_sd_ok[i]) &&
 				     !(mem_q_next_full||mem_q_full) && !t_flash_clear &&
 				     (r_mem_sched_uops[i].srcA_valid ?
 				      (!r_prf_inflight[r_mem_sched_uops[i].srcA] |
-				       (r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (r_mem_sched_uops[i].srcA == int_uop.dst)) |
+				       (t_iwb && (t_iwb_dst != 'd0) && (r_mem_sched_uops[i].srcA == t_iwb_dst)) |
 				       (w_mem_rsp_int_valid && (r_mem_sched_uops[i].srcA == mem_rsp_dst_ptr))) : 1'b1) &&
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
 				     /* indexed FP load/store: the index (srcC) too */
 				     (r_mem_sched_uops[i].srcC_valid ?
 				      (!r_prf_inflight[r_mem_sched_uops[i].srcC] |
-				       (r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (r_mem_sched_uops[i].srcC == int_uop.dst)) |
+				       (t_iwb && (t_iwb_dst != 'd0) && (r_mem_sched_uops[i].srcC == t_iwb_dst)) |
 				       (w_mem_rsp_int_valid && (r_mem_sched_uops[i].srcC == mem_rsp_dst_ptr))) : 1'b1) &&
 `endif
 				     ((r_mem_sched_uops[i].fp_srcB_valid && !r_mem_sched_uops[i].is_store) ?
@@ -3271,7 +3670,9 @@ module exec(clk,
 		t_mem_sd_rdy[i] = (t_mem_st_live[i] || (r_mem_sched_valid[i] && r_mem_sched_mg[i])) &&
 				  !r_mem_sched_sd_sel[i] && !t_flash_clear &&
 				  (r_mem_sched_uops[i].fp_srcB_valid ? !r_fp_prf_inflight[r_mem_sched_uops[i].srcB] :
-				   r_mem_sched_uops[i].srcB_valid ? !r_prf_inflight[r_mem_sched_uops[i].srcB] : 1'b1);
+				   r_mem_sched_uops[i].srcB_valid ? !r_prf_inflight[r_mem_sched_uops[i].srcB] : 1'b1) &&
+				  /* SPARC std: rd+1, read the cycle after rd through the same port */
+				  (r_mem_sched_uops[i].srcD_valid ? !r_prf_inflight[r_mem_sched_uops[i].srcD] : 1'b1);
 		t_mem_st_retire[i] = t_mem_st_live[i] && r_mem_sched_issued[i] && !r_mem_sched_ret[i] &&
 				     ((retired_rob_ptr_valid && (r_mem_sched_uops[i].rob_ptr == retired_rob_ptr)) ||
 				      (retired_rob_ptr_two_valid && (r_mem_sched_uops[i].rob_ptr == retired_rob_ptr_two)));
@@ -3330,6 +3731,13 @@ module exec(clk,
      begin
 	t_mem_strict = r_mem_sched_valid & ~r_mem_sched_ld & ~r_mem_sched_st & ~r_mem_sched_mv;
 	t_mem_st_live = r_mem_sched_valid & r_mem_sched_st;
+	for(integer j = 0; j < N_MEM_SCHED_ENTRIES; j = j + 1)
+	  begin
+	     /* an ldd the l1d still owes a response: issued, or blocked on the cache
+	      * (a miss/MQ block answers it later; an LSU-owned block, bit 2, does not) */
+	     t_mem_ldd_out[j] = r_mem_sched_valid[j] & r_mem_sched_uops[j].dst2_valid &
+				(r_mem_sched_issued[j] | ((r_mem_sched_blk[j] != BLK_NONE) & !r_mem_sched_blk[j][2]));
+	  end
 	t_mem_pending = t_mem_strict | (t_mem_st_live & ~r_mem_sched_issued);
      end // always_comb
 
@@ -3344,8 +3752,9 @@ module exec(clk,
 	t_mem_sched_select_ptr = t_mem_issue_cmt ? t_mem_cmt_ptr : t_mem_sched_pick_ptr;
 	t_picked_mem_uop = r_mem_sched_uops[t_mem_sched_select_ptr[`LG_MEM_SCHED_ENTRIES-1:0]];
 	/* store / merge-load data capture: the store-data PRF read port (port 3) */
-	t_sd_go = |t_mem_sd_rdy;
-	t_sd_src = r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcB;
+	t_sd_go = (|t_mem_sd_rdy) & !r_sd_std_ph2;
+	t_sd_src = r_sd_std_ph2 ? r_mem_sched_uops[r_sd_idx].srcD :
+		   r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcB;
 	t_mem_alloc_entry = 'd0;
 	t_mem_select_entry = 'd0;
 	if(t_pop_mem_uq)
@@ -3563,20 +3972,33 @@ module exec(clk,
     * buffer at t+1 -- which is also the ROB's store-data-complete (retire gate) */
    always_ff@(posedge clk)
      begin
+	/* a std is picked at t (rd read), reads rd+1 at t+1 (r_sd_std_ph2: no new
+	 * pick, the r_sd_* fields hold), and writes the store buffer at t+2 */
 	if(reset)
 	  begin
 	     r_sd_go <= 1'b0;
+	     r_sd_std_ph2 <= 1'b0;
 	  end
 	else
 	  begin
-	     r_sd_go <= t_sd_go;
+	     r_sd_go <= (t_sd_go & !r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcD_valid) |
+			r_sd_std_ph2;
+	     r_sd_std_ph2 <= t_sd_go & r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcD_valid;
 	  end
-	r_sd_idx <= t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0];
-	r_sd_fp <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].fp_srcB_valid;
-	r_sd_fp_hi <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].jmp_imm[0];
-	r_sd_zero <= !(r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].fp_srcB_valid |
-		      r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcB_valid);
-	r_sd_rob <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].rob_ptr;
+	if(r_sd_std_ph2)
+	  begin
+	     r_sd_hi <= w_mem_srcB[31:0];
+	  end
+	else
+	  begin
+	     r_sd_idx <= t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0];
+	     r_sd_fp <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].fp_srcB_valid;
+	     r_sd_std <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcD_valid;
+	     r_sd_fp_hi <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].jmp_imm[0];
+	     r_sd_zero <= !(r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].fp_srcB_valid |
+			    r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcB_valid);
+	     r_sd_rob <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].rob_ptr;
+	  end
      end // always_ff@ (posedge clk)
 
    always_comb
@@ -3594,7 +4016,9 @@ module exec(clk,
 	/* FR=0 swc1 odd reg (fp_hi): store the HIGH 32b half (placed low for MEM_SW) */
 	lsu_sb.data = r_sd_zero ? 64'd0 :
 		      r_sd_fp ? (r_sd_fp_hi ? {32'd0, r_fp_rd_dq[63:32]} : r_fp_rd_dq) :
-		      w_mem_srcB;
+		      /* std: rd at the address, rd+1 after it (big-endian MEM_SD) */
+		      r_sd_std ? {r_sd_hi, w_mem_srcB[31:0]} :
+		      64'(w_mem_srcB);
      end // always_comb
 
 `ifdef LSU_TRACE
@@ -3674,19 +4098,13 @@ module exec(clk,
    wire		       w_cached, w_mapped;
    wire [1:0]	       w_seg;
    
-   mipsseg seg0 (.v_addr(w_agu),
-		 .l_addr(w_agu_la),
-		 .cache(w_cached),
-		 .mapped(w_mapped),
-		 .seg(w_seg),
-		 .bad_perms(w_bad_seg_perms),
-		 .erl(r_sr_erl),
-		 .in_kernel_mode(in_kernel_mode),
-		 .in_supervisor_mode(in_supervisor_mode),
-		 .in_user_mode(in_user_mode),
-		 .in_64b_kernel_mode(in_64b_kernel_mode),
-		 .in_64b_supervisor_mode(in_64b_supervisor_mode),
-		 .in_64b_user_mode(in_64b_user_mode));
+   /* SPARC, SRMMU not yet wired: MMU off, the access goes out at its VA, cached.
+    * (The MIPS segment map is gone; ASI-driven cacheability comes with the LSU.) */
+   assign w_agu_la = w_agu;
+   assign w_cached = 1'b1;
+   assign w_mapped = 1'b0;
+   assign w_seg = 2'd0;
+   assign w_bad_seg_perms = 1'b0;
 
    wire w_bad_seg_perms;
 
@@ -3694,7 +4112,7 @@ module exec(clk,
      begin
 	t_mem_simm = {{E_BITS{mem_uq.imm[15]}},mem_uq.imm};
 	t_mem_tail.op = MEM_LW;
-	t_mem_tail.addr = w_agu_la;
+	t_mem_tail.addr = `REQ_ADDR_WIDTH'(w_agu_la);
 	t_mem_tail.rob_ptr = mem_uq.rob_ptr;
 	t_mem_tail.dst_valid = 1'b0;
 	t_mem_tail.fp_dst = 1'b0;
@@ -3702,9 +4120,11 @@ module exec(clk,
 	t_mem_tail.fp_hi = 1'b0;
 	t_mem_tail.fp_pres = 32'd0;
 	t_mem_tail.dst_ptr = mem_uq.dst;
+	t_mem_tail.dst2_ptr = mem_uq.dst2;
+	t_mem_tail.dst2_valid = 1'b0;
 	t_mem_tail.is_store = 1'b0;
 	t_mem_tail.is_atomic = 1'b0;
-	t_mem_tail.data = zero_extend32(32'd0);
+	t_mem_tail.data = 'd0;
 	t_mem_tail.bad_addr = 1'b0;
 	t_mem_tail.cached = w_cached;
 	t_mem_tail.mapped = w_mapped;
@@ -3853,6 +4273,7 @@ module exec(clk,
 	    begin
 	       t_mem_tail.op = MEM_LD;
 	       t_mem_tail.dst_valid = mem_uq.dst_valid;
+	       t_mem_tail.dst2_valid = mem_uq.dst2_valid;   /* SPARC ldd */
 	       t_mem_tail.bad_addr = (w_agu[2:0] != 3'd0) | w_bad_seg_perms;
 	    end
 	  SD:
@@ -3916,59 +4337,8 @@ module exec(clk,
 	  TLBP:
 	    begin
 	       t_mem_tail.op = MEM_TLBP;
-	       t_mem_tail.addr = {r_entryhi_r, {(62-`SEGBITS){1'b0}}, r_entryhi_vpn2, 13'd0};
+	       t_mem_tail.addr = `REQ_ADDR_WIDTH'({r_entryhi_r, {(62-`SEGBITS){1'b0}}, r_entryhi_vpn2, 13'd0});
 	       t_mem_tail.mapped = 1'b1;
-	    end
-	  MTC1:
-	    begin
-	       /* GPR->FPR move.  FR=1 (no fp_srcB read): FPR = sign_extend32(GPR[31:0]).
-		* FR=0 (fp_srcB = old even-reg): splice GPR[31:0] into the jmp_imm[0]-selected
-		* half, preserve the other half (read-old merge, R10000 UM p.307). */
-	       t_mem_tail.op = MEM_MOV;
-	       t_mem_tail.addr = mem_uq.fp_srcB_valid ?
-		   (mem_uq.jmp_imm[0] ? {t_mem_srcA[31:0],   r_fp_rd_srcB[31:0]}
-				      : {r_fp_rd_srcB[63:32], t_mem_srcA[31:0]})
-		   : {{32{t_mem_srcA[31]}}, t_mem_srcA[31:0]};
-	       t_mem_tail.dst_valid = 1'b1;
-	       t_mem_tail.fp_dst = 1'b1;
-	       t_mem_tail.dst_ptr = mem_uq.dst;
-	       t_mem_tail.mapped = 1'b0;
-	       t_mem_tail.cached = 1'b1;
-	    end
-	  MFC1:
-	    begin
-	       /* FPR->GPR move: GPR[rt] = sign_extend32(selected 32b half).  jmp_imm[0]
-		* picks the half: FR=1 / FR=0-even -> low 32; FR=0-odd -> high 32. */
-	       t_mem_tail.op = MEM_MOV;
-	       t_mem_tail.addr = mem_uq.jmp_imm[0] ? {{32{r_fp_rd_srcB[63]}}, r_fp_rd_srcB[63:32]}
-						   : {{32{r_fp_rd_srcB[31]}}, r_fp_rd_srcB[31:0]};
-	       t_mem_tail.dst_valid = mem_uq.dst_valid;
-	       t_mem_tail.fp_dst = 1'b0;
-	       t_mem_tail.dst_ptr = mem_uq.dst;
-	       t_mem_tail.mapped = 1'b0;
-	       t_mem_tail.cached = 1'b1;
-	    end
-	  DMTC1:
-	    begin
-	       /* GPR->FPR 64-bit move: FPR[fs] = GPR[rt] (full register, no sign-ext) */
-	       t_mem_tail.op = MEM_MOV;
-	       t_mem_tail.addr = t_mem_srcA;
-	       t_mem_tail.dst_valid = 1'b1;
-	       t_mem_tail.fp_dst = 1'b1;
-	       t_mem_tail.dst_ptr = mem_uq.dst;
-	       t_mem_tail.mapped = 1'b0;
-	       t_mem_tail.cached = 1'b1;
-	    end
-	  DMFC1:
-	    begin
-	       /* FPR->GPR 64-bit move: GPR[rt] = FPR[fs] (full register) */
-	       t_mem_tail.op = MEM_MOV;
-	       t_mem_tail.addr = r_fp_rd_srcB;
-	       t_mem_tail.dst_valid = mem_uq.dst_valid;
-	       t_mem_tail.fp_dst = 1'b0;
-	       t_mem_tail.dst_ptr = mem_uq.dst;
-	       t_mem_tail.mapped = 1'b0;
-	       t_mem_tail.cached = 1'b1;
 	    end
 	  LWC1:
 	    begin
@@ -4031,9 +4401,9 @@ module exec(clk,
 
    always_comb
      begin
-	t_fwd_int_mem_srcA = r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_mem_uop.srcA == int_uop.dst);
+	t_fwd_int_mem_srcA = t_iwb && (t_iwb_dst != 'd0) && (t_picked_mem_uop.srcA == t_iwb_dst);
 	t_fwd_mem_mem_srcA = w_mem_rsp_int_valid && (t_picked_mem_uop.srcA == mem_rsp_dst_ptr);
-	t_fwd_int_mem_srcC = r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_mem_uop.srcC == int_uop.dst);
+	t_fwd_int_mem_srcC = t_iwb && (t_iwb_dst != 'd0) && (t_picked_mem_uop.srcC == t_iwb_dst);
 	t_fwd_mem_mem_srcC = w_mem_rsp_int_valid && (t_picked_mem_uop.srcC == mem_rsp_dst_ptr);
      end
    
@@ -4043,67 +4413,63 @@ module exec(clk,
 	r_fwd_mem_mem_srcA <= t_fwd_mem_mem_srcA;
 	if(t_fwd_int_mem_srcA)
 	  begin
-	     r_fwd_mem_srcA_data <= t_result;
+	     r_fwd_mem_srcA_data <= t_iwb_data;
 	  end
 	else if(t_fwd_mem_mem_srcA)
 	  begin
-	     r_fwd_mem_srcA_data <= mem_rsp_load_data[`M_WIDTH-1:0];
+	     r_fwd_mem_srcA_data <= w_mem_rsp_int_data;
 	  end
 	r_fwd_int_mem_srcC <= t_fwd_int_mem_srcC;
 	r_fwd_mem_mem_srcC <= t_fwd_mem_mem_srcC;
 	if(t_fwd_int_mem_srcC)
 	  begin
-	     r_fwd_mem_srcC_data <= t_result;
+	     r_fwd_mem_srcC_data <= t_iwb_data;
 	  end
 	else if(t_fwd_mem_mem_srcC)
 	  begin
-	     r_fwd_mem_srcC_data <= mem_rsp_load_data[`M_WIDTH-1:0];
+	     r_fwd_mem_srcC_data <= w_mem_rsp_int_data;
 	  end
 	
-	r_fwd_int_srcA <= r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_uop.srcA == int_uop.dst);
-	r_fwd_int_srcB <= r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_uop.srcB == int_uop.dst);
+	r_fwd_int_srcA <= t_iwb && (t_iwb_dst != 'd0) && (t_picked_uop.srcA == t_iwb_dst);
+	r_fwd_int_srcB <= t_iwb && (t_iwb_dst != 'd0) && (t_picked_uop.srcB == t_iwb_dst);
 	
 	r_fwd_mem_srcA <= w_mem_rsp_int_valid && (t_picked_uop.srcA == mem_rsp_dst_ptr);
 	r_fwd_mem_srcB <= w_mem_rsp_int_valid && (t_picked_uop.srcB == mem_rsp_dst_ptr);
 
 	/* capture the forwarded DATA with its flag -- int result wins if both
 	 * match, mirroring the mux priority above */
-	if(r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_uop.srcA == int_uop.dst))
+	if(t_iwb && (t_iwb_dst != 'd0) && (t_picked_uop.srcA == t_iwb_dst))
 	  begin
-	     r_fwd_srcA_data <= t_result;
+	     r_fwd_srcA_data <= t_iwb_data;
 	  end
 	else if(w_mem_rsp_int_valid && (t_picked_uop.srcA == mem_rsp_dst_ptr))
 	  begin
-	     r_fwd_srcA_data <= mem_rsp_load_data[`M_WIDTH-1:0];
+	     r_fwd_srcA_data <= w_mem_rsp_int_data;
 	  end
-	if(r_start_int && t_wr_int_prf && (int_uop.dst != 'd0) && (t_picked_uop.srcB == int_uop.dst))
+	if(t_iwb && (t_iwb_dst != 'd0) && (t_picked_uop.srcB == t_iwb_dst))
 	  begin
-	     r_fwd_srcB_data <= t_result;
+	     r_fwd_srcB_data <= t_iwb_data;
 	  end
 	else if(w_mem_rsp_int_valid && (t_picked_uop.srcB == mem_rsp_dst_ptr))
 	  begin
-	     r_fwd_srcB_data <= mem_rsp_load_data[`M_WIDTH-1:0];
+	     r_fwd_srcB_data <= w_mem_rsp_int_data;
 	  end
 
 	r_fwd_hilo_int <= r_start_int && t_wr_hilo && (t_picked_uop.hilo_src == int_uop.hilo_dst);
 	r_fwd_hilo_mul <= t_hilo_prf_ptr_val_out && (t_picked_uop.hilo_src == t_hilo_prf_ptr_out);
-	r_fwd_hilo_div <= t_div_complete && (t_picked_uop.hilo_src == t_div_hilo_prf_ptr_out);
+	r_fwd_hilo_div <= 1'b0;   /* SPARC divides do not write Y */
 	if(r_start_int && t_wr_hilo && (t_picked_uop.hilo_src == int_uop.hilo_dst))
 	  begin
 	     r_fwd_hilo_data <= t_hilo_result;
 	  end
 	else if(t_hilo_prf_ptr_val_out && (t_picked_uop.hilo_src == t_hilo_prf_ptr_out))
 	  begin
-	     r_fwd_hilo_data <= t_mul_result;
-	  end
-	else if(t_div_complete && (t_picked_uop.hilo_src == t_div_hilo_prf_ptr_out))
-	  begin
-	     r_fwd_hilo_data <= t_div_result;
+	     r_fwd_hilo_data <= w_mul_y;
 	  end
      end
 
 
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
    always_ff@(posedge clk)
      begin
 	if(reset)
@@ -4112,17 +4478,34 @@ module exec(clk,
 	  end
 	else
 	  begin
-	     if(r_start_int && t_wr_int_prf && (int_uop.dst != 'd0))
+	     if(t_iwb && (t_iwb_dst != 'd0))
 	       begin
-		  r_prf_zero[int_uop.dst] <= (t_result == 'd0);
+		  r_prf_zero[t_iwb_dst] <= (t_iwb_data == 'd0);
 	       end
 	     if(mem_rsp_dst_valid & ~mem_rsp_fp_dst & (mem_rsp_dst_ptr != 'd0))
 	       begin
-		  r_prf_zero[mem_rsp_dst_ptr] <= (mem_rsp_load_data == 'd0);
+		  r_prf_zero[mem_rsp_dst_ptr] <= (w_mem_rsp_int_data == 'd0);
 	       end
 	  end
      end // always_ff@ (posedge clk)
 `endif
+
+   /* SPARC icc, stored beside the value in the integer PRF (uop.vh): written by
+    * the icc writers' ALU writeback, read through srcC (the flags RAT's
+    * register) by the readers.  Like r_prf_zero, a reader woken by the writer's
+    * writeback executes the next cycle, after this write -- no bypass.  Reset 0
+    * covers p0, the reset flags register. */
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_prf_icc <= '{default:4'd0};
+	  end
+	else if(t_iwb && t_iwb_flags && (t_iwb_dst != 'd0))
+	  begin
+	     r_prf_icc[t_iwb_dst] <= t_iwb_icc;
+	  end
+     end // always_ff@ (posedge clk)
 
    rf4r2w #(.WIDTH(`M_WIDTH), .LG_DEPTH(`LG_PRF_ENTRIES))
    intprf (.clk(clk),
@@ -4131,17 +4514,17 @@ module exec(clk,
 	   .rdptr1(t_picked_uop.srcB),
 	   .rdptr2(t_picked_mem_uop.srcA),
 	   .rdptr3(t_sd_src),
-`ifdef ENABLE_MIPS4
+`ifdef ENABLE_INT_SRCC
 	   .rdptr4(t_picked_mem_uop.srcC),
 `else
 	   .rdptr4('d0),
 `endif
-	   .wrptr0(int_uop.dst),
+	   .wrptr0(t_iwb_dst),
 	   .wrptr1(mem_rsp_dst_ptr),
-	   .wen0(r_start_int && t_wr_int_prf),
+	   .wen0(t_iwb),
 	   .wen1(mem_rsp_dst_valid & ~mem_rsp_fp_dst),
-	   .wr0(t_result),
-	   .wr1(mem_rsp_load_data),
+	   .wr0(t_iwb_data),
+	   .wr1(w_mem_rsp_int_data),
 	   .rd0(w_srcA),
 	   .rd1(w_srcB),
 	   .rd2(w_mem_srcA),
@@ -4162,11 +4545,7 @@ module exec(clk,
 	  end
 	else if(t_hilo_prf_ptr_val_out)
 	  begin
-	     r_hilo_prf[t_hilo_prf_ptr_out] <= t_mul_result;
-	  end
-	else if(t_div_complete)
-	  begin
-	     r_hilo_prf[t_div_hilo_prf_ptr_out] <= t_div_result;
+	     r_hilo_prf[t_hilo_prf_ptr_out] <= w_mul_y;
 	  end	     
      end // always_ff@ (posedge clk)
 
@@ -4405,8 +4784,8 @@ module exec(clk,
 	   logic [63:0] c10, c4, c20, c2, c3;   /* EntryLo: the full ENTRYLO_PFN_WIDTH */
 	   c13 = loadcp0(13); c2 = loadcp0_64(2); c3 = loadcp0_64(3); c5 = loadcp0(5);
 	   c10 = loadcp0_64(10); c4 = loadcp0_64(4); c20 = loadcp0_64(20);
-	   r_epc      <= loadcp0_64(14);
-	   r_badvaddr <= loadcp0_64(8);
+	   r_epc      <= `M_WIDTH'(loadcp0_64(14));
+	   r_badvaddr <= `M_WIDTH'(loadcp0_64(8));
 	   r_cause    <= c13[6:2];   r_ce <= c13[29:28];
 	   r_ip0      <= c13[8];     r_ip1 <= c13[9];   r_exc_in_ds <= c13[31];
 	   r_entryhi_asid <= c10[7:0]; r_entryhi_r <= c10[63:62]; r_entryhi_vpn2 <= c10[`SEGBITS-1:13];
@@ -4600,11 +4979,11 @@ module exec(clk,
 	  end
 	else if(w_cp0_wr & w_cp0_wr_64 & w_cp0_wr_reg == 'd20)
 	  begin
-	     n_xptebase = w_cp0_wr_data[63:`SEGBITS-7];
+	     n_xptebase = w_cp0_wr_data64[63:`SEGBITS-7];
 	  end
 	if(save_to_tlb_regs)
 	  begin
-	     n_badvpn2 = core_badvaddr[`SEGBITS-1:13];
+	     n_badvpn2 = w_badvaddr64[`SEGBITS-1:13];
 	  end
      end
    
@@ -4635,8 +5014,8 @@ module exec(clk,
 	  end
 	else if(save_to_tlb_regs)
 	  begin
-	     n_entryhi_r    = core_badvaddr[63:62];
-	     n_entryhi_vpn2 = core_badvaddr[`SEGBITS-1:13];
+	     n_entryhi_r    = w_badvaddr64[63:62];
+	     n_entryhi_vpn2 = w_badvaddr64[`SEGBITS-1:13];
 	  end
 	else if(w_cp0_wr & w_cp0_wr_reg == 'd10)
 	  begin
@@ -4649,8 +5028,8 @@ module exec(clk,
 	      * via mtc0 (IRIX tlbwired, etc.).  Zero-extending here was the companion
 	      * workaround to the old low-19 loose match. In 32-bit addressing the
 	      * TLB match ignores R/upper-VPN, so the extra stored bits are benign. */
-	     n_entryhi_r    = w_cp0_wr_data[63:62];
-	     n_entryhi_vpn2 = w_cp0_wr_data[`SEGBITS-1:13];
+	     n_entryhi_r    = w_cp0_wr_data64[63:62];
+	     n_entryhi_vpn2 = w_cp0_wr_data64[`SEGBITS-1:13];
 	  end
      end
 
@@ -5024,27 +5403,27 @@ module exec(clk,
 	case(int_uop.srcA[4:0])
 	  'd2:
 	    begin
-	       t_csr0_64_val = w_entrylo0_64;
+	       t_csr0_64_val = `M_WIDTH'(w_entrylo0_64);
 	    end
 	  'd3:
 	    begin
-	       t_csr0_64_val = w_entrylo1_64;
+	       t_csr0_64_val = `M_WIDTH'(w_entrylo1_64);
 	    end
 	  'd10:
 	    begin
-	       t_csr0_64_val = {r_entryhi_r, {(62-`SEGBITS){1'b0}}, r_entryhi_vpn2, 5'd0, r_entryhi_asid};
+	       t_csr0_64_val = `M_WIDTH'({r_entryhi_r, {(62-`SEGBITS){1'b0}}, r_entryhi_vpn2, 5'd0, r_entryhi_asid});
 	    end
 	  'd20:
 	    begin
-	       t_csr0_64_val = {r_xptebase, r_entryhi_r, r_badvpn2, 4'd0};
+	       t_csr0_64_val = `M_WIDTH'({r_xptebase, r_entryhi_r, r_badvpn2, 4'd0});
 	    end
 	  'd23:
 	    begin
-	       t_csr0_64_val = r_cycle;            /* full 64b cycle count */
+	       t_csr0_64_val = `M_WIDTH'(r_cycle);            /* full 64b cycle count */
 	    end
 	  'd24:
 	    begin
-	       t_csr0_64_val = r_retired_insns;    /* full 64b retired count */
+	       t_csr0_64_val = `M_WIDTH'(r_retired_insns);    /* full 64b retired count */
 	    end
 	endcase
      end
@@ -5093,7 +5472,8 @@ module exec(clk,
 	     complete_bundle_1.take_br <= 1'b0;
 	     complete_bundle_1.overflow <= 1'b0;
 	     complete_bundle_1.trap <= 1'b0;
-	     complete_bundle_1.data <= t_mul_result[`M_WIDTH-1:0];
+	     /* {Y, rd}: the core reports data[63:32] as Y (retire_y_data) */
+	     complete_bundle_1.data <= t_mul_complete ? `MEM_WIDTH'(t_mul_result) : `MEM_WIDTH'(w_div_rd);
 	     complete_bundle_1.fwd_sel <= 2'b00;
 	     complete_bundle_1.fwd_selB <= 2'b00;
 	     complete_bundle_1.srcB_val <= 32'd0;
@@ -5110,14 +5490,14 @@ module exec(clk,
 	     complete_bundle_1.take_br <= t_take_br;
 	     complete_bundle_1.overflow <= t_overflow;
 	     complete_bundle_1.trap <= t_trap;	     
-	     complete_bundle_1.data <= t_result;
+	     complete_bundle_1.data <= {(t_wr_hilo ? t_hilo_result[31:0] : 32'd0), t_result};
 	     /* which source fed t_srcA for this uop -- see complete_t.fwd_sel */
 	     complete_bundle_1.fwd_sel <= {r_fwd_int_srcA, r_fwd_mem_srcA};
 	     /* srcB operand + its mux select, same edge as take_br/data */
 	     complete_bundle_1.fwd_selB <= {r_fwd_int_srcB, r_fwd_mem_srcB};
 	     complete_bundle_1.srcB_val <= t_srcB[31:0];
-	     complete_bundle_1.hi_nzA <= |t_srcA[`M_WIDTH-1:32];
-	     complete_bundle_1.hi_nzB <= |t_srcB[`M_WIDTH-1:32];
+	     complete_bundle_1.hi_nzA <= 1'b0;   /* 32-bit: no high half */
+	     complete_bundle_1.hi_nzB <= 1'b0;
 	  end
 	//(uq.rob_ptr == 'd5) ? 1'b1 : 1'b0;
      end
@@ -5167,7 +5547,7 @@ module exec(clk,
    logic [`M_WIDTH-1:0] t_vchk_expect;
    integer 		vchk_i;
 
-   wire w_vchk_wr0 = r_start_int & t_wr_int_prf & (int_uop.dst != 'd0);
+   wire w_vchk_wr0 = t_iwb & (t_iwb_dst != 'd0);
    wire w_vchk_wr1 = mem_rsp_dst_valid & (~mem_rsp_fp_dst) & (mem_rsp_dst_ptr != 'd0);
 
    wire w_vchk_read = r_start_int & int_uop.srcA_valid & (~int_uop.fp_srcA_valid)
@@ -5177,8 +5557,8 @@ module exec(clk,
      begin
 	/* a write landing THIS cycle is what the operand mux is supposed to
 	 * forward, so it -- not the shadow -- is the correct expectation. */
-	t_vchk_expect = (w_vchk_wr1 & (mem_rsp_dst_ptr == int_uop.srcA)) ? mem_rsp_load_data :
-			(w_vchk_wr0 & (int_uop.dst     == int_uop.srcA)) ? t_result :
+	t_vchk_expect = (w_vchk_wr1 & (mem_rsp_dst_ptr == int_uop.srcA)) ? w_mem_rsp_int_data :
+			(w_vchk_wr0 & (t_iwb_dst     == int_uop.srcA)) ? t_iwb_data :
 			r_vchk_shadow[int_uop.srcA];
      end
 
@@ -5192,14 +5572,15 @@ module exec(clk,
 	  begin
 	     if(w_vchk_wr0)
 	       begin
-		  r_vchk_shadow[int_uop.dst] <= t_result;
-		  r_vchk_valid[int_uop.dst]  <= 1'b1;
+		  r_vchk_shadow[t_iwb_dst] <= t_iwb_data;
+		  r_vchk_valid[t_iwb_dst]  <= 1'b1;
 	       end
 	     if(w_vchk_wr1)
 	       begin
-		  r_vchk_shadow[mem_rsp_dst_ptr] <= mem_rsp_load_data;
+		  r_vchk_shadow[mem_rsp_dst_ptr] <= w_mem_rsp_int_data;
 		  r_vchk_valid[mem_rsp_dst_ptr]  <= 1'b1;
 	       end
+
 	     if(w_vchk_read & (t_srcA != t_vchk_expect))
 	       begin
 		  $display("[VALCHK] cyc=%0d pc=%x op=%0d srcA=p%0d GOT %x EXPECT %x  fwd_int=%b fwd_mem=%b",
@@ -5256,6 +5637,10 @@ module exec(clk,
 	     if(uq_push && uq_uop.dst_valid)
 	       begin
 		  r_rd_seen[uq_uop.dst] <= 1'b0;
+	       end
+	     if(uq_push && uq_uop.dst2_valid)
+	       begin
+		  r_rd_seen[uq_uop.dst2] <= 1'b0;   /* SPARC ldd: rd+1 */
 	       end
 	     if(uq_push_two && uq_uop_two.dst_valid)
 	       begin
@@ -5356,7 +5741,7 @@ module exec(clk,
    /* debug only: name every port-1 completion that lands near a restart, and time
     * the flush -> restart window.  r_dbg_st_* = what last STARTED at each rob slot. */
    logic [31:0] r_dbg_st_pc [N_ROB_ENTRIES-1:0];
-   logic [7:0]  r_dbg_st_op [N_ROB_ENTRIES-1:0];
+   logic [8:0]  r_dbg_st_op [N_ROB_ENTRIES-1:0];
    logic [31:0] r_dbg_st_ep [N_ROB_ENTRIES-1:0];
    logic [3:0]  r_dbg_since_rc;
    logic        r_dbg_dsd;

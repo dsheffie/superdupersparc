@@ -26,7 +26,9 @@ typedef struct packed {
    logic       has_delay_slot;
    logic       has_nullifying_delay_slot;
    logic       in_delay_slot;
-   logic [4:0] ldst;
+   logic       valid_flags_dst;   /* SPARC: pdst also holds the new icc (flags RAT) */
+   logic       valid_dst2;        /* SPARC ldd: pdst2 is rd+1 (arch ldst+1) */
+   logic [(`LG_PRF_ENTRIES-1):0] ldst;   /* int: the flat windowed arch index */
 
    /* Renamed srcA pointer + its architectural name, captured at ALLOC.  With pdst
     * below this makes the retire trace self-checking for renaming: a consumer whose
@@ -35,9 +37,15 @@ typedef struct packed {
     * data (delivery/bypass bug).  The captured jr faults cannot distinguish those
     * two without this. */
    logic [(`LG_PRF_ENTRIES-1):0] srcA_ptr;
-   logic [4:0] 		         srcA_arch;
+   logic [(`LG_PRF_ENTRIES-1):0] srcA_arch;
    logic [(`LG_PRF_ENTRIES-1):0] pdst;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst;
+   logic [(`LG_PRF_ENTRIES-1):0] old_flags_pdst;   /* the flags RAT's previous register */
+   logic [(`LG_PRF_ENTRIES-1):0] pdst2;
+   logic [(`LG_PRF_ENTRIES-1):0] old_pdst2;
+   /* SPARC Y (the HILO rename), its own fields: a multiply writes rd AND Y */
+   logic [(`LG_HILO_PRF_ENTRIES-1):0] hilo_pdst;
+   logic [(`LG_HILO_PRF_ENTRIES-1):0] old_hilo_pdst;
    logic [(`M_WIDTH-1):0] 	 pc;
    logic [(`M_WIDTH-1):0] 	 target_pc;
    logic 			 is_br;
@@ -47,8 +55,8 @@ typedef struct packed {
    logic			 is_syscall;
    logic			 is_cache;   /* MIPS CACHE op (serializing flush) */
    cache_act_t		 cache_act;  /* what the CACHE op does at retire (machine.vh) */
-   logic [(`M_WIDTH-1):0]	 data;
-   logic [7:0]			 opcode;
+   logic [(`MEM_WIDTH-1):0]	 data;
+   logic [8:0]			 opcode;
    logic [`LG_BPU_TBL_SZ-1:0] 	 bpu_idx;
    /* PREDICTED direction, kept alongside the RESOLVED take_br so a capture can
     * separate "predictor said taken" from "branch resolved taken".  The
@@ -108,11 +116,18 @@ typedef struct packed {
    logic has_delay_slot;
    logic has_nullifying_delay_slot;
    logic in_delay_slot;
-   logic [4:0] ldst;
+   logic valid_flags_dst;
+   logic valid_dst2;
+   logic [(`LG_PRF_ENTRIES-1):0] ldst;
    logic [(`LG_PRF_ENTRIES-1):0] srcA_ptr;
-   logic [4:0] srcA_arch;
+   logic [(`LG_PRF_ENTRIES-1):0] srcA_arch;
    logic [(`LG_PRF_ENTRIES-1):0] pdst;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst;
+   logic [(`LG_PRF_ENTRIES-1):0] old_flags_pdst;
+   logic [(`LG_PRF_ENTRIES-1):0] pdst2;
+   logic [(`LG_PRF_ENTRIES-1):0] old_pdst2;
+   logic [(`LG_HILO_PRF_ENTRIES-1):0] hilo_pdst;
+   logic [(`LG_HILO_PRF_ENTRIES-1):0] old_hilo_pdst;
    logic [(`M_WIDTH-1):0] pc;
    logic is_br;
    logic is_indirect;
@@ -120,7 +135,7 @@ typedef struct packed {
    logic is_syscall;
    logic is_cache;
    cache_act_t cache_act;
-   logic [7:0] opcode;
+   logic [8:0] opcode;
    logic [`LG_BPU_TBL_SZ-1:0] bpu_idx;
    logic br_pred;
    logic oldest_first;
@@ -143,7 +158,7 @@ typedef struct packed {
    logic is_bus_err;
    logic [(`M_WIDTH-1):0] target_pc;
    logic take_br;
-   logic [(`M_WIDTH-1):0] data;
+   logic [(`MEM_WIDTH-1):0] data;
    logic tlb_refill;
    logic tlb_invalid;
    logic tlb_modified;
@@ -171,7 +186,7 @@ typedef struct packed {
    logic		       overflow;
    logic		       trap;
    logic [5:0]		       fp_flags;  /* {denorm(E), V,Z,O,U,I} of a completing FP op (port 2) */
-   logic [(`M_WIDTH-1):0]      data;
+   logic [(`MEM_WIDTH-1):0]    data;
    /* Which source the operand mux actually used for srcA at execute:
     *   bit1 = r_fwd_int_srcA (forwarded ALU result)
     *   bit0 = r_fwd_mem_srcA (forwarded load data)
@@ -235,7 +250,7 @@ typedef struct packed {
 } lsu_sb_t;
 
 typedef struct packed {
-   logic [(`M_WIDTH-1):0] addr;
+   logic [(`REQ_ADDR_WIDTH-1):0] addr;   /* the VA, then (l1d) the PA */
    logic 	is_store;
    logic	is_atomic;
    mem_op_t op;
@@ -245,13 +260,15 @@ typedef struct packed {
    logic [`LG_ROB_ENTRIES-1:0] rob_ptr;
    logic [`LG_PRF_ENTRIES-1:0] dst_ptr;
    logic 		       dst_valid;
+   logic [`LG_PRF_ENTRIES-1:0] dst2_ptr;   /* SPARC ldd: rd+1 takes the low word */
+   logic 		       dst2_valid;
    logic 		       fp_dst;   /* result writes the FP PRF (vs int) — for moves/FP loads */
    /* FR=0 lwc1 merge: write only the fp_hi-selected 32b half of the load result,
     * preserving the other half (fp_pres = the old 32b half read at issue). */
    logic 		       fp_merge;
    logic 		       fp_hi;
    logic [31:0]		       fp_pres;
-   logic [(`M_WIDTH-1):0]      data;
+   logic [(`MEM_WIDTH-1):0]    data;
    logic [(`M_WIDTH-1):0]      pc;   /* un-guarded for synth: store-tracer PC watchpoint (be birth catch) */
    /* simple load (LW/LWU/LB/LBU/LH/LHU/LD/LWC1/LDC1): its LSU entry stays until
     * the data returns, so the l1d may block it instead of replaying it */
@@ -270,7 +287,7 @@ typedef struct packed {
    logic [(1<<`LG_MEM_SCHED_ENTRIES)-1:0] lsu_older_st;
    logic [(1<<`LG_MEM_SCHED_ENTRIES)-1:0] lsu_older_ep;
 `ifdef VERILATOR
-   logic [(`M_WIDTH-1):0]      uuid;
+   logic [63:0] 	       uuid;
 `endif
 } mem_req_t;
 
@@ -282,15 +299,17 @@ typedef struct packed {
 } dq_t;
 
 typedef struct packed {
-   logic [(`M_WIDTH-1):0] data;
+   logic [(`MEM_WIDTH-1):0] data;
    logic [`LG_ROB_ENTRIES-1:0] rob_ptr;
 } mem_data_t;
 
 typedef struct packed {
-   logic [(`M_WIDTH-1):0] data;
+   logic [(`MEM_WIDTH-1):0] data;
    logic [`LG_ROB_ENTRIES-1:0] rob_ptr;
    logic [`LG_PRF_ENTRIES-1:0] dst_ptr;
    logic 		       dst_valid;
+   logic [`LG_PRF_ENTRIES-1:0] dst2_ptr;   /* SPARC ldd: rd+1 (rd gets data[63:32], rd+1 data[31:0]) */
+   logic 		       dst2_valid;
    logic 		       fp_dst;   /* result writes the FP PRF (vs int) */
    logic 		       fp_merge; /* FR=0 lwc1: merge into the fp_hi half, preserve fp_pres */
    logic 		       fp_hi;

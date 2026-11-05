@@ -118,6 +118,8 @@ module core(clk,
 	    took_branch,
 	    branch_bpu_idx,
 	    restart_pc,
+	    restart_npc,
+	    restart_npc_valid,
 	    restart_src_pc,
 	    restart_src_is_indirect,
 	    restart_valid,
@@ -146,6 +148,8 @@ module core(clk,
 	    retire_reg_two_ptr,
 	    retire_reg_two_data,
 	    retire_reg_two_valid,
+	    retire_y_valid,
+	    retire_y_data,
 	    retire_fp_reg_ptr,
 	    retire_fp_reg_data,
 	    retire_fp_reg_valid,
@@ -296,6 +300,10 @@ module core(clk,
    
    
    output logic [(`M_WIDTH-1):0] restart_pc;
+   /* SPARC jmpl;rett: the restart is into a delay slot -- after the one
+    * instruction at restart_pc, fetch continues at restart_npc (the rett target) */
+   output logic [(`M_WIDTH-1):0] restart_npc;
+   output logic 		 restart_npc_valid;
    output logic [(`M_WIDTH-1):0] restart_src_pc;
    output logic 		 restart_src_is_indirect;
    output logic 		 restart_valid;
@@ -329,23 +337,26 @@ module core(clk,
    input logic [1:0] mem_color_busy;       /* l1d: a memory op of color c is still in flight */
    input logic       mem_quiet;            /* l1d: nothing accepted is still in flight */
 
-   output logic [4:0] 			  retire_reg_ptr;
+   output logic [`LG_PRF_ENTRIES-1:0] 	  retire_reg_ptr;   /* flat windowed arch index */
    output logic [`M_WIDTH-1:0]		  retire_reg_data;
    output logic 			  retire_reg_valid;
 
-   output logic [4:0] 			  retire_reg_two_ptr;
+   output logic [`LG_PRF_ENTRIES-1:0] 	  retire_reg_two_ptr;
    output logic [`M_WIDTH-1:0]		  retire_reg_two_data;
    output logic 			  retire_reg_two_valid;
+   /* SPARC Y (the HILO rename), for the co-sim: ROB data[63:32] of a Y writer */
+   output logic 			  retire_y_valid;
+   output logic [31:0]			  retire_y_data;
    /* FP and FCR architectural writes, for the co-sim.  retire_reg_valid tests
     * only valid_dst, so an FP register write was invisible to the checker --
     * every FP value bug stayed silent until it leaked through an mfc1/swc1.
     * rob_entry_t.data already carries the FP result (complete_bundle_2 writes
     * it), and for a compare data[7:0] is the condition-code vector. */
    output logic [4:0] 		  retire_fp_reg_ptr;
-   output logic [`M_WIDTH-1:0] 	  retire_fp_reg_data;
+   output logic [`FP_WIDTH-1:0] 	  retire_fp_reg_data;
    output logic 		  retire_fp_reg_valid;
    output logic [4:0] 		  retire_fp_reg_two_ptr;
-   output logic [`M_WIDTH-1:0] 	  retire_fp_reg_two_data;
+   output logic [`FP_WIDTH-1:0] 	  retire_fp_reg_two_data;
    output logic 		  retire_fp_reg_two_valid;
    output logic [4:0] 		  retire_fcr_reg_ptr;
    output logic [`M_WIDTH-1:0] 	  retire_fcr_reg_data;
@@ -370,8 +381,8 @@ module core(clk,
    logic [31:0] 			  r_rob_raw_insn[(1<<`LG_ROB_ENTRIES)-1:0];
 `endif
 
-   output logic [7:0]			  retire_op;
-   output logic [7:0]			  retire_two_op;
+   output logic [8:0]			  retire_op;
+   output logic [8:0]			  retire_two_op;
       
    output logic 			  retired_call;
    output logic 			  retired_ret;
@@ -467,6 +478,27 @@ module core(clk,
    
    
    localparam N_PRF_ENTRIES = (1<<`LG_PRF_ENTRIES);
+   localparam N_INT_ARCH = `N_INT_ARCH_REGS;
+
+   /* the physical register holding arch register a at reset.  The PRF is two
+    * clusters (prf_pool_split: ALU = the low half, MEM = the high half) and a
+    * writer allocates from its own, so the arch registers are split between
+    * them: identity-mapping all 136 would fill the ALU cluster and starve it. */
+   function automatic logic [`LG_PRF_ENTRIES-1:0] reset_preg(input integer a);
+      begin
+	 integer t;
+	 t = (a < N_INT_ARCH/2) ? a : (N_PRF_ENTRIES/2 + a - N_INT_ARCH/2);
+	 reset_preg = t[`LG_PRF_ENTRIES-1:0];
+      end
+   endfunction // reset_preg
+
+   /* is physical register p a reset mapping (other than the pinned p0)? */
+   function automatic logic reset_mapped(input integer p);
+      begin
+	 reset_mapped = ((p >= 1) && (p < N_INT_ARCH/2)) ||
+			((p >= N_PRF_ENTRIES/2) && (p < N_PRF_ENTRIES/2 + N_INT_ARCH - N_INT_ARCH/2));
+      end
+   endfunction // reset_mapped
    /* N_ROB_ENTRIES = pointer index space (masks/ports indexed by rob_ptr stay 2^LG);
     * ROB_ENTRIES = real capacity (storage arrays, pointer wrap) */
    localparam N_ROB_ENTRIES = (1<<`LG_ROB_ENTRIES);
@@ -559,6 +591,13 @@ module core(clk,
       r.has_delay_slot = e.has_delay_slot;
       r.has_nullifying_delay_slot = e.has_nullifying_delay_slot;
       r.in_delay_slot = e.in_delay_slot;
+      r.valid_flags_dst = e.valid_flags_dst;
+      r.old_flags_pdst = e.old_flags_pdst;
+      r.valid_dst2 = e.valid_dst2;
+      r.pdst2 = e.pdst2;
+      r.old_pdst2 = e.old_pdst2;
+      r.hilo_pdst = e.hilo_pdst;
+      r.old_hilo_pdst = e.old_hilo_pdst;
       r.ldst = e.ldst;
       r.srcA_ptr = e.srcA_ptr;
       r.srcA_arch = e.srcA_arch;
@@ -639,6 +678,13 @@ module core(clk,
       r.has_delay_slot = m.has_delay_slot;
       r.has_nullifying_delay_slot = m.has_nullifying_delay_slot;
       r.in_delay_slot = m.in_delay_slot;
+      r.valid_flags_dst = m.valid_flags_dst;
+      r.old_flags_pdst = m.old_flags_pdst;
+      r.valid_dst2 = m.valid_dst2;
+      r.pdst2 = m.pdst2;
+      r.old_pdst2 = m.old_pdst2;
+      r.hilo_pdst = m.hilo_pdst;
+      r.old_hilo_pdst = m.old_hilo_pdst;
       r.ldst = m.ldst;
       r.srcA_ptr = m.srcA_ptr;
       r.srcA_arch = m.srcA_arch;
@@ -762,10 +808,22 @@ module core(clk,
    
       
          
-   logic [`LG_PRF_ENTRIES-1:0] r_alloc_rat[31:0];
-   logic [`LG_PRF_ENTRIES-1:0] n_alloc_rat[31:0];
-   logic [`LG_PRF_ENTRIES-1:0] r_retire_rat[31:0];
-   logic [`LG_PRF_ENTRIES-1:0] n_retire_rat[31:0];
+   /* indexed by the flat windowed arch index (decode_sparc.sv widx) */
+   logic [`LG_PRF_ENTRIES-1:0] r_alloc_rat[`N_INT_ARCH_REGS-1:0];
+   logic [`LG_PRF_ENTRIES-1:0] n_alloc_rat[`N_INT_ARCH_REGS-1:0];
+   logic [`LG_PRF_ENTRIES-1:0] r_retire_rat[`N_INT_ARCH_REGS-1:0];
+   logic [`LG_PRF_ENTRIES-1:0] n_retire_rat[`N_INT_ARCH_REGS-1:0];
+   /* the flags RAT: the physical register of the youngest icc writer (icc is
+    * stored in the integer PRF beside the value, uop.vh) */
+   logic [`LG_PRF_ENTRIES-1:0] r_flags_alloc_rat, n_flags_alloc_rat;
+   logic [`LG_PRF_ENTRIES-1:0] r_flags_retire_rat, n_flags_retire_rat;
+   /* committed reference counts: how many committed mappings (GPR RAT entries
+    * plus the flags RAT) hold each integer physical register.  Changed only at
+    * retire; a register is freed when its count reaches 0.  p0 (%g0, also the
+    * reset flags register) is pinned and never counted. */
+   logic [`LG_PRF_REFCNT-1:0] r_prf_refcnt[N_PRF_ENTRIES-1:0];
+   logic [`LG_PRF_REFCNT-1:0] n_prf_refcnt[N_PRF_ENTRIES-1:0];
+   logic [N_PRF_ENTRIES-1:0]  t_prf_ref_free;
    
    logic [`LG_HILO_PRF_ENTRIES-1:0] r_hilo_alloc_rat;
    logic [`LG_HILO_PRF_ENTRIES-1:0] n_hilo_alloc_rat;
@@ -889,7 +947,7 @@ module core(clk,
    assign ext_flush_done = r_xflush_done;
    /* the op decode injects into the flush uop, and the page the L1D walks (read at the
     * ROB head; held here until ext_flush_done) */
-   wire [`M_WIDTH-1:0] w_xflush_addr = {{(`M_WIDTH-`PA_WIDTH){1'b0}}, r_xflush_ppn, {`LG_PG_SZ{1'b0}}};
+   wire [`M_WIDTH-1:0] w_xflush_addr = `M_WIDTH'({r_xflush_ppn, {`LG_PG_SZ{1'b0}}});   /* RAM PAs fit 32 bits */
    wire opcode_t w_xflush_op = r_xflush_whole ? XFLUSH : (r_xflush_drop ? XPG_INV : XPG_WBINV);
 `ifdef VERILATOR
    /* an injected ext_flush uop must never land in a delay slot: it replaces the
@@ -927,11 +985,7 @@ module core(clk,
    logic 		     t_any_complete;
    
 
-   logic 		     t_free_reg;
-   logic [`LG_PRF_ENTRIES-1:0] t_free_reg_ptr;
    
-   logic 		       t_free_reg_two;
-   logic [`LG_PRF_ENTRIES-1:0] t_free_reg_two_ptr;
    
    logic 			   t_free_hilo;
    logic [`LG_HILO_PRF_ENTRIES-1:0] t_free_hilo_ptr;
@@ -1575,7 +1629,7 @@ module core(clk,
 					 t_rob_head.has_delay_slot,
 					 t_rob_head.is_ret,
 					 t_rob_head.fwd_sel,   /* {fwd_int,fwd_mem} operand-mux select at execute */
-					 t_rob_head.srcA_arch,
+					 t_rob_head.srcA_arch[4:0],
 					 t_rob_head.srcA_ptr,
 					 t_rob_head.pdst,
 					 t_rob_head.exec_cycle,
@@ -1583,7 +1637,7 @@ module core(clk,
 					 {{(11-`LG_BPU_TBL_SZ){1'b0}}, t_rob_head.bpu_idx},   /* was pht_idx[10:0]; same 11b slot */
 					 t_rob_head.br_pred,
 					 w_rt_flags[6:0],
-					 t_rob_head.ldst,
+					 t_rob_head.ldst[4:0],
 					 t_rob_head.opcode,
 					 t_rob_head.data[31:0],
 					 t_rob_head.target_pc[31:0],
@@ -1601,7 +1655,7 @@ module core(clk,
 					 t_rob_next_head.has_delay_slot,
 					 t_rob_next_head.is_ret,
 					 t_rob_next_head.fwd_sel,   /* {fwd_int,fwd_mem} operand-mux select at execute */
-					 t_rob_next_head.srcA_arch,
+					 t_rob_next_head.srcA_arch[4:0],
 					 t_rob_next_head.srcA_ptr,
 					 t_rob_next_head.pdst,
 					 t_rob_next_head.exec_cycle,
@@ -1609,7 +1663,7 @@ module core(clk,
 					 {{(11-`LG_BPU_TBL_SZ){1'b0}}, t_rob_next_head.bpu_idx},   /* was pht_idx[10:0]; same 11b slot */
 					 t_rob_next_head.br_pred,
 					 w_rt_flags2[6:0],
-					 t_rob_next_head.ldst,
+					 t_rob_next_head.ldst[4:0],
 					 t_rob_next_head.opcode,
 					 t_rob_next_head.data[31:0],
 					 t_rob_next_head.target_pc[31:0],
@@ -1854,14 +1908,24 @@ module core(clk,
    
    uop_t t_uop, t_dec_uop, t_alloc_uop;
    uop_t t_uop2, t_dec_uop2, t_alloc_uop2;
+   uop_t t_dq_push_uop, t_dq_push_uop2;   /* what the decode queue takes: decoded, or a trap's pair */
       
-   assign insn_ack = !t_dq_full && insn_valid && (r_state == ACTIVE) && !r_oldest_first_pending;
+   assign insn_ack = !t_dq_full && insn_valid && (r_state == ACTIVE) && !r_oldest_first_pending && !r_trap_inj && !w_dec_hold;
    assign insn_ack_two = !t_dq_full &&
 			 insn_valid &&
 			 !t_dq_next_full &&
-			 insn_valid_two && (r_state == ACTIVE) && !r_oldest_first_pending;
+			 insn_valid_two && (r_state == ACTIVE) && !r_oldest_first_pending && !r_trap_inj && !w_dec_hold;
    
    assign restart_pc = r_restart_pc;
+   assign restart_npc = r_restart_npc;
+   assign restart_npc_valid = r_restart_npc_valid;
+   logic [(`M_WIDTH-1):0] r_restart_npc, n_restart_npc;
+   logic r_restart_npc_valid, n_restart_npc_valid;
+   always_ff@(posedge clk)
+     begin
+	r_restart_npc_valid <= reset ? 1'b0 : n_restart_npc_valid;
+	r_restart_npc <= n_restart_npc;
+     end
    assign restart_src_pc = r_restart_src_pc;
    assign restart_src_is_indirect = r_restart_src_is_indirect;
 
@@ -2151,6 +2215,8 @@ module core(clk,
    	     retire_reg_two_ptr <= 'd0;
    	     retire_reg_two_data <= 'd0;
    	     retire_reg_two_valid <= 1'b0;
+   	     retire_y_valid <= 1'b0;
+   	     retire_y_data <= 'd0;
    	     retire_fp_reg_ptr <= 'd0;
    	     retire_fp_reg_data <= 'd0;
    	     retire_fp_reg_valid <= 1'b0;
@@ -2183,29 +2249,37 @@ module core(clk,
    	else
    	  begin
    	     retire_reg_ptr <= t_rob_head.ldst;
-   	     retire_reg_data <= t_rob_head.data;
-   	     retire_reg_valid <= t_rob_head.valid_dst && t_retire;
-   	     retire_reg_two_ptr <= t_rob_next_head.ldst;
-   	     retire_reg_two_data <= t_rob_next_head.data;
-   	     retire_reg_two_valid <= t_rob_next_head.valid_dst && t_retire_two;
-   	     retire_fp_reg_ptr <= t_rob_head.ldst;
+   	     /* a write to %g0 (cmp, ldd %g0) is not architectural; an ldd's rd+1
+   	      * (the low word) reports through the second port, as it retires alone */
+   	     retire_reg_data <= t_rob_head.valid_dst2 ? t_rob_head.data[63:32] : t_rob_head.data[`M_WIDTH-1:0];
+   	     retire_reg_valid <= t_rob_head.valid_dst && (t_rob_head.ldst != 'd0) && t_retire;
+   	     retire_reg_two_ptr <= t_rob_head.valid_dst2 ? (t_rob_head.ldst + 'd1) : t_rob_next_head.ldst;
+   	     retire_reg_two_data <= t_rob_head.valid_dst2 ? t_rob_head.data[31:0] : t_rob_next_head.data[`M_WIDTH-1:0];
+   	     retire_reg_two_valid <= t_rob_head.valid_dst2 ? (t_rob_head.valid_dst && t_retire) :
+   				     (t_rob_next_head.valid_dst && (t_rob_next_head.ldst != 'd0) && t_retire_two);
+   	     retire_y_valid <= t_rob_head.valid_hilo_dst && t_retire;
+   	     retire_y_data <= t_rob_head.data[63:32];
+   	     retire_fp_reg_ptr <= t_rob_head.ldst[4:0];
    	     retire_fp_reg_data <= t_rob_head.data;
    	     retire_fp_reg_valid <= t_rob_head.valid_fp_dst && t_retire;
-   	     retire_fp_reg_two_ptr <= t_rob_next_head.ldst;
+   	     retire_fp_reg_two_ptr <= t_rob_next_head.ldst[4:0];
    	     retire_fp_reg_two_data <= t_rob_next_head.data;
    	     retire_fp_reg_two_valid <= t_rob_next_head.valid_fp_dst && t_retire_two;
-   	     retire_fcr_reg_ptr <= t_rob_head.ldst;
-   	     retire_fcr_reg_data <= t_rob_head.data;
+   	     retire_fcr_reg_ptr <= t_rob_head.ldst[4:0];
+   	     retire_fcr_reg_data <= t_rob_head.data[`M_WIDTH-1:0];
    	     retire_fcr_reg_valid <= t_rob_head.valid_fcr_dst && t_retire;
-   	     retire_fcr_reg_two_ptr <= t_rob_next_head.ldst;
-   	     retire_fcr_reg_two_data <= t_rob_next_head.data;
+   	     retire_fcr_reg_two_ptr <= t_rob_next_head.ldst[4:0];
+   	     retire_fcr_reg_two_data <= t_rob_next_head.data[`M_WIDTH-1:0];
    	     retire_fcr_reg_two_valid <= t_rob_next_head.valid_fcr_dst && t_retire_two;
 	     
    	     /* an injected ext_flush uop (XFLUSH/XPG_*) leaves the ROB like any CACHE op
    	      * but is NOT an architectural instruction -- it replaced the insn at .pc,
    	      * which the restart re-executes -- so it must not count as retired (an IRQ
    	      * uop never retires either: it commits through the fault path). */
-   	     retire_valid <= t_retire & !is_xflush(t_rob_head.opcode);
+   	     /* TRAP_L1 is not an architectural instruction; TRAP_L2 retires as the
+   	      * trapped one (its pc), so the checker steps the ISS through the trap
+   	      * once, after both %l1 and %l2 are written */
+   	     retire_valid <= t_retire & !is_xflush(t_rob_head.opcode) & (t_rob_head.opcode != TRAP_L1);
 	     retire_two_valid <= t_retire_two;
    	     retire_pc <= t_rob_head.pc;
 	     retire_two_pc <= t_rob_next_head.pc;
@@ -2233,7 +2307,7 @@ module core(clk,
      begin
 	if(retire_valid)
 	  begin
-	     last_retire_pc <= retire_pc;
+	     last_retire_pc <= 64'(retire_pc);
 	  end
      end
    always_ff@(negedge clk)
@@ -2430,6 +2504,8 @@ module core(clk,
 	n_restart_pc = r_restart_pc;
 	n_restart_src_pc = r_restart_src_pc;
 	n_restart_src_is_indirect = r_restart_src_is_indirect;
+	n_restart_npc = r_restart_npc;
+	n_restart_npc_valid = r_restart_npc_valid;
 	n_restart_why = r_restart_why;
 	n_restart_head_ptr = r_restart_head_ptr;
 	n_restart_valid = 1'b0;
@@ -2444,13 +2520,16 @@ module core(clk,
 	n_exc_in_delay = r_exc_in_delay;
 	
 	
-	t_enough_iprfs = !((t_uop.dst_valid) && t_gpr_ffs_full);
+	/* ldd's second destination takes the second slot's allocator */
+	t_enough_iprfs = !((t_uop.dst_valid) && t_gpr_ffs_full) && !(t_uop.dst2_valid && t_gpr_ffs2_full);
 	t_enough_hlprfs = !((t_uop.hilo_dst_valid) && (r_hilo_prf_free == 'd0));
 	t_enough_fprfs = !((t_uop.fp_dst_valid) && (t_uop.is_mem ? t_fp_b1_full : t_fp_b0_full));
 	t_enough_fcrprfs = !((t_uop.fcr_dst_valid) && (r_fcr_prf_free == 'd0));
 
 
-	t_enough_next_iprfs = !((t_uop2.dst_valid) && t_gpr_ffs2_full);
+	/* an ldd allocates alone: in slot 0 its rd+1 uses slot 1's allocator, and in
+	 * slot 1 it would need a third */
+	t_enough_next_iprfs = !((t_uop2.dst_valid) && t_gpr_ffs2_full) && !t_uop.dst2_valid && !t_uop2.dst2_valid;
 	t_enough_next_hlprfs = !((t_uop2.hilo_dst_valid) /*&& (r_hilo_prf_free == 'd0)*/);
 	/* one FP dst alloc per cycle: slot 1 FP-dst needs a free FP reg AND slot 0 not also FP-dst */
 	t_enough_next_fprfs = !((t_uop2.fp_dst_valid) && ((t_uop2.is_mem ? t_fp_b1_full : t_fp_b0_full) || t_uop.fp_dst_valid));
@@ -2594,6 +2673,7 @@ module core(clk,
 			      n_state = DRAIN;
 			      n_restart_cycles = 'd1;
 			      n_restart_valid = 1'b1;
+			      n_restart_npc_valid = 1'b0;
 			      n_restart_why = RST_WHY_MISPREDICT;
 			      n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
 			      t_bump_rob_head = 1'b1;			      
@@ -2674,6 +2754,11 @@ module core(clk,
 				    * already excluded above, which covers the restart / drain paths
 				    * and a not-taken branch-likely. */
 				   & (t_rob_head.is_br ? !t_rob_next_head.is_br : 1'b1)
+				   /* TRAP_L1 retires alone (TRAP_L2 must report in slot 0) */
+				   & (t_rob_head.opcode != TRAP_L1)
+				   /* an ldd retires alone: rd+1 takes the second register port */
+				   & !t_rob_head.valid_dst2
+				   & !t_rob_next_head.valid_dst2
 				   & !t_rob_next_head.is_ret
 				   & !t_rob_next_head.is_call
 				   & !is_cp0_wr(t_rob_next_head.opcode)   /* one CP0 commit per cycle */
@@ -2787,6 +2872,16 @@ module core(clk,
 			      //$stop();
 			   end
 		      end
+		    if(!t_arch_fault & (t_rob_head.opcode == S_RETT) &
+		       (t_rob_head.target_pc != (r_restart_pc + 'd4)))
+		      begin
+			 /* jmpl;rett behind a mispredicted jmpl: the front end already
+			  * restarted at the jmpl's target (r_restart_pc) before the rett's
+			  * target was known -- restart it again, into the delay slot */
+			 n_restart_npc = t_rob_head.target_pc;
+			 n_restart_npc_valid = 1'b1;
+			 n_restart_valid = 1'b1;
+		      end
 		    if(t_arch_fault)
 		      begin
 			 /* faulted delay slot (e.g. store TLB miss) -> arch exception.
@@ -2899,7 +2994,7 @@ module core(clk,
 			      /* EA = base+offset, masked to a physical address (kseg0/kseg1
 			       * unmapped: PA = VA & 0x1fffffff) so L1D can tag-match it and
 			       * the L2 drop targets the right line. */
-			      n_flush_cl_addr = t_rob_head.data & 64'h1fffffff;
+			      n_flush_cl_addr = t_rob_head.data[`M_WIDTH-1:0] & 32'h1fffffff;
 			      n_flush_cl_inval = (t_rob_head.cache_act == CA_D_LINE_INV); /* drop, no WB */
 			      n_l1i_flush_complete = 1'b1;          /* not flushing L1I */
 			      n_l2_flush_complete  = 1'b1;          /* flush_cl bypasses the L2 flush */
@@ -2923,6 +3018,14 @@ module core(clk,
 		      begin
 			 t_clr_dq = 1'b1;
 			 n_restart_pc = t_rob_head.in_delay_slot ? r_last_branch_target : t_rob_head.target_pc;
+			 /* jmpl;rett: the jmpl's target runs, then the rett's.  Only a rett
+			  * target other than jmpl target + 4 needs the delay-slot restart;
+			  * the sequential case is an ordinary restart (and must be: the
+			  * instruction there may itself be a branch, e.g. the call after a
+			  * ta, whose own target the delay-slot mode would lose) */
+			 n_restart_npc = t_rob_head.target_pc;
+			 n_restart_npc_valid = (t_rob_head.opcode == S_RETT) & t_rob_head.in_delay_slot &
+					       (t_rob_head.target_pc != (r_last_branch_target + 'd4));
 			 n_restart_src_pc = t_rob_head.pc;
 			 n_restart_why = RST_WHY_SERIALIZE;
 			 n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
@@ -2956,6 +3059,7 @@ module core(clk,
 		    n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
 		    n_restart_src_is_indirect = 1'b0;
 		    n_restart_valid = 1'b1;
+		    n_restart_npc_valid = 1'b0;
 		    n_pending_fault = 1'b0;
 		    if(n_got_restart_ack)
 		      begin
@@ -2999,6 +3103,7 @@ module core(clk,
 		    n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
 		    n_restart_src_is_indirect = 1'b0;
 		    n_restart_valid = 1'b1;
+		    n_restart_npc_valid = 1'b0;
 		    n_state = HALT_WAIT_FOR_RESTART;
 		    n_got_break = 1'b0;
 		    n_got_ud = 1'b0;
@@ -3019,121 +3124,26 @@ module core(clk,
 	    end
 	  ARCH_FAULT:
 	    begin
-	       n_tlb_refill = 1'b0;
-	       n_xtlb_refill = 1'b0;
-	       n_has_badvaddr = 1'b0;
-	       n_save_to_tlb_regs = 1'b0;
-	       /* a fetch fault's BadVAddr is its own pc (already in the mrob); only
-		* memory ops need r_addrs, so r_addrs has a single (mem-response)
-		* write port and can map to LUTRAM */
-	       n_badvaddr = ((t_rob_head.opcode == FETCH_TLB_MISS) | (t_rob_head.opcode == FETCH_TLB_INVALID) |
-			     (t_rob_head.opcode == FETCH_MISALIGNED) | (t_rob_head.opcode == FETCH_ADDR_ERROR)) ?
-			    t_rob_head.pc : r_addrs[r_rob_head_ptr[`LG_ROB_ENTRIES-1:0]];
-	       if(t_rob_head.is_break)
-		 begin
-		    n_pending_break = 1'b1;
-		    n_cause = 5'd9;
-		 end
-	       else if(t_rob_head.is_syscall)
-		 begin
-		    n_cause = 5'd8;		    
-		 end
-	       else if(t_rob_head.is_ii)
-		 begin
-`ifdef VERILATOR
-		    if(t_rob_head.mode_when_fetched != w_in_64b_mode) $stop();  // P-mode-hazard ($stop in sim; formal assert below)
-`endif
-		    n_pending_ud = 1'b1;
-		    //$display("bad pc %x", t_rob_head.in_delay_slot ? (t_rob_head.pc - 'd4) : t_rob_head.pc);
-		    n_cause = 5'd10;
-		 end
-	       else if(t_rob_head.is_cpu)
-		 begin
-		    n_cause = 5'd11;  /* Coprocessor Unusable */
-		    n_ce = t_rob_head.cpu_ce1 ? 2'd1 : 2'd0;  /* CP1 (FPU) -> CE=1, else CP0 -> CE=0 */
-		 end
-	       else if(t_rob_head.is_fpe)
-		 begin
-		    n_cause = 5'd15;  /* Floating-Point Exception (denorm/Unimplemented + enabled IEEE) */
-		    /* set FCSR.Cause so the handler can read why it trapped; the trapped
-		     * op does NOT accumulate into the sticky Flags field. */
-		    core_fcsr_we = 1'b1;
-		    core_fcsr_cause6 = r_fp_flags[r_rob_head_ptr[`LG_ROB_ENTRIES-1:0]];
-		 end
-	       else if(t_rob_head.opcode == FETCH_MISALIGNED ||
-			       t_rob_head.opcode == FETCH_ADDR_ERROR)  /* both AdEL, BadVAddr=PC */
-		 begin
-		    n_pending_bad_addr = 1'b1;
-		    n_has_badvaddr = 1'b1;
-		    n_cause = 5'd4;
-		 end
-	       else if(t_rob_head.is_bad_addr)
-		 begin
-		    n_pending_bad_addr = 1'b1;
-		    n_has_badvaddr = 1'b1;
-		    n_cause = t_rob_head.is_store ? 5'd5 : 5'd4;
-		 end
-	       else if(t_rob_head.is_bus_err)
-		 begin
-		    /* Data Bus Error: the MC answered the load with an error.  Precise,
-		     * EPC at the load; BadVAddr is not written (R4000). */
-		    n_cause = 5'd7;
-		 end
-	       else if(t_rob_head.is_irq)
-		 begin
-		    n_cause = 5'd0;
-		 end
-	       else if(t_rob_head.overflow)
-		 begin
-		    n_cause = 5'd12;
-		 end
-	       else if(t_rob_head.trap)
-		 begin
-		    //$display("taking trap exception");
-		    n_cause = 5'd13;
-		 end
-	       else if(t_rob_head.tlb_refill | t_rob_head.tlb_invalid)
-		 begin
-		    /* A refill uses the special refill vector only when EXL=0 at
-		     * fault time; a nested refill (EXL already set) falls through
-		     * to the general vector (0x180). */
-		    n_tlb_refill = t_rob_head.tlb_refill & ~w_sr_exl;
-		    /* XTLB refill vector (0x080) when 64-bit addressing is active
-		     * for the operating mode of the faulting access; else the
-		     * 32-bit TLB refill vector (0x000). */
-		    n_xtlb_refill = t_rob_head.tlb_refill & ~w_sr_exl &
-				    (w_in_64b_kernel_mode |
-				     w_in_64b_supervisor_mode |
-				     w_in_64b_user_mode);
-		    n_save_to_tlb_regs = 1'b1;
-		    n_cause = t_rob_head.is_store ? 5'd3 : 5'd2;
-		    n_pending_bad_addr = 1'b1;
-		    n_has_badvaddr = 1'b1;
-		 end
-	       else if(t_rob_head.tlb_modified)
-		 begin
-		    n_cause = 5'd1;
-		    n_save_to_tlb_regs = 1'b1;		    
-		    n_pending_bad_addr = 1'b1;
-		    n_has_badvaddr = 1'b1;		    
-		 end
+	       /* SPARC trap (interpret.cc take_trap), at the ROB head: the trapping
+		* instruction does not retire.  ET=1: the trap is taken (w_take_trap
+		* moves the committed state; WRITE_EPC restarts at the trap table and
+		* TRAP_L1/L2 write %l1/%l2).  ET=0: error mode, which halts. */
+	       n_epc = t_rob_head.pc;
 	       t_bump_rob_head = 1'b1;
-	       n_state = WRITE_EPC;
-	       n_epc = (t_rob_head.in_delay_slot ? (t_rob_head.pc - 'd4) : t_rob_head.pc);
-	       $display(">>>>>>>> at cycle %d, taking fault for EPC %x, cause %d, store %b, load %b, badaddr %x, opcode %d, fault cnt %d", 
-			r_cycle, n_epc, n_cause, is_store(t_rob_head.opcode), is_load(t_rob_head.opcode), n_badvaddr,
-			t_rob_head.opcode,
-			r_fault_cnt);
-	       if(n_badvaddr == 'h744b)
+	       if(r_psr_et)
 		 begin
-		    $stop();
+		    n_state = WRITE_EPC;
 		 end
-	       if(n_epc < 'd1000)
+	       else
 		 begin
-		    $stop();
+		    /* write the dirty L1D (the L2 chains its own flush, as for
+		     * XFLUSH) back before halting, so memory holds the final
+		     * state; the L1I holds nothing dirty */
+		    n_pending_break = 1'b1;
+		    n_flush_req_l1d = 1'b1;
+		    n_l1i_flush_complete = 1'b1;
+		    n_state = FLUSH_FOR_HALT;
 		 end
-	       
-	       n_exc_in_delay = t_rob_head.in_delay_slot;
 	    end
 	  WRITE_EPC:
 	    begin
@@ -3145,13 +3155,13 @@ module core(clk,
 	       
 	       /* TLB refill -> 0x000 (32-bit) or 0x080 (64-bit XTLB);
 		* all other exceptions -> 0x180 general vector. */
-	       n_restart_pc = sign_extend32((w_sr_bev ? 32'hbfc00200 : 32'h80000000) |
-					    (r_tlb_refill ? (r_xtlb_refill ? 32'h80 : 32'h0) : 32'h180));
+	       n_restart_pc = {r_tbr_tba, r_tbr_tt, 4'd0};   /* TBR, tt just written */
 	       n_restart_src_pc = 'd0;
 	       n_restart_why = RST_WHY_EXCEPTION;
 	       n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
 	       n_restart_src_is_indirect = 1'b0;
 	       n_restart_valid = 1'b1;
+	       n_restart_npc_valid = 1'b0;
 
 	       n_got_break = 1'b0;
 	       n_got_ud = 1'b0;
@@ -3198,6 +3208,8 @@ module core(clk,
 	    end
 	endcase // unique case (r_state)
 
+	/* restart_npc_valid is set (or cleared) by every restart and held after:
+	 * the l1i reads it whenever it acks, and may ack one restart more than once */
 	if(t_clr_rob)
 	  n_oldest_first_pending = 1'b0;
 	else if((t_retire && t_rob_head.oldest_first) ||
@@ -3214,7 +3226,9 @@ module core(clk,
 	
 	else if(t_clr_dq || t_clr_rob)
 	  begin
-	     n_in_delay_slot = 1'b0;
+	     /* a jmpl;rett restart puts the first instruction in a delay slot (its
+	      * nPC, if it traps, is r_last_branch_target = the rett's target) */
+	     n_in_delay_slot = n_restart_npc_valid | r_restart_npc_valid;
 	  end
 	
      end // always_comb
@@ -3271,18 +3285,50 @@ module core(clk,
      begin
 	if(reset)
 	  begin
-	     for(logic [`LG_PRF_ENTRIES-1:0] i_rat = 'd0; i_rat < 'd32; i_rat = i_rat + 'd1)
-	       begin
-		  r_alloc_rat[i_rat[4:0]] <= i_rat;
-		  r_retire_rat[i_rat[4:0]] <= i_rat;
-	       end
+	     r_flags_alloc_rat <= 'd0;
+	     r_flags_retire_rat <= 'd0;
 	  end
 	else
 	  begin
-	     r_alloc_rat <= t_rat_copy ? r_retire_rat : n_alloc_rat;
-	     r_retire_rat <= n_retire_rat;
+	     r_flags_alloc_rat <= t_rat_copy ? r_flags_retire_rat : n_flags_alloc_rat;
+	     r_flags_retire_rat <= n_flags_retire_rat;
 	  end
      end // always_ff@ (posedge clk)
+
+   /* per entry: a reset loop over 136 (256) unpacked entries is past what
+    * Verilator unrolls */
+   generate
+      for(genvar i = 0; i < N_INT_ARCH; i = i + 1)
+	begin : int_rat
+	   always_ff@(posedge clk)
+	     begin
+		if(reset)
+		  begin
+		     r_alloc_rat[i] <= reset_preg(i);
+		     r_retire_rat[i] <= reset_preg(i);
+		  end
+		else
+		  begin
+		     r_alloc_rat[i] <= t_rat_copy ? r_retire_rat[i] : n_alloc_rat[i];
+		     r_retire_rat[i] <= n_retire_rat[i];
+		  end
+	     end // always_ff@ (posedge clk)
+	end // block: int_rat
+      for(genvar i = 0; i < N_PRF_ENTRIES; i = i + 1)
+	begin : prf_refcnt
+	   always_ff@(posedge clk)
+	     begin
+		if(reset)
+		  begin
+		     r_prf_refcnt[i] <= reset_mapped(i) ? 'd1 : 'd0;
+		  end
+		else
+		  begin
+		     r_prf_refcnt[i] <= n_prf_refcnt[i];
+		  end
+	     end // always_ff@ (posedge clk)
+	end // block: prf_refcnt
+   endgenerate
 
    always_ff@(posedge clk)
      begin
@@ -3337,6 +3383,7 @@ module core(clk,
    always_comb
      begin
 	n_alloc_rat = r_alloc_rat;
+	n_flags_alloc_rat = r_flags_alloc_rat;
 	n_hilo_alloc_rat = r_hilo_alloc_rat;
 	n_fcr_alloc_rat = r_fcr_alloc_rat;
 	n_fp_alloc_rat = r_fp_alloc_rat;
@@ -3352,19 +3399,30 @@ module core(clk,
 	
 	if(t_uop.srcA_valid)
 	  begin
-	     t_alloc_uop.srcA = r_alloc_rat[t_uop.srcA[4:0]];	     
+	     t_alloc_uop.srcA = r_alloc_rat[t_uop.srcA];
 	  end
 	if(t_uop.srcB_valid)
 	  begin
-	     t_alloc_uop.srcB = r_alloc_rat[t_uop.srcB[4:0]];
+	     t_alloc_uop.srcB = r_alloc_rat[t_uop.srcB];
 	  end
 	/* FP sources: looked up in the FP RAT (mutually exclusive with the int valids above) */
 	if(t_uop.fp_srcA_valid)
 	  t_alloc_uop.srcA = r_fp_alloc_rat[t_uop.srcA[4:0]];
 	if(t_uop.fp_srcB_valid)
 	  t_alloc_uop.srcB = r_fp_alloc_rat[t_uop.srcB[4:0]];
-	if(t_uop.srcC_valid)
-	  t_alloc_uop.srcC = r_alloc_rat[t_uop.srcC[4:0]];
+	if(t_uop.srcD_valid)
+	  begin
+	     t_alloc_uop.srcD = r_alloc_rat[t_uop.srcD];
+	  end
+	/* an icc reader's srcC is the youngest icc writer's register */
+	if(t_uop.flags_src_valid)
+	  begin
+	     t_alloc_uop.srcC = r_flags_alloc_rat;
+	  end
+	else if(t_uop.srcC_valid)
+	  begin
+	     t_alloc_uop.srcC = r_alloc_rat[t_uop.srcC];
+	  end
 	if(t_uop.fp_srcC_valid)
 	  t_alloc_uop.srcC = r_fp_alloc_rat[t_uop.srcC[4:0]];
 
@@ -3375,19 +3433,19 @@ module core(clk,
 	/* FCR source overloads the hilo_src field (mutually exclusive with hilo_src_valid) */
 	else if(t_uop.fcr_src_valid)
 	  begin
-	     t_alloc_uop.hilo_src = r_fcr_alloc_rat;
+	     t_alloc_uop.hilo_src = `LG_HILO_PRF_ENTRIES'(r_fcr_alloc_rat);
 	  end
 
 	//2nd uop begins here
 	if(t_uop2.srcA_valid)
 	  begin
-	     t_alloc_uop2.srcA =  (t_uop.dst_valid && (t_uop2.srcA[4:0] == t_uop.dst[4:0]) ?
-				  n_prf_entry :  r_alloc_rat[t_uop2.srcA[4:0]]);	     
+	     t_alloc_uop2.srcA = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcA == t_uop.dst)) ?
+				 n_prf_entry : r_alloc_rat[t_uop2.srcA];
 	  end
 	if(t_uop2.srcB_valid )
 	  begin
-	     t_alloc_uop2.srcB = (t_uop.dst_valid && (t_uop2.srcB[4:0] == t_uop.dst[4:0]) ?
-				  n_prf_entry :  r_alloc_rat[t_uop2.srcB[4:0]]);
+	     t_alloc_uop2.srcB = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcB == t_uop.dst)) ?
+				 n_prf_entry : r_alloc_rat[t_uop2.srcB];
 	  end
 	/* FP sources for slot 1, with bypass from a slot-0 FP dst */
 	if(t_uop2.fp_srcA_valid)
@@ -3396,9 +3454,20 @@ module core(clk,
 	if(t_uop2.fp_srcB_valid)
 	  t_alloc_uop2.srcB = (t_uop.fp_dst_valid && (t_uop2.srcB[4:0] == t_uop.dst[4:0])) ?
 			      n_fp_prf_entry : r_fp_alloc_rat[t_uop2.srcB[4:0]];
-	if(t_uop2.srcC_valid)
-	  t_alloc_uop2.srcC = (t_uop.dst_valid && (t_uop2.srcC[4:0] == t_uop.dst[4:0])) ?
-			      n_prf_entry : r_alloc_rat[t_uop2.srcC[4:0]];
+	if(t_uop2.srcD_valid)
+	  begin
+	     t_alloc_uop2.srcD = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcD == t_uop.dst)) ?
+				 n_prf_entry : r_alloc_rat[t_uop2.srcD];
+	  end
+	if(t_uop2.flags_src_valid)
+	  begin
+	     t_alloc_uop2.srcC = t_uop.flags_dst_valid ? n_prf_entry : r_flags_alloc_rat;
+	  end
+	else if(t_uop2.srcC_valid)
+	  begin
+	     t_alloc_uop2.srcC = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcC == t_uop.dst)) ?
+				 n_prf_entry : r_alloc_rat[t_uop2.srcC];
+	  end
 	if(t_uop2.fp_srcC_valid)
 	  t_alloc_uop2.srcC = (t_uop.fp_dst_valid && (t_uop2.srcC[4:0] == t_uop.dst[4:0])) ?
 			      n_fp_prf_entry : r_fp_alloc_rat[t_uop2.srcC[4:0]];
@@ -3411,8 +3480,8 @@ module core(clk,
 	/* FCR source for slot 1, with bypass from a slot-0 FCR dst */
 	else if(t_uop2.fcr_src_valid)
 	  begin
-	     t_alloc_uop2.hilo_src = t_uop.fcr_dst_valid ? n_fcr_prf_entry :
-				     r_fcr_alloc_rat;
+	     t_alloc_uop2.hilo_src = {{(`LG_HILO_PRF_ENTRIES-`LG_FCR_PRF_ENTRIES){1'b0}},
+				      (t_uop.fcr_dst_valid ? n_fcr_prf_entry : r_fcr_alloc_rat)};
 	  end
 	
 
@@ -3420,23 +3489,37 @@ module core(clk,
 	  begin
 	     if(t_uop.dst_valid)
 	       begin
-		  n_alloc_rat[t_uop.dst[4:0]] = n_prf_entry;
+		  /* a write to %g0 (cmp) gets a register but leaves %g0 mapped to p0 */
+		  if(t_uop.dst != 'd0)
+		    begin
+		       n_alloc_rat[t_uop.dst] = n_prf_entry;
+		    end
+		  if(t_uop.flags_dst_valid)
+		    begin
+		       n_flags_alloc_rat = n_prf_entry;
+		    end
 		  t_alloc_uop.dst = n_prf_entry;
-	       end
-	     else if(t_uop.hilo_dst_valid)
-	       begin
-		  n_hilo_alloc_rat = n_hilo_prf_entry;
-		  t_alloc_uop.hilo_dst = n_hilo_prf_entry;
+		  if(t_uop.dst2_valid)
+		    begin
+		       n_alloc_rat[t_uop.dst2] = n_prf_entry2;
+		       t_alloc_uop.dst2 = n_prf_entry2;
+		    end
 	       end
 	     else if(t_uop.fcr_dst_valid)
 	       begin
 		  n_fcr_alloc_rat = n_fcr_prf_entry;
-		  t_alloc_uop.hilo_dst = n_fcr_prf_entry;
+		  t_alloc_uop.hilo_dst = `LG_HILO_PRF_ENTRIES'(n_fcr_prf_entry);
 	       end
 	     else if(t_uop.fp_dst_valid)
 	       begin
 		  n_fp_alloc_rat[t_uop.dst[4:0]] = n_fp_prf_entry;
 		  t_alloc_uop.dst = n_fp_prf_entry;
+	       end
+	     /* Y (the HILO rename) beside rd: a multiply writes both */
+	     if(t_uop.hilo_dst_valid)
+	       begin
+		  n_hilo_alloc_rat = n_hilo_prf_entry;
+		  t_alloc_uop.hilo_dst = n_hilo_prf_entry;
 	       end
 
 	     t_alloc_uop.rob_ptr = r_rob_tail_ptr[`LG_ROB_ENTRIES-1:0];
@@ -3446,7 +3529,14 @@ module core(clk,
 	  begin
 	     if(t_uop2.dst_valid)
 	       begin
-		  n_alloc_rat[t_uop2.dst[4:0]] = n_prf_entry2;
+		  if(t_uop2.dst != 'd0)
+		    begin
+		       n_alloc_rat[t_uop2.dst] = n_prf_entry2;
+		    end
+		  if(t_uop2.flags_dst_valid)
+		    begin
+		       n_flags_alloc_rat = n_prf_entry2;
+		    end
 		  t_alloc_uop2.dst = n_prf_entry2;
 	       end
 	     else if(t_uop2.fp_dst_valid)
@@ -3468,14 +3558,11 @@ module core(clk,
    always_comb
      begin
 	n_retire_rat = r_retire_rat;
+	n_flags_retire_rat = r_flags_retire_rat;
 	n_hilo_retire_rat = r_hilo_retire_rat;
 	n_fcr_retire_rat = r_fcr_retire_rat;
 	n_fp_retire_rat = r_fp_retire_rat;
 	
-	t_free_reg = 1'b0;
-	t_free_reg_ptr = 'd0;
-	t_free_reg_two = 1'b0;
-	t_free_reg_two_ptr = 'd0;
 	
 	
 	t_free_hilo = 1'b0;
@@ -3487,7 +3574,6 @@ module core(clk,
 	t_free_fp_reg_two = 1'b0;
 	t_free_fp_reg_two_ptr = 'd0;
 
-	n_retire_prf_free = r_retire_prf_free;
 	n_retire_hilo_prf_free = r_retire_hilo_prf_free;
 	n_retire_fcr_prf_free = r_retire_fcr_prf_free;
 	n_retire_fp_prf_free = r_retire_fp_prf_free;
@@ -3502,21 +3588,21 @@ module core(clk,
 	
 	if(t_retire)
 	  begin
+	     /* freeing is by reference count (below), not old_pdst */
 	     if(t_rob_head.valid_dst)
 	       begin
-		  t_free_reg = 1'b1;
-		  t_free_reg_ptr = t_rob_head.old_pdst;
-		  n_retire_rat[t_rob_head.ldst] = t_rob_head.pdst;
-		  n_retire_prf_free[t_rob_head.pdst] = 1'b0;
-		  n_retire_prf_free[t_rob_head.old_pdst] = 1'b1;
-	       end
-	     else if(t_rob_head.valid_hilo_dst)
-	       begin
-		  t_free_hilo = 1'b1;
-		  t_free_hilo_ptr = t_rob_head.old_pdst[`LG_HILO_PRF_ENTRIES-1:0];
-		  n_hilo_retire_rat = t_rob_head.pdst[`LG_HILO_PRF_ENTRIES-1:0];
-		  n_retire_hilo_prf_free[t_rob_head.pdst[`LG_HILO_PRF_ENTRIES-1:0]] = 1'b0;
-		  n_retire_hilo_prf_free[t_rob_head.old_pdst[`LG_HILO_PRF_ENTRIES-1:0]] = 1'b1;
+		  if(t_rob_head.ldst != 'd0)
+		    begin
+		       n_retire_rat[t_rob_head.ldst] = t_rob_head.pdst;
+		    end
+		  if(t_rob_head.valid_flags_dst)
+		    begin
+		       n_flags_retire_rat = t_rob_head.pdst;
+		    end
+		  if(t_rob_head.valid_dst2)
+		    begin
+		       n_retire_rat[t_rob_head.ldst + 'd1] = t_rob_head.pdst2;
+		    end
 	       end
 	     else if(t_rob_head.valid_fcr_dst)
 	       begin
@@ -3530,24 +3616,36 @@ module core(clk,
 	       begin
 		  t_free_fp_reg = 1'b1;
 		  t_free_fp_reg_ptr = t_rob_head.old_pdst;
-		  n_fp_retire_rat[t_rob_head.ldst] = t_rob_head.pdst;
+		  n_fp_retire_rat[t_rob_head.ldst[4:0]] = t_rob_head.pdst;
 		  n_retire_fp_prf_free[t_rob_head.pdst] = 1'b0;
 		  n_retire_fp_prf_free[t_rob_head.old_pdst] = 1'b1;
+	       end
+	     /* Y beside rd (only the head: t_retire_two excludes a Y writer second) */
+	     if(t_rob_head.valid_hilo_dst)
+	       begin
+		  t_free_hilo = 1'b1;
+		  t_free_hilo_ptr = t_rob_head.old_hilo_pdst;
+		  n_hilo_retire_rat = t_rob_head.hilo_pdst;
+		  n_retire_hilo_prf_free[t_rob_head.hilo_pdst] = 1'b0;
+		  n_retire_hilo_prf_free[t_rob_head.old_hilo_pdst] = 1'b1;
 	       end
 
 	     if(t_retire_two && t_rob_next_head.valid_dst)
 	       begin
-		  t_free_reg_two = 1'b1;
-		  t_free_reg_two_ptr = t_rob_next_head.old_pdst;
-		  n_retire_rat[t_rob_next_head.ldst] = t_rob_next_head.pdst;
-		  n_retire_prf_free[t_rob_next_head.pdst] = 1'b0;
-		  n_retire_prf_free[t_rob_next_head.old_pdst] = 1'b1;
+		  if(t_rob_next_head.ldst != 'd0)
+		    begin
+		       n_retire_rat[t_rob_next_head.ldst] = t_rob_next_head.pdst;
+		    end
+		  if(t_rob_next_head.valid_flags_dst)
+		    begin
+		       n_flags_retire_rat = t_rob_next_head.pdst;
+		    end
 	       end
 	     else if(t_retire_two && t_rob_next_head.valid_fp_dst)
 	       begin
 		  t_free_fp_reg_two = 1'b1;
 		  t_free_fp_reg_two_ptr = t_rob_next_head.old_pdst;
-		  n_fp_retire_rat[t_rob_next_head.ldst] = t_rob_next_head.pdst;
+		  n_fp_retire_rat[t_rob_next_head.ldst[4:0]] = t_rob_next_head.pdst;
 		  n_retire_fp_prf_free[t_rob_next_head.pdst] = 1'b0;
 		  n_retire_fp_prf_free[t_rob_next_head.old_pdst] = 1'b1;
 	       end
@@ -3578,9 +3676,16 @@ module core(clk,
 	t_rob_tail.ldst  = 'd0;
 	t_rob_tail.pdst  = 'd0;
 	t_rob_tail.old_pdst  = 'd0;
+	t_rob_tail.valid_flags_dst = 1'b0;
+	t_rob_tail.old_flags_pdst = 'd0;
+	t_rob_tail.valid_dst2 = 1'b0;
+	t_rob_tail.pdst2 = 'd0;
+	t_rob_tail.old_pdst2 = 'd0;
+	t_rob_tail.hilo_pdst = 'd0;
+	t_rob_tail.old_hilo_pdst = 'd0;
 	/* renamed srcA + its arch name, for the retire trace's rename self-check */
 	t_rob_tail.srcA_ptr  = t_alloc_uop.srcA;
-	t_rob_tail.srcA_arch = t_uop.srcA[4:0];
+	t_rob_tail.srcA_arch = t_uop.srcA;
 	t_rob_tail.post_restart = r_post_restart_arm;
 	t_rob_tail.pc = t_alloc_uop.pc;
 	/* carry the decode-time 64b-mode flag into the ROB (the P-mode-hazard guard at
@@ -3592,14 +3697,14 @@ module core(clk,
 	 * branches overwrite this with the resolved target at completion (~1963). */
 	t_rob_tail.target_pc = (t_alloc_uop.op == J) ? t_alloc_uop.pred_target : (t_alloc_uop.pc + 'd4);
 
-	t_rob_tail.is_call = t_alloc_uop.op == JAL || t_alloc_uop.op == JALR || t_alloc_uop.op == BAL;
+	t_rob_tail.is_call = t_alloc_uop.is_call;
 	t_rob_tail.is_irq = t_alloc_uop.op == IRQ;
-	t_rob_tail.is_ret = (t_alloc_uop.op == JR) && (t_uop.srcA == 'd31);
+	t_rob_tail.is_ret = t_alloc_uop.is_ret;
 	t_rob_tail.is_break  = (t_alloc_uop.op == BREAK);
 	t_rob_tail.is_syscall  = (t_alloc_uop.op == SYSCALL);
 	t_rob_tail.is_cache  = t_alloc_uop.is_cache;
 	t_rob_tail.cache_act = t_alloc_uop.cache_act;
-	t_rob_tail.is_indirect = t_alloc_uop.op == JALR || t_alloc_uop.op == JR;
+	t_rob_tail.is_indirect = (t_alloc_uop.op == S_JMPL);
 	t_rob_tail.is_tlbp = (t_alloc_uop.op == TLBP);
 	
 	t_rob_tail.is_ii = 1'b0;
@@ -3637,23 +3742,30 @@ module core(clk,
 	t_rob_next_tail.ldst  = 'd0;
 	t_rob_next_tail.pdst  = 'd0;
 	t_rob_next_tail.old_pdst  = 'd0;
+	t_rob_next_tail.valid_flags_dst = 1'b0;
+	t_rob_next_tail.old_flags_pdst = 'd0;
+	t_rob_next_tail.valid_dst2 = 1'b0;
+	t_rob_next_tail.pdst2 = 'd0;
+	t_rob_next_tail.old_pdst2 = 'd0;
+	t_rob_next_tail.hilo_pdst = 'd0;
+	t_rob_next_tail.old_hilo_pdst = 'd0;
 	t_rob_next_tail.srcA_ptr  = t_alloc_uop2.srcA;
-	t_rob_next_tail.srcA_arch = t_uop2.srcA[4:0];
+	t_rob_next_tail.srcA_arch = t_uop2.srcA;
 	t_rob_next_tail.post_restart = r_post_restart_arm & ~t_alloc;
 	t_rob_next_tail.pc = t_alloc_uop2.pc;
 	t_rob_next_tail.mode_when_fetched = t_alloc_uop2.mode_when_fetched;   /* see slot0 note above */
 	t_rob_next_tail.target_pc = (t_alloc_uop2.op == J) ? t_alloc_uop2.pred_target : (t_alloc_uop2.pc + 'd4);
 	t_rob_next_tail.opcode = t_alloc_uop2.op;
-	t_rob_next_tail.is_call = t_alloc_uop2.op == JAL || t_alloc_uop2.op == JALR || t_alloc_uop2.op == BAL;
+	t_rob_next_tail.is_call = t_alloc_uop2.is_call;
 	t_rob_next_tail.is_irq = t_alloc_uop2.op == IRQ;
 	
-	t_rob_next_tail.is_ret = (t_alloc_uop2.op == JR) && (t_uop2.srcA == 'd31);
+	t_rob_next_tail.is_ret = t_alloc_uop2.is_ret;
 	t_rob_next_tail.is_break = (t_alloc_uop2.op == BREAK);
 	t_rob_next_tail.is_syscall = (t_alloc_uop2.op == SYSCALL);
 	t_rob_next_tail.is_cache = t_alloc_uop2.is_cache;
 	t_rob_next_tail.cache_act = t_alloc_uop2.cache_act;
 	t_rob_next_tail.is_tlbp = (t_alloc_uop2.op == TLBP);
-	t_rob_next_tail.is_indirect = t_alloc_uop2.op == JALR || t_alloc_uop2.op == JR;
+	t_rob_next_tail.is_indirect = (t_alloc_uop2.op == S_JMPL);
 	t_rob_next_tail.is_fpe = 1'b0;
 	t_rob_next_tail.fp_set_flags = 1'b0;
 	t_rob_next_tail.overflow = 1'b0;
@@ -3705,15 +3817,14 @@ module core(clk,
 	       begin
 		  t_rob_tail.valid_dst = 1'b1;
 		  /* this is correct, we do not want the renamed version */
-		  t_rob_tail.ldst = t_uop.dst[4:0];
+		  t_rob_tail.ldst = t_uop.dst;
 		  t_rob_tail.pdst = n_prf_entry;
-		  t_rob_tail.old_pdst = r_alloc_rat[t_uop.dst[4:0]];
-	       end
-	     else if(t_uop.hilo_dst_valid)
-	       begin
-		  t_rob_tail.valid_hilo_dst = 1'b1;
-		  t_rob_tail.pdst = {{(`LG_PRF_ENTRIES-`LG_HILO_PRF_ENTRIES){1'b0}}, n_hilo_prf_entry};
-		  t_rob_tail.old_pdst = {{(`LG_PRF_ENTRIES-`LG_HILO_PRF_ENTRIES){1'b0}}, r_hilo_alloc_rat};
+		  t_rob_tail.old_pdst = r_alloc_rat[t_uop.dst];
+		  t_rob_tail.valid_flags_dst = t_uop.flags_dst_valid;
+		  t_rob_tail.old_flags_pdst = r_flags_alloc_rat;
+		  t_rob_tail.valid_dst2 = t_uop.dst2_valid;
+		  t_rob_tail.pdst2 = n_prf_entry2;
+		  t_rob_tail.old_pdst2 = r_alloc_rat[t_uop.dst2];
 	       end
 	     else if(t_uop.fcr_dst_valid)
 	       begin
@@ -3724,9 +3835,15 @@ module core(clk,
 	     else if(t_uop.fp_dst_valid)
 	       begin
 		  t_rob_tail.valid_fp_dst = 1'b1;
-		  t_rob_tail.ldst = t_uop.dst[4:0];
+		  t_rob_tail.ldst = t_uop.dst;
 		  t_rob_tail.pdst = n_fp_prf_entry;
 		  t_rob_tail.old_pdst = r_fp_alloc_rat[t_uop.dst[4:0]];
+	       end
+	     if(t_uop.hilo_dst_valid)
+	       begin
+		  t_rob_tail.valid_hilo_dst = 1'b1;
+		  t_rob_tail.hilo_pdst = n_hilo_prf_entry;
+		  t_rob_tail.old_hilo_pdst = r_hilo_alloc_rat;
 	       end
 	     
 	     if(t_fold_uop)
@@ -3738,6 +3855,7 @@ module core(clk,
 		    begin
 		       t_rob_tail.faulted = 1'b1;
 		       t_rob_tail.is_ii = 1'b1;
+		       t_rob_tail.data = `MEM_WIDTH'(t_uop.imm[7:0]);   /* the decode trap type */
 		    end
 		  else if(t_uop.op == CPU)
 		    begin
@@ -3788,14 +3906,17 @@ module core(clk,
 	       begin
 		  t_rob_next_tail.valid_dst = 1'b1;
 		  /* this is correct, we do not want the renamed version */
-		  t_rob_next_tail.ldst = t_uop2.dst[4:0];
+		  t_rob_next_tail.ldst = t_uop2.dst;
 		  t_rob_next_tail.pdst = n_prf_entry2;
-		  t_rob_next_tail.old_pdst = (t_uop.dst_valid && (t_uop.dst == t_uop2.dst)) ? t_rob_tail.pdst : r_alloc_rat[t_uop2.dst[4:0]];
+		  t_rob_next_tail.old_pdst = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop.dst == t_uop2.dst)) ?
+					     t_rob_tail.pdst : r_alloc_rat[t_uop2.dst];
+		  t_rob_next_tail.valid_flags_dst = t_uop2.flags_dst_valid;
+		  t_rob_next_tail.old_flags_pdst = t_uop.flags_dst_valid ? t_rob_tail.pdst : r_flags_alloc_rat;
 	       end
 	     else if(t_uop2.fp_dst_valid)
 	       begin
 		  t_rob_next_tail.valid_fp_dst = 1'b1;
-		  t_rob_next_tail.ldst = t_uop2.dst[4:0];
+		  t_rob_next_tail.ldst = t_uop2.dst;
 		  t_rob_next_tail.pdst = n_fp_prf_entry;
 		  t_rob_next_tail.old_pdst = (t_uop.fp_dst_valid && (t_uop.dst == t_uop2.dst)) ? t_rob_tail.pdst : r_fp_alloc_rat[t_uop2.dst[4:0]];
 	       end
@@ -3812,6 +3933,7 @@ module core(clk,
 		    begin
 		       t_rob_next_tail.faulted = 1'b1;
 		       t_rob_next_tail.is_ii = 1'b1;
+		       t_rob_next_tail.data = `MEM_WIDTH'(t_uop2.imm[7:0]);
 		    end
 		  else if(t_uop2.op == CPU)
 		    begin
@@ -3872,13 +3994,14 @@ module core(clk,
 		   * freed + reallocated (find-lowest free list) to a younger load that
 		   * sits behind the dataless graduated store in the L1D -> deadlock
 		   * (applu jacld_ wedge), or to an op that completes -> wrong store data. */
-		  r_rob_sd_complete[r_rob_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= !(t_uop.is_mem & (t_uop.srcB_valid | (t_uop.fp_srcB_valid & t_uop.is_store)));
+		  /* a store waits for its data; an ldd for its parked rd+1 (exec.sv) */
+		  r_rob_sd_complete[r_rob_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= !(t_uop.is_mem & (t_uop.srcB_valid | (t_uop.fp_srcB_valid & t_uop.is_store) | t_uop.dst2_valid));
 	       end
 	     if(t_alloc_two)
 	       begin
 		  r_rob_is_mem[r_rob_next_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= t_uop2.is_mem;
 		  r_rob_complete[r_rob_next_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= t_fold_uop2;
-		  r_rob_sd_complete[r_rob_next_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= !(t_uop2.is_mem & (t_uop2.srcB_valid | (t_uop2.fp_srcB_valid & t_uop2.is_store)));
+		  r_rob_sd_complete[r_rob_next_tail_ptr[`LG_ROB_ENTRIES-1:0]] <= !(t_uop2.is_mem & (t_uop2.srcB_valid | (t_uop2.fp_srcB_valid & t_uop2.is_store) | t_uop2.dst2_valid));
 	       end
 	     if(t_complete_valid_1)
 	       begin
@@ -3899,6 +4022,10 @@ module core(clk,
 	     if(t_core_store_data_ptr_valid)
 	       begin
 		  r_rob_sd_complete[t_core_store_data_ptr] <= 1'b1;
+	       end
+	     if(w_ldd_lo_done)
+	       begin
+		  r_rob_sd_complete[w_ldd_lo_rob] <= 1'b1;
 	       end
 	  end
      end // always_ff@ (posedge clk)
@@ -4336,8 +4463,8 @@ module core(clk,
 	  begin
 	     for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
 	       begin
-		  r_prf_free[i] <= (i < 32) ? 1'b0 : 1'b1;
-		  r_retire_prf_free[i] <= (i < 32) ? 1'b0 : 1'b1;
+		  r_prf_free[i] <= !((i == 0) || reset_mapped(i));
+		  r_retire_prf_free[i] <= !((i == 0) || reset_mapped(i));
 	       end
 	  end
 	else
@@ -4477,7 +4604,8 @@ module core(clk,
 	     t_gpr_ffs      = r_bank_sel ? w_ffs_alu_even : w_ffs_alu_odd;
 	     t_gpr_ffs_full = r_bank_sel ? w_alu_even_full : w_alu_odd_full;
 	  end
-	if(t_uop2.is_mem)
+	/* ldd's rd+1 (the second allocator) is a load result too: the MEM bank */
+	if(t_uop2.is_mem | t_uop.dst2_valid)
 	  begin
 	     t_gpr_ffs2      = r_bank_sel ? w_ffs_mem_odd : w_ffs_mem_even;
 	     t_gpr_ffs2_full = r_bank_sel ? w_mem_odd_full : w_mem_even_full;
@@ -4499,17 +4627,88 @@ module core(clk,
 	  begin
 	     n_prf_free[n_prf_entry] = 1'b0;
 	  end
-	if(t_alloc_two && t_uop2.dst_valid)
+	if((t_alloc_two && t_uop2.dst_valid) || (t_alloc && t_uop.dst2_valid))
 	  begin
 	     n_prf_free[n_prf_entry2] = 1'b0;
 	  end
-	if(t_free_reg)
+	n_prf_free = n_prf_free | t_prf_ref_free;
+     end // always_comb
+
+   /* the committed reference counts.  A retiring writer adds one reference to
+    * its pdst per committed mapping it creates (the GPR RAT unless rd is %g0,
+    * the flags RAT if it writes icc) and removes one from each register it
+    * displaces (old_pdst, old_flags_pdst).  A register some retire touched whose
+    * count lands at 0 is free -- including a pdst no mapping kept.  Two retires a
+    * cycle touch up to six registers, so each count takes the summed change. */
+   wire w_ret0 = t_retire & t_rob_head.valid_dst;
+   wire w_ret0_gpr = w_ret0 & (t_rob_head.ldst != 'd0);
+   wire w_ret0_flags = w_ret0 & t_rob_head.valid_flags_dst;
+   wire w_ret0_dst2 = w_ret0 & t_rob_head.valid_dst2;   /* ldd: always retires as the head */
+   wire w_ret1 = t_retire & t_retire_two & t_rob_next_head.valid_dst;
+   wire w_ret1_gpr = w_ret1 & (t_rob_next_head.ldst != 'd0);
+   wire w_ret1_flags = w_ret1 & t_rob_next_head.valid_flags_dst;
+   logic [`LG_PRF_REFCNT+1:0] t_ref_inc[N_PRF_ENTRIES-1:0];
+   logic [`LG_PRF_REFCNT+1:0] t_ref_dec[N_PRF_ENTRIES-1:0];
+   logic [N_PRF_ENTRIES-1:0]  t_ref_touch;
+
+   always_comb
+     begin
+	for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
 	  begin
-	     n_prf_free[t_free_reg_ptr] = 1'b1;
-	  end
-	if(t_free_reg_two)
-	  begin
-	     n_prf_free[t_free_reg_two_ptr] = 1'b1;
+	     t_ref_inc[i] = 'd0;
+	     t_ref_dec[i] = 'd0;
+	     if(w_ret0 && (t_rob_head.pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_inc[i] = t_ref_inc[i] + {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret0_gpr} +
+				 {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret0_flags};
+	       end
+	     if(w_ret0_dst2 && (t_rob_head.pdst2 == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_inc[i] = t_ref_inc[i] + 'd1;
+	       end
+	     if(w_ret1 && (t_rob_next_head.pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_inc[i] = t_ref_inc[i] + {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret1_gpr} +
+				 {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret1_flags};
+	       end
+	     if(w_ret0_gpr && (t_rob_head.old_pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     if(w_ret0_flags && (t_rob_head.old_flags_pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     if(w_ret0_dst2 && (t_rob_head.old_pdst2 == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     if(w_ret1_gpr && (t_rob_next_head.old_pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     if(w_ret1_flags && (t_rob_next_head.old_flags_pdst == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     t_ref_touch[i] = (w_ret0 && (t_rob_head.pdst == i[`LG_PRF_ENTRIES-1:0])) ||
+			      (w_ret0_dst2 && (t_rob_head.pdst2 == i[`LG_PRF_ENTRIES-1:0])) ||
+			      (w_ret1 && (t_rob_next_head.pdst == i[`LG_PRF_ENTRIES-1:0])) ||
+			      (t_ref_dec[i] != 'd0);
+	     if(i == 0)
+	       begin
+		  /* p0: %g0 and the reset flags register, pinned */
+		  n_prf_refcnt[i] = 'd0;
+		  t_prf_ref_free[i] = 1'b0;
+		  n_retire_prf_free[i] = 1'b0;
+	       end
+	     else
+	       begin
+		  n_prf_refcnt[i] = r_prf_refcnt[i] + t_ref_inc[i][`LG_PRF_REFCNT-1:0] -
+				    t_ref_dec[i][`LG_PRF_REFCNT-1:0];
+		  t_prf_ref_free[i] = t_ref_touch[i] && (n_prf_refcnt[i] == 'd0);
+		  n_retire_prf_free[i] = (n_prf_refcnt[i] == 'd0);
+	       end
 	  end
      end // always_comb
 
@@ -4518,13 +4717,17 @@ module core(clk,
     * register handed out twice: mfc0 k1 and a younger li k0 both got P1) */
    always_ff@(negedge clk)
      begin
-	if(!reset && t_free_reg && r_prf_free[t_free_reg_ptr])
-	  $display("[DBLFREE] cyc=%0d spec list: p%0d freed while already free, retiring pc=%x", r_cycle, t_free_reg_ptr, t_rob_head.pc);
-	if(!reset && t_free_reg_two && r_prf_free[t_free_reg_two_ptr])
-	  $display("[DBLFREE] cyc=%0d spec list (slot 2): p%0d freed while already free, retiring pc=%x", r_cycle, t_free_reg_two_ptr, t_rob_next_head.pc);
-	if(!reset && t_retire && t_rob_head.valid_dst && r_retire_prf_free[t_rob_head.old_pdst])
-	  $display("[DBLFREE] cyc=%0d retire list: p%0d freed while already free, pc=%x", r_cycle, t_rob_head.old_pdst, t_rob_head.pc);
-	for(integer i = 0; i < 32; i = i + 1)
+	for(integer i = 1; i < N_PRF_ENTRIES; i = i + 1)
+	  begin
+	     if(!reset && t_prf_ref_free[i] && r_prf_free[i])
+	       $display("[DBLFREE] cyc=%0d p%0d freed while already free, retiring pc=%x", r_cycle, i, t_rob_head.pc);
+	     if(!reset && ({2'b00, r_prf_refcnt[i]} + t_ref_inc[i] < t_ref_dec[i]))
+	       $display("[REFCNT] cyc=%0d p%0d count %0d underflows (+%0d -%0d), retiring pc=%x",
+			r_cycle, i, r_prf_refcnt[i], t_ref_inc[i], t_ref_dec[i], t_rob_head.pc);
+	  end
+	if(!reset && t_alloc && t_uop.dst_valid && (r_flags_retire_rat == n_prf_entry))
+	  $display("[DBLALLOC] cyc=%0d p%0d allocated to pc=%x but the retire flags RAT holds it", r_cycle, n_prf_entry, t_uop.pc);
+	for(integer i = 0; i < N_INT_ARCH; i = i + 1)
 	  begin
 	     if(!reset && t_alloc && t_uop.dst_valid && (r_retire_rat[i] == n_prf_entry) && (i != 0))
 	       $display("[DBLALLOC] cyc=%0d p%0d allocated to pc=%x but retire RAT maps r%0d to it", r_cycle, n_prf_entry, t_uop.pc, i);
@@ -4635,57 +4838,255 @@ module core(clk,
  `define R4K_IRQ_G1
 `endif
 
-   decode_mips dec0 (
-		     .in_kernel_mode(in_kernel_mode),
-		     .in_supervisor_mode(in_supervisor_mode),
-		     .in_user_mode(in_user_mode),
-		     .in_64b_kernel_mode(w_in_64b_kernel_mode),
-		     .in_64b_supervisor_mode(w_in_64b_supervisor_mode),
-		     .in_64b_user_mode(w_in_64b_user_mode),
-		     .cu1(w_cu1),
-		     .fr(w_fr),
-		     .irq(w_irq_pending & (t_dec0_in_delay_slot == 1'b0) `R4K_IRQ_G0),
-		     .xflush(r_xflush_pend & (t_dec0_in_delay_slot == 1'b0)),
-		     .xflush_op(w_xflush_op),
-		     .tlb_miss(insn.tlb_miss),
-		     .tlb_invalid(insn.tlb_invalid),
-		     .misaligned(insn.misaligned),
-		     .bad_va(insn.bad_va),
-		     .insn(insn.data),
-		     .pc(insn.pc), 
-		     .insn_pred(insn.pred), 
-		     .bpu_idx(insn.bpu_idx),
-		     .insn_pred_target(insn.pred_target),
-`ifdef ENABLE_CYCLE_ACCOUNTING
-		     .fetch_cycle(insn.fetch_cycle),
-`endif		      
-		     .uop(t_dec_uop));
+   /* SPARC state outside the renamed registers (icc rides in the integer PRF,
+    * Y on the HILO rename).  Committed values, changed at retire: SAVE/RESTORE
+    * move CWP; WRPSR/WRWIM/WRTBR and RETT are serializing, so nothing younger
+    * has decoded against the old values when they retire. */
+   logic		  r_psr_s, n_psr_s;
+   logic		  r_psr_ps, n_psr_ps;
+   logic		  r_psr_et, n_psr_et;
+   logic		  r_psr_ef, n_psr_ef;
+   logic [3:0]		  r_psr_pil, n_psr_pil;
+   logic [`LG_NWINDOWS-1:0] r_arch_cwp, n_arch_cwp;
+   logic [`NWINDOWS-1:0]  r_wim, n_wim;
+   logic [31:12] 	  r_tbr_tba, n_tbr_tba;
+   logic [7:0] 		  r_tbr_tt, n_tbr_tt;   /* written when a trap is taken */
+   /* the decode-time (speculative) CWP: the window the next decoded instruction
+    * names its registers in.  Reloaded from the committed CWP whenever the decode
+    * queue is cleared (every restart path clears it) or a CWP-writing serializing
+    * op retires. */
+   logic [`LG_NWINDOWS-1:0] r_dec_cwp, n_dec_cwp;
+   wire [`LG_NWINDOWS-1:0] w_dec0_next_cwp, w_dec1_next_cwp;
 
-   decode_mips dec1 (
-		     .in_kernel_mode(in_kernel_mode),
-		     .in_supervisor_mode(in_supervisor_mode),
-		     .in_user_mode(in_user_mode),
-		     .in_64b_kernel_mode(w_in_64b_kernel_mode),
-		     .in_64b_supervisor_mode(w_in_64b_supervisor_mode),
-		     .in_64b_user_mode(w_in_64b_user_mode),
-		     .cu1(w_cu1),
-		     .fr(w_fr),
-		     .irq(w_irq_pending & (t_dec1_in_delay_slot == 1'b0) `R4K_IRQ_G1),
-		     .xflush(r_xflush_pend & (t_dec1_in_delay_slot == 1'b0)),
-		     .xflush_op(w_xflush_op),
-		     .tlb_miss(insn_two.tlb_miss),
-		     .tlb_invalid(insn_two.tlb_invalid),
-		     .misaligned(insn_two.misaligned),
-		     .bad_va(insn_two.bad_va),
-		     .insn(insn_two.data),
-		     .pc(insn_two.pc), 
-		     .insn_pred(insn_two.pred), 
-		     .bpu_idx(insn_two.bpu_idx),
-		     .insn_pred_target(insn_two.pred_target),
+   /* ---- SPARC traps ---- */
+   /* the trap type of the faulting ROB head: decode traps (II) and exec traps
+    * carry it in data[7:0]; an exec op that is not implemented is
+    * illegal_instruction; a misaligned access mem_address_not_aligned */
+   wire [7:0] w_trap_tt = (t_rob_head.is_ii | t_rob_head.trap) ?
+			  ((t_rob_head.data[7:0] != 8'd0) ? t_rob_head.data[7:0] : 8'h02) :
+			  t_rob_head.is_bad_addr ? 8'h07 :
+			  t_rob_head.is_bus_err ? 8'h29 :
+			  8'h02;
+   /* nPC of the trapped instruction: a delay slot's is its branch's target */
+   wire [`M_WIDTH-1:0] w_trap_npc = t_rob_head.in_delay_slot ? r_last_branch_target : (t_rob_head.pc + 'd4);
+   wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et;
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset && (r_state == ARCH_FAULT))
+	  begin
+	     $display(">>>>>>>> at cycle %0d, trap tt %02x at pc %x npc %x, et %b",
+		      r_cycle, w_trap_tt, t_rob_head.pc, w_trap_npc, r_psr_et);
+	  end
+     end
+`endif
+   logic r_trap_inj, n_trap_inj;
+   logic [`M_WIDTH-1:0] r_trap_pc, r_trap_npc;
+   always_ff@(posedge clk)
+     begin
+	r_trap_inj <= reset ? 1'b0 : n_trap_inj;
+	if(w_take_trap)
+	  begin
+	     r_trap_pc <= t_rob_head.pc;
+	     r_trap_npc <= w_trap_npc;
+	  end
+     end
+
+   /* flat arch index of r in window w (decode_sparc.sv widx) */
+   function automatic logic [`LG_PRF_ENTRIES-1:0] arch_widx(input logic [`LG_NWINDOWS-1:0] w, input logic [4:0] r);
+      logic [`LG_NWINDOWS+3:0] t;
+      begin
+	 t = {w, 4'b0000} + {{(`LG_NWINDOWS-1){1'b0}}, r - 5'd8};
+	 arch_widx = 'd8 + `LG_PRF_ENTRIES'(t);
+      end
+   endfunction // arch_widx
+
+   /* TRAP_L1 / TRAP_L2: "sethi" the trapped pc / npc into %l1 / %l2 (r17 / r18)
+    * of the new window, pushed into the empty decode queue ahead of the handler */
+   function automatic uop_t trap_uop(input opcode_t op, input logic [`LG_PRF_ENTRIES-1:0] dst,
+				     input logic [`M_WIDTH-1:0] v, input logic [`M_WIDTH-1:0] pc);
+      uop_t u;
+      begin
+	 u = '0;
+	 u.op = op;
+	 u.dst = dst;
+	 u.dst_valid = 1'b1;
+	 u.is_int = 1'b1;
+	 u.imm = v[15:0];
+	 u.jmp_imm = v[31:16];
+	 u.pc = pc;
+	 trap_uop = u;
+      end
+   endfunction // trap_uop
+   wire uop_t w_trap_uop1 = trap_uop(TRAP_L1, arch_widx(r_arch_cwp, 5'd17), r_trap_pc, r_trap_pc);
+   wire uop_t w_trap_uop2 = trap_uop(TRAP_L2, arch_widx(r_arch_cwp, 5'd18), r_trap_npc, r_trap_pc);
+   wire w_trap_push = r_trap_inj & (r_state == ACTIVE) & !t_clr_dq;
+   /* decode waits out a serializing CWP/PSR/WIM writer at the ROB head */
+   wire w_dec_hold = !t_rob_empty & retire_writes_cwp(t_rob_head.opcode);
+
+   /* serializing ops whose retirement changes what decode reads (CWP, PSR.S/ET/EF,
+    * WIM).  They restart the front end once COMPLETE but retire a cycle or more
+    * later, so decode holds while one is at the ROB head (it is then alone in the
+    * machine) and reloads its CWP when it retires. */
+   function automatic logic retire_writes_cwp(input logic [8:0] op);
+      begin
+	 retire_writes_cwp = (op == S_WRPSR) | (op == S_RETT) | (op == S_WRWIM);
+      end
+   endfunction // retire_writes_cwp
+
+   /* the CWP change of one retiring op */
+   function automatic logic [`LG_NWINDOWS-1:0] retire_cwp(input logic [`LG_NWINDOWS-1:0] cwp,
+							  input rob_entry_t e);
+      begin
+	 retire_cwp = (e.opcode == S_SAVE) ? (cwp - 'd1) :
+		      ((e.opcode == S_RESTORE) || (e.opcode == S_RETT)) ? (cwp + 'd1) :
+		      (e.opcode == S_WRPSR) ? e.data[`LG_NWINDOWS-1:0] :
+		      cwp;
+      end
+   endfunction // retire_cwp
+
+   always_comb
+     begin
+	n_psr_s = r_psr_s;
+	n_psr_ps = r_psr_ps;
+	n_psr_et = r_psr_et;
+	n_psr_ef = r_psr_ef;
+	n_psr_pil = r_psr_pil;
+	n_wim = r_wim;
+	n_tbr_tba = r_tbr_tba;
+	n_tbr_tt = r_tbr_tt;
+	n_arch_cwp = r_arch_cwp;
+	if(t_retire)
+	  begin
+	     n_arch_cwp = retire_cwp(r_arch_cwp, t_rob_head);
+	     if(t_retire_two)
+	       begin
+		  n_arch_cwp = retire_cwp(n_arch_cwp, t_rob_next_head);
+	       end
+	     /* the serializing writers (never in the second retire slot) */
+	     if(t_rob_head.opcode == S_WRPSR)
+	       begin
+		  n_psr_ef = t_rob_head.data[12];
+		  n_psr_pil = t_rob_head.data[11:8];
+		  n_psr_s = t_rob_head.data[7];
+		  n_psr_ps = t_rob_head.data[6];
+		  n_psr_et = t_rob_head.data[5];
+	       end
+	     else if(t_rob_head.opcode == S_RETT)
+	       begin
+		  n_psr_s = r_psr_ps;
+		  n_psr_et = 1'b1;
+	       end
+	     else if(t_rob_head.opcode == S_WRWIM)
+	       begin
+		  n_wim = t_rob_head.data[`NWINDOWS-1:0];
+	       end
+	     else if(t_rob_head.opcode == S_WRTBR)
+	       begin
+		  n_tbr_tba = t_rob_head.data[31:12];
+	       end
+	  end // if (t_retire)
+	/* trap entry (ARCH_FAULT, ET=1) */
+	n_trap_inj = r_trap_inj & !w_trap_push;
+	if(w_take_trap)
+	  begin
+	     n_psr_ps = r_psr_s;
+	     n_psr_s = 1'b1;
+	     n_psr_et = 1'b0;
+	     n_arch_cwp = r_arch_cwp - 'd1;
+	     n_tbr_tt = w_trap_tt;
+	     n_trap_inj = 1'b1;
+	  end
+
+	n_dec_cwp = r_dec_cwp;
+	if(t_clr_dq | t_clr_rob | (t_retire & retire_writes_cwp(t_rob_head.opcode)))
+	  begin
+	     n_dec_cwp = n_arch_cwp;
+	  end
+	else if(w_trap_push)
+	  begin
+	     /* the injected pair is not decoded: CWP stays */
+	  end
+	else if(t_push_dq_two)
+	  begin
+	     n_dec_cwp = w_dec1_next_cwp;
+	  end
+	else if(t_push_dq_one)
+	  begin
+	     n_dec_cwp = w_dec0_next_cwp;
+	  end
+     end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     /* V8 reset: S=1, ET=0 (interpret.cc initState); EF=1 as the ISS has it */
+	     r_psr_s <= 1'b1;
+	     r_psr_ps <= 1'b0;
+	     r_psr_et <= 1'b0;
+	     r_psr_ef <= 1'b1;
+	     r_psr_pil <= 4'd0;
+	     r_arch_cwp <= 'd0;
+	     r_dec_cwp <= 'd0;
+	     r_wim <= 'd0;
+	     r_tbr_tba <= 'd0;
+	     r_tbr_tt <= 'd0;
+	  end
+	else
+	  begin
+	     r_psr_s <= n_psr_s;
+	     r_psr_ps <= n_psr_ps;
+	     r_psr_et <= n_psr_et;
+	     r_psr_ef <= n_psr_ef;
+	     r_psr_pil <= n_psr_pil;
+	     r_arch_cwp <= n_arch_cwp;
+	     r_dec_cwp <= n_dec_cwp;
+	     r_wim <= n_wim;
+	     r_tbr_tba <= n_tbr_tba;
+	     r_tbr_tt <= n_tbr_tt;
+	  end
+     end // always_ff@ (posedge clk)
+
+   decode_sparc dec0 (
+		      .s(r_psr_s),
+		      .et(r_psr_et),
+		      .ef(r_psr_ef),
+		      .cwp(r_dec_cwp),
+		      .wim(r_wim),
+		      .irq(1'b0),
+		      .iacc_exc(insn.tlb_miss | insn.tlb_invalid | insn.bad_va),
+		      .iacc_err(1'b0),
+		      .insn(insn.data),
+		      .pc(insn.pc),
+		      .insn_pred(insn.pred),
+		      .bpu_idx(insn.bpu_idx),
+		      .insn_pred_target(insn.pred_target),
 `ifdef ENABLE_CYCLE_ACCOUNTING
-		     .fetch_cycle(insn_two.fetch_cycle),
-`endif		      
-		      .uop(t_dec_uop2));
+		      .fetch_cycle(insn.fetch_cycle),
+`endif
+		      .uop(t_dec_uop),
+		      .next_cwp(w_dec0_next_cwp));
+
+   decode_sparc dec1 (
+		      .s(r_psr_s),
+		      .et(r_psr_et),
+		      .ef(r_psr_ef),
+		      .cwp(w_dec0_next_cwp),
+		      .wim(r_wim),
+		      .irq(1'b0),
+		      .iacc_exc(insn_two.tlb_miss | insn_two.tlb_invalid | insn_two.bad_va),
+		      .iacc_err(1'b0),
+		      .insn(insn_two.data),
+		      .pc(insn_two.pc),
+		      .insn_pred(insn_two.pred),
+		      .bpu_idx(insn_two.bpu_idx),
+		      .insn_pred_target(insn_two.pred_target),
+`ifdef ENABLE_CYCLE_ACCOUNTING
+		      .fetch_cycle(insn_two.fetch_cycle),
+`endif
+		      .uop(t_dec_uop2),
+		      .next_cwp(w_dec1_next_cwp));
 
 
    
@@ -4723,7 +5124,14 @@ module core(clk,
    
    
    logic [319:0] w_dbg_exec_snap;
+   wire w_ldd_lo_done;
+   wire [`LG_ROB_ENTRIES-1:0] w_ldd_lo_rob;
    exec e (
+	   .ldd_lo_done(w_ldd_lo_done),
+	   .ldd_lo_rob(w_ldd_lo_rob),
+	   .sparc_psr({8'h41, 4'd0, 6'd0, 1'b0, r_psr_ef, r_psr_pil, r_psr_s, r_psr_ps, r_psr_et, 5'd0}),
+	   .sparc_wim(32'(r_wim)),
+	   .sparc_tbr({r_tbr_tba, r_tbr_tt, 4'd0}),
 	   .dbg_exec_snap(w_dbg_exec_snap),
 	   .clk(clk), 
 	   .reset(reset),
@@ -4807,9 +5215,11 @@ module core(clk,
 	   .mem_req_ack(core_mem_req_ack),
 	   .core_store_data_ptr_valid(t_core_store_data_ptr_valid),
 	   .core_store_data_ptr(t_core_store_data_ptr),
-	   .mem_rsp_dst_ptr(core_mem_rsp.dst_ptr),
-	   .mem_rsp_dst_valid(core_mem_rsp.dst_valid),
-	   .mem_rsp_fp_dst(core_mem_rsp.fp_dst),
+	   .mem_rsp_dst_ptr_in(core_mem_rsp.dst_ptr),
+	   .mem_rsp_dst2_ptr(core_mem_rsp.dst2_ptr),
+	   .mem_rsp_dst2_valid(core_mem_rsp.dst2_valid),
+	   .mem_rsp_dst_valid_in(core_mem_rsp.dst_valid),
+	   .mem_rsp_fp_dst_in(core_mem_rsp.fp_dst),
 	   .mem_rsp_fp_merge(core_mem_rsp.fp_merge),
 	   .mem_rsp_fp_hi(core_mem_rsp.fp_hi),
 	   .mem_rsp_fp_pres(core_mem_rsp.fp_pres),
@@ -4861,11 +5271,11 @@ module core(clk,
      begin
 	if(t_push_dq_one)
 	  begin
-	     r_dq[r_dq_tail_ptr[`LG_DQ_ENTRIES-1:0]] <= t_dec_uop;
+	     r_dq[r_dq_tail_ptr[`LG_DQ_ENTRIES-1:0]] <= t_dq_push_uop;
 	  end
 	if(t_push_dq_two)
 	  begin
-	     r_dq[r_dq_next_tail_ptr[`LG_DQ_ENTRIES-1:0]] <= t_dec_uop2;
+	     r_dq[r_dq_next_tail_ptr[`LG_DQ_ENTRIES-1:0]] <= t_dq_push_uop2;
 	  end
      end
 
@@ -4911,6 +5321,8 @@ module core(clk,
 	t_uop = r_dq[r_dq_head_ptr[`LG_DQ_ENTRIES-1:0]];
 	t_uop2 = r_dq[r_dq_next_head_ptr[`LG_DQ_ENTRIES-1:0]];
 	
+	t_dq_push_uop = t_dec_uop;
+	t_dq_push_uop2 = t_dec_uop2;
 	if(t_clr_dq)
 	  begin
 	     n_dq_tail_ptr = 'd0;
@@ -4921,7 +5333,18 @@ module core(clk,
 	  end
 	else
 	  begin
-	     if(insn_valid && !t_dq_full && !(!t_dq_next_full && insn_valid_two) && !r_oldest_first_pending)
+	     if(w_trap_push)
+	       begin
+		  /* the queue is empty right after the trap's restart */
+		  t_push_dq_one = 1'b1;
+		  t_push_dq_two = 1'b1;
+		  t_dq_push_uop = w_trap_uop1;
+		  t_dq_push_uop2 = w_trap_uop2;
+		  n_dq_tail_ptr = r_dq_tail_ptr + 'd2;
+		  n_dq_next_tail_ptr = r_dq_next_tail_ptr + 'd2;
+		  n_dq_cnt = n_dq_cnt + 'd2;
+	       end
+	     else if(insn_valid && !t_dq_full && !(!t_dq_next_full && insn_valid_two) && !r_oldest_first_pending && !w_dec_hold)
 	       begin
 		  //push one instruction
 		  t_push_dq_one = 1'b1;
@@ -4929,7 +5352,7 @@ module core(clk,
 		  n_dq_next_tail_ptr = r_dq_next_tail_ptr + 'd1;
 		  n_dq_cnt = n_dq_cnt + 'd1;
 	       end
-	     else if(insn_valid && !t_dq_full && !t_dq_next_full && insn_valid_two && !r_oldest_first_pending)
+	     else if(insn_valid && !t_dq_full && !t_dq_next_full && insn_valid_two && !r_oldest_first_pending && !w_dec_hold)
 	       begin
 		  //push two instructions
 		  t_push_dq_one = 1'b1;

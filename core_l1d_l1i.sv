@@ -64,6 +64,8 @@ module core_l1d_l1i(clk,
 		    retire_reg_two_ptr,
 		    retire_reg_two_data,
 		    retire_reg_two_valid,
+		    retire_y_valid,
+		    retire_y_data,
 		    retire_valid,
 		    retire_two_valid,
 		    retire_pc,
@@ -168,6 +170,8 @@ module core_l1d_l1i(clk,
    
 
    logic [(`M_WIDTH-1):0] 	restart_pc;
+   logic [(`M_WIDTH-1):0] 	restart_npc;
+   logic 			restart_npc_valid;
    logic 			restart_valid;
    logic 			clr_link_reg;
    logic 			restart_ack;
@@ -221,10 +225,10 @@ module core_l1d_l1i(clk,
     * Implement them for real before trusting any register that shows them. */
    output logic [7:0] 			  asid;
    output logic [4:0] 			  retire_fp_reg_ptr;
-   output logic [`M_WIDTH-1:0]		  retire_fp_reg_data;
+   output logic [`FP_WIDTH-1:0]		  retire_fp_reg_data;
    output logic 			  retire_fp_reg_valid;
    output logic [4:0] 			  retire_fp_reg_two_ptr;
-   output logic [`M_WIDTH-1:0]		  retire_fp_reg_two_data;
+   output logic [`FP_WIDTH-1:0]		  retire_fp_reg_two_data;
    output logic 			  retire_fp_reg_two_valid;
    output logic [4:0] 			  retire_fcr_reg_ptr;
    output logic [`M_WIDTH-1:0]		  retire_fcr_reg_data;
@@ -257,13 +261,16 @@ module core_l1d_l1i(clk,
    assign wf_badv                  = 32'd0;
    assign wf_stat                  = 32'd0;
 
-   output logic [4:0] 			  retire_reg_ptr;
+   output logic [`LG_PRF_ENTRIES-1:0] 	  retire_reg_ptr;
    output logic [`M_WIDTH-1:0]		  retire_reg_data;
    output logic 			  retire_reg_valid;
 
-   output logic [4:0] 			  retire_reg_two_ptr;
+   output logic [`LG_PRF_ENTRIES-1:0] 	  retire_reg_two_ptr;
    output logic [`M_WIDTH-1:0]		  retire_reg_two_data;
    output logic 			  retire_reg_two_valid;
+   /* SPARC Y (the HILO rename), for the co-sim: ROB data[63:32] of a Y writer */
+   output logic 			  retire_y_valid;
+   output logic [31:0]			  retire_y_data;
    
    output logic 			  retire_valid;
    output logic 			  retire_two_valid;
@@ -274,8 +281,8 @@ module core_l1d_l1i(clk,
    output logic [31:0] 			  retire_two_insn;
 `endif
 
-   output logic [7:0]			  retire_op;
-   output logic [7:0]			  retire_two_op;   
+   output logic [8:0]			  retire_op;
+   output logic [8:0]			  retire_two_op;   
    
    logic 				  retired_call;
    logic 				  retired_ret;
@@ -1049,6 +1056,8 @@ module core_l1d_l1i(clk,
 	      .blk_inv_done(w_l1i_blk_inv_done),
 	      .flush_complete(l1i_flush_complete),
 	      .restart_pc(restart_pc),
+	      .restart_npc(restart_npc),
+	      .restart_npc_valid(restart_npc_valid),
 	      .dbg_arch_hist(w_dbg_arch_hist),
 	      .dbg_spec_hist(w_dbg_spec_hist),
 	      .restart_valid(restart_valid),
@@ -1156,6 +1165,8 @@ module core_l1d_l1i(clk,
 	     .took_branch(took_branch),
 	     .branch_bpu_idx(branch_bpu_idx),
 	     .restart_pc(restart_pc),
+	     .restart_npc(restart_npc),
+	     .restart_npc_valid(restart_npc_valid),
 	     .restart_src_pc(),
 	     .restart_src_is_indirect(),
 	     .restart_valid(restart_valid),
@@ -1184,6 +1195,8 @@ module core_l1d_l1i(clk,
 	     .retire_reg_two_ptr(retire_reg_two_ptr),
 	     .retire_reg_two_data(retire_reg_two_data),
 	     .retire_reg_two_valid(retire_reg_two_valid),
+	     .retire_y_valid(retire_y_valid),
+	     .retire_y_data(retire_y_data),
 	     .retire_fp_reg_ptr(retire_fp_reg_ptr),
 	     .retire_fp_reg_data(retire_fp_reg_data),
 	     .retire_fp_reg_valid(retire_fp_reg_valid),
