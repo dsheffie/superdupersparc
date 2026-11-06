@@ -24,6 +24,8 @@ module fpu_zero_detector(distance, a);
      end
 endmodule
 
+`include "fp_nan.vh"
+
 module fpu_add(/*AUTOARG*/
    // Outputs
    y, denorm, fflags,
@@ -65,26 +67,18 @@ module fpu_add(/*AUTOARG*/
    wire 	b_is_nan = exp_all1_b & (frac_b != 'd0);
    wire 	a_is_inf = exp_all1_a & (frac_a == 'd0);
    wire 	b_is_inf = exp_all1_b & (frac_b == 'd0);
-/* MIPS legacy NaN semantics (the R4400 predates IEEE-754-2008 and has no FCSR.NAN2008 bit):
- *   - a NaN is SIGNALING when its fraction MSB is SET (the inverse of the 2008 rule);
- *   - default-NaN mode is always on: ANY NaN result is the architectural default NaN,
- *     the input NaN's payload is NOT propagated;
- *   - default NaN = 0x7FF7FFFFFFFFFFFF (double) / 0x7FBFFFFF (single): sign 0, exponent all
- *     ones, fraction = 0 followed by all ones.
- * Verified against a MIPS-legacy Berkeley SoftFloat specialization via TestFloat. */
-   wire 	a_is_snan = a_is_nan & a[fmt ? 51 : 22];
-   wire 	b_is_snan = b_is_nan & b[fmt ? 51 : 22];
+/* SPARC NaN semantics (fp_nan.vh): IEEE quiet bit, operand NaN propagated quieted */
+   wire 	a_is_snan = fp_is_snan(a, fmt);
+   wire 	b_is_snan = fp_is_snan(b, fmt);
    wire 	any_nan = a_is_nan | b_is_nan;
    wire 	special = any_nan | a_is_inf | b_is_inf;
    wire 	inf_sub_inf = a_is_inf & b_is_inf & (sgn_a ^ sgn_b);
    wire 	s1_invalid  = a_is_snan | b_is_snan | inf_sub_inf;
 
-   localparam [63:0] DEF_NAN_D = {1'b0, 11'h7ff, 1'b0, 51'h7ffffffffffff};
-   localparam [63:0] DEF_NAN_S = {32'd0, 1'b0, 8'hff, 1'b0, 22'h3fffff};
-   wire [63:0] 	DEF_NAN = fmt ? DEF_NAN_D : DEF_NAN_S;
+   wire [63:0] 	DEF_NAN = fmt ? SPARC_DNAN_D : SPARC_DNAN_S;
    wire 	inf_sign = a_is_inf ? sgn_a : sgn_b;
    wire [63:0] 	specinf = fmt ? {inf_sign, 11'h7ff, 52'd0} : {32'd0, inf_sign, 8'hff, 23'd0};
-   wire [63:0] 	special_y = (any_nan | inf_sub_inf) ? DEF_NAN : specinf;
+   wire [63:0] 	special_y = any_nan ? sparc_nan(a, b, fmt) : inf_sub_inf ? DEF_NAN : specinf;
 
    wire [63:0] 	a_pass = fmt ? a : {32'd0, a[31:0]};
    wire [63:0] 	b_pass = fmt ? {sgn_b, b[62:0]} : {32'd0, sgn_b, b[30:0]};
@@ -270,7 +264,10 @@ module fpu_add(/*AUTOARG*/
    wire [63:0] 	w_y = r3_early_valid ? r3_early_y :
 		w_is_zero  ? ((r3_rm == 2'd3) ? (r3_fmt ? {1'b1, 63'd0} : {32'd0, 1'b1, 31'd0}) : 64'd0) :  // exact cancellation: -0 only toward -inf
 		w_overflow ? ovf_y : norm_y;
-   wire 	w_denorm = ~r3_special & (r3_in_den | w_res_denorm);
+   /* the unfinished_FPop punt (the same rule in interpret.cc fp_unfinished): any
+    * denormal operand, or a nonzero exact result below the smallest normal
+    * (tininess before rounding) */
+   wire 	w_denorm = r3_in_den | (~r3_special & w_res_denorm);
    wire 	w_f_inexact  = ~r3_early_valid & ~w_is_zero & (w_inexact | w_overflow);
    wire 	w_f_overflow = ~r3_early_valid & ~w_is_zero & w_overflow;
    wire 	w_f_underflow = ~r3_early_valid & w_res_denorm;

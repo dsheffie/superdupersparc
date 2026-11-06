@@ -154,9 +154,14 @@
 //page size
 `define LG_PG_SZ 12
 
-/* 256: the SPARC windowed arch registers (8 globals + 16*NWINDOWS = 136) plus
- * the in-flight destinations; 256x32 is the same bit count as r9999's 128x64 */
-`define LG_PRF_ENTRIES 8
+/* 512: the RF is banked (core.sv: ALU results allocate only from the low half,
+ * loads only from the high half), and any one bank must be able to hold all
+ * 136 SPARC windowed arch registers (8 globals + 16*NWINDOWS) plus in-flight
+ * destinations.  At 256 (128 per bank) ALU writes migrated the arch registers
+ * into the ALU bank until it was full: no ALU op could allocate, with half the
+ * MEM bank free (the OpenBIOS console loop hung after a few hundred window
+ * traps).  512x32 is twice r9999's 128x64 bit count. */
+`define LG_PRF_ENTRIES 9
 
 /* SPARC register windows (power of two: the flat arch index wraps mod 16*NWINDOWS) */
 `define LG_NWINDOWS 3
@@ -339,86 +344,28 @@
 `define PA_WIDTH 36
 `define REQ_ADDR_WIDTH ((`PA_WIDTH > `M_WIDTH) ? `PA_WIDTH : `M_WIDTH)
 
-/* Supported virtual-address bits within a region (MIPS SEGBITS). A non-compat 64b
- * VA must fit in SEGBITS, i.e. VA[61:SEGBITS]==0, else Address Error (Sail
- * TLBTranslate MAX_VA). R4000 = 40; R10000 = 44. This also bounds the VPN width
- * carried through the TLB/CAM, so shrinking it saves bits on the critical path. */
-`ifdef ENABLE_R10000
-`define SEGBITS 44
-`else
-`define SEGBITS 40
-`endif
-/* VPN2 = VA[SEGBITS-1:13]: what a TLB entry, EntryHi and BadVPN2 hold (27 / 31 bits) */
-`define VPN2_WIDTH (`SEGBITS - 13)
+/* SRMMU (SPARC V8 reference MMU) */
+/* an SRMMU fault (L1D/L1I -> ROB -> the trap): the fault status register fields
+ * the trap records (with the VA: a data fault's rides in the ROB entry's data, an
+ * instruction fault's is its pc) */
+typedef struct packed {
+   logic       fault;
+   logic [2:0] ft;
+   logic [1:0] level;
+   logic [2:0] at;   /* access type: {store, fetch, supervisor} */
+} mmu_fault_t;
 
-/* Page-frame-number width = PA_WIDTH - 12 (4KB page offset). The TLB stores
- * PFN this wide (so PA = {pfn, va[11:0]} is exactly PA_WIDTH and can never exceed
- * it -- no translate-time PA-range check needed). 36-bit PA -> 24-bit PFN. */
-`define PFN_WIDTH (`PA_WIDTH - 12)
-
-/* PA bits the TLBs actually STORE (dtlb, itlb + micro-ITLB, exec's TLBR shadow):
- * everything IP22/henry maps is below 0x20000000, so 29 bits; the stored PFN is
- * zero-filled up to PFN_WIDTH on read and PA_WIDTH stays 36 everywhere else.  A
- * PFN with bits set above TLB_PA_WIDTH aliases low (no PA-range check). */
-`ifndef TLB_PA_WIDTH
- `ifdef ENABLE_R10000
-  `define TLB_PA_WIDTH 31
- `else
-  `define TLB_PA_WIDTH 30
- `endif
-`endif
-`define TLB_PFN_WIDTH (`TLB_PA_WIDTH - 12)
-
-/* EntryLo's PFN as the architecture defines it -- what dmtc0 / tlbwi / tlbr / dmfc0 keep
- * (exec.sv's EntryLo registers and the TLBR shadow RAM): the R10000's is 28 bits,
- * EntryLo[33:6].  The translating TLBs still store only TLB_PFN_WIDTH: IRIX keeps
- * software bits (the PFN lock among them) just above the PFN, they reach EntryLo as PA
- * bits 32 and up, and the board decodes 32 -- so translation drops them, tlbr must not. */
-`ifdef ENABLE_R10000
-`define ENTRYLO_PFN_WIDTH 28
-`else
-`define ENTRYLO_PFN_WIDTH `PFN_WIDTH
-`endif
-
-/* JTLB entry count -- the knob for the TLB-CAM timing tradeoff. R4000/R4400 is
- * architecturally 48 (IRIX + Linux both hardcode it by PRId -- there's no Config1
- * MMU-size reg on R4x00), so 48 is the default and the ONLY value IRIX accepts.
- * Set 16 for a Linux-only, timing-optimized FPGA build: the fully-associative TLB
- * CAM is henry's #1 timing path (48->16 measured WNS -0.240 -> +0.191, passes),
- * but it ALSO requires a matching Linux cpu-probe.c `c->tlbsize = 16` and BREAKS
- * IRIX. The keeper fix (both OSes + the timing win) is a micro-TLB in front of a
- * 48-entry JTLB. Single source of truth for tlb.sv (N) + exec.sv (Random reset/
- * wrap + shadow depth); flip here, nowhere else.  ENABLE_R10000 = 64 entries (the
- * R10000's JTLB); interpret.hh derives the same value for the C++ checker. */
-`ifdef ENABLE_R10000
- `define N_TLB_ENTRIES 64
-`else
- `define N_TLB_ENTRIES 48
-`endif
-
-/* Micro-ITLB: a small fully-associative cache of translations in front of the
- * 48-way JTLB CAM (itlb.sv).  Hit = 1-cycle translate (skips WAIT_FOR_TLB); miss =
- * probe the 48-way, install with LFSR-random replacement.  Flushed on TLBWR/TLBWI
- * (tlb_entry_in_valid) and on ASID change.  Small = small CAM = closes timing AND
- * removes the per-fetch JTLB re-prime stall.  Power of 2 (for the LFSR replace). */
-`define N_UITLB_ENTRIES 2
-
-/* TEMPORARY sim experiment (revert before commit): inject extra timer IRQs to
- * crank exception frequency ~100x and hunt the "corrupt after an interrupt"
- * mapped-corruption bug under Verilator. Period in core cycles between injected
- * IRQs (normal tick ~= 400000 cyc at HZ=250). NOT for synth. */
-/* `define TIMER_ACCEL 1   -- DISABLED: the injected timer ticks advance jiffies
- * (fast-time) and wedge the boot in a poll loop before the initcalls. Using random
- * memory latency alone to perturb timing instead. */
-`define TIMER_ACCEL_PERIOD 32'd40000
+/* context number width: SuperSPARC implements 16 bits (the ISS masks to 0xffff) */
+`define SRMMU_CTX_BITS 16
+/* TLB entries (fully associative CAMs: the size is the FPGA timing knob) */
+`define N_DTLB_ENTRIES 16
+`define N_ITLB_ENTRIES 8
 
 /* Per-structure block-RAM synthesis-attribute guards. Defined as the attribute =
  * force that array into block RAM (frees the LUT/FF fabric, which is the bottleneck
  * on Ultra96); define empty to let Vivado choose (FF/LUTRAM). These apply only to
  * plain INDEXED RAMs -- the associative TLB CAMs (l1i/l1d r_tlb) must stay FFs.
- *   TLB_SHADOW_RAM_STYLE -> exec's CP0 maintenance shadow TLB (r_shadow_tlb)
  *   RF_RAM_STYLE         -> the rf4r2w register-file banks (int/FP/hilo PRFs) */
-`define TLB_SHADOW_RAM_STYLE (* ram_style = "block" *)
 /* rw_addr_collision: force Vivado to insert explicit read-during-write BYPASS
  * logic on the register-file banks.  Two reasons:
  *   1. ram_style="block" is NOT being honoured -- 4 read + 2 write ports exceed
@@ -526,6 +473,8 @@ typedef enum logic [5:0] {
    MEM_SB   = 6'd5,
    MEM_SH   = 6'd6,
    MEM_SW   = 6'd7,
+   MEM_LDSTUB = 6'd8,  /* SPARC ldstub: old byte back, 0xff written (one l1d RMW) */
+   MEM_SWAP = 6'd9,    /* SPARC swap: old word back, rd written (one l1d RMW) */
    MEM_LD   = 6'd14,
    MEM_SD   = 6'd15,
    MEM_INVL = 6'd24,   /* L2 line invalidate -- CACHE DMA-in drop; a dirty L2 line (or a dirty

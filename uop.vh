@@ -275,16 +275,12 @@ typedef enum logic [8:0]
    /* memory: address rs1 + op2, ASI in uop.asi */
    S_LDSTUB,
    S_SWAP,
-   S_LDF,
-   S_LDDF,
    S_LDFSR,
-   S_STF,
-   S_STDF,
    S_STFSR,
    S_STDFQ,
    /* FP ops without a MIPS twin (the rest reuse SP_ADD, CVT_S_W, ...) */
    S_FSMULD,
-   S_FCMPS,      /* imm[0] = fcmpe (signal on unordered) */
+   S_FCMPS,      /* imm[6] = fcmpe (signal on unordered) */
    S_FCMPD,
    /* SPARC trap entry (core.sv): injected ahead of the handler, they write the
     * trapped instruction's PC to %l1 and nPC to %l2 of the new window (the value
@@ -346,7 +342,8 @@ endfunction // is_div
 /* the stores the LSU holds until retirement and drains itself: all of them but
  * the CACHE ops (serializing, answered when done) */
 function logic is_lsu_store(opcode_t op);
-   return (op == SB) | (op == SH) | (op == SW) | (op == SD) | (op == SWC1) | (op == SDC1);
+   return (op == SB) | (op == SH) | (op == SW) | (op == SD) | (op == SWC1) | (op == SDC1) |
+          (op == S_STFSR) | (op == S_STDFQ);
 endfunction
 
 function logic is_store(opcode_t op);
@@ -366,6 +363,10 @@ function logic is_store(opcode_t op);
               * did not block a younger load (FP interrupt-resume wedge suspect). */
        x = 1'b1;
      SDC1:
+       x = 1'b1;
+     S_STFSR:   /* stores of the FSR and the FP queue */
+       x = 1'b1;
+     S_STDFQ:
        x = 1'b1;
      default:
        x = 1'b0;
@@ -391,6 +392,8 @@ function logic is_load(opcode_t op);
      LWC1:   /* FP loads are loads too (exec.sv remaps LWC1->MEM_LW / LDC1->MEM_LD) */
        x = 1'b1;
      LDC1:
+       x = 1'b1;
+     S_LDFSR:   /* a load into the FSR */
        x = 1'b1;
      default:
        x = 1'b0;
@@ -452,6 +455,7 @@ typedef struct packed {
    logic 		       is_fp;   /* compute FP op (routes to the FP issue queue) */
    logic [`LG_BPU_TBL_SZ-1:0]      bpu_idx;
    logic [7:0] 	       asi;        /* SPARC memory ops: the address space identifier */
+   mmu_fault_t 	       mmu;        /* instruction_access_exception: the FSR fields */
 `ifdef VERILATOR
    logic [31:0] 	       clear_id;
    logic [31:0] 	       raw_insn;   /* the fetched word, for the co-sim checker (stale-L1I fetches) */

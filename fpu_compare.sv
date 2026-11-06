@@ -8,7 +8,7 @@
 // compare of the low W-1 bits.  Extract {sign, magnitude} per fmt and the rest
 // is format-independent.  D-deep pipeline (matches fp_compare).
 
-module fpu_compare(clk, a, b, start, cond, fmt, y, fflags);
+module fpu_compare(clk, a, b, start, cond, fmt, y, fcc, fflags);
    parameter D = 4;
 
    input logic 	      clk;
@@ -20,6 +20,7 @@ module fpu_compare(clk, a, b, start, cond, fmt, y, fflags);
    input logic [3:0]  cond;
    input logic 	      fmt;            // 0 = single, 1 = double
    output logic       y;
+   output logic [1:0] fcc;             // SPARC fcmp: 0 =, 1 <, 2 >, 3 unordered
    output logic [4:0] fflags;          // {V,Z,O,U,I}; a compare only raises V
 
    // ---------------- field extraction (fmt-dependent) ----------------
@@ -42,15 +43,10 @@ module fpu_compare(clk, a, b, start, cond, fmt, y, fflags);
    wire 	b_is_nan = exp1_b & frac_nz_b;
    wire 	a_qbit = fmt ? a[51] : a[22];     // quiet bit = frac MSB
    wire 	b_qbit = fmt ? b[51] : b[22];
-/* MIPS legacy NaN semantics (the R4400 predates IEEE-754-2008 and has no FCSR.NAN2008 bit):
- *   - a NaN is SIGNALING when its fraction MSB is SET (the inverse of the 2008 rule);
- *   - default-NaN mode is always on: ANY NaN result is the architectural default NaN,
- *     the input NaN's payload is NOT propagated;
- *   - default NaN = 0x7FF7FFFFFFFFFFFF (double) / 0x7FBFFFFF (single): sign 0, exponent all
- *     ones, fraction = 0 followed by all ones.
- * Verified against a MIPS-legacy Berkeley SoftFloat specialization via TestFloat. */
-   wire 	a_snan = a_is_nan & a_qbit;
-   wire 	b_snan = b_is_nan & b_qbit;
+/* IEEE 754 / SPARC V8 NaN semantics: a NaN is SIGNALING when its fraction MSB
+ * (the quiet bit) is CLEAR.  (r9999's R4400 legacy rule was the inverse.) */
+   wire 	a_snan = a_is_nan & ~a_qbit;
+   wire 	b_snan = b_is_nan & ~b_qbit;
    wire 	w_unordered = a_is_nan | b_is_nan;
    wire 	w_any_snan  = a_snan | b_snan;
 
@@ -75,11 +71,14 @@ module fpu_compare(clk, a, b, start, cond, fmt, y, fflags);
    wire 	w_ord_eq  = w_eq & ~w_unordered;
    wire 	t_y       = (w_ord_lt & cond[2]) | (w_ord_eq & cond[1]) | (w_unordered & cond[0]);
    wire 	t_invalid = cond[3] ? w_unordered : w_any_snan;
+   wire [1:0] 	t_fcc     = w_unordered ? 2'd3 : w_ord_eq ? 2'd0 : w_ord_lt ? 2'd1 : 2'd2;
 
    // ---------------- D-deep output pipeline ----------------
    logic [D-1:0]      r_d, r_v;
    wire [D-1:0]       w_d, w_v;
+   logic [1:0] 	      r_c[D-1:0];
    assign y = r_d[D-1];
+   assign fcc = r_c[D-1];
    assign fflags = {r_v[D-1], 4'b0};
    generate
       assign w_d[0] = t_y;
@@ -94,6 +93,11 @@ module fpu_compare(clk, a, b, start, cond, fmt, y, fflags);
      begin
 	r_d <= w_d;
 	r_v <= w_v;
+	r_c[0] <= t_fcc;
+	for(integer i = 1; i < D; i = i + 1)
+	  begin
+	     r_c[i] <= r_c[i-1];
+	  end
      end
 
 endmodule // fpu_compare

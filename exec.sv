@@ -26,6 +26,9 @@ module exec(clk,
 	    core_fcsr_we,
 	    core_fcsr_cause6,
 	    core_fcsr_flags5,
+	    core_fsr_trap,
+	    core_fsr_ftt,
+	    core_fsr_cexc5,
 `ifdef VERILATOR
 	    clear_cnt,
 `endif
@@ -67,6 +70,7 @@ module exec(clk,
 	    mem_rsp_fp_hi,
 	    mem_rsp_fp_pres,
 	    mem_rsp_rob_ptr,
+	    mem_rsp_faulted,
 	    mem_rsp_load_data,
 	    mem_rsp_valid,
 	    mem_rsp_lsu_hold,
@@ -75,6 +79,8 @@ module exec(clk,
 	    mem_blk_code,
 	    mem_blk_st,
 	    mem_wake_valid,
+	    mem_tlb_busy,
+	    lsu_st_pending,
 	    mem_st_done_valid,
 	    mem_st_done_idx,
 	    lsu_sb,
@@ -96,11 +102,16 @@ module exec(clk,
    output logic ldd_lo_done;
    output logic [`LG_ROB_ENTRIES-1:0] ldd_lo_rob;
        
-   /* FCSR (FCR31) update from retire/fault: set the Cause field (bits 17:12) and
-    * OR sticky exceptions into the Flags field (bits 6:2). */
+   /* FSR update from retire: a retiring FPop sets cexc (its exceptions), ORs
+    * them into aexc and clears ftt */
    input logic		      core_fcsr_we;
    input logic [5:0]	      core_fcsr_cause6;  /* {E,V,Z,O,U,I} this op raised */
-   input logic [4:0]	      core_fcsr_flags5;  /* {V,Z,O,U,I} to OR into Flags (0 on a trap) */
+   input logic [4:0]	      core_fcsr_flags5;  /* {V,Z,O,U,I} to OR into aexc */
+   /* ... and from an fp_exception: ftt (1 IEEE_754_exception, 2 unfinished_FPop,
+    * 3 unimplemented_FPop); an IEEE trap also sets cexc, aexc is untouched */
+   input logic		      core_fsr_trap;
+   input logic [2:0]	      core_fsr_ftt;
+   input logic [4:0]	      core_fsr_cexc5;    /* {V,Z,O,U,I} */
 
    
 
@@ -167,6 +178,7 @@ module exec(clk,
    input logic [31:0]		     mem_rsp_fp_pres;
    input logic [`MEM_WIDTH-1:0]	     mem_rsp_load_data;
    input logic [`LG_ROB_ENTRIES-1:0] mem_rsp_rob_ptr;
+   input logic 			     mem_rsp_faulted;   /* the access trapped (ldfsr writes nothing) */
    /* LSU: a completing simple load frees its entry (mem_rsp_valid & lsu_hold);
     * a block parks it with a code; a wakeup makes it issuable again */
    input logic 			     mem_rsp_valid;
@@ -176,6 +188,10 @@ module exec(clk,
    input 			     blk_code_t mem_blk_code;
    input logic [(1<<`LG_MEM_SCHED_ENTRIES)-1:0] mem_blk_st;
    input logic 			     mem_wake_valid;
+   input logic 			     mem_tlb_busy;   /* a dtlb walk is pending (BLK_TLB release) */
+   /* the LSU holds a store (unretired, or retired and not yet written by the
+    * l1d): a SPARC flush waits for none before it invalidates the L1I line */
+   output logic 			     lsu_st_pending;
    input logic 			     mem_st_done_valid;
    input logic [`LG_MEM_SCHED_ENTRIES-1:0] mem_st_done_idx;
    output 			     lsu_sb_t lsu_sb;
@@ -276,14 +292,29 @@ module exec(clk,
     * All four read ports are SYNCHRONOUS (registered inside the module): rd0/rd1 =
     * fpu operand reads (consumed one cycle later in the FP read stage); rd2 = mfc1
     * source (srcB); rd3 = FP store data (dq).  No flat r_fp_prf flop array anymore. */
-   logic [`FP_WIDTH-1:0] 	  w_fp_srcA, w_fp_srcB;     // fpu reads  (rd0/rd1)
-   logic [`FP_WIDTH-1:0] 	  w_fp_srcC;                // ENABLE_MIPS4 madd fr (rd4)
+   logic [`FP_WIDTH-1:0] 	  w_fp_rawA, w_fp_rawB;     // fpu reads  (rd0/rd1): whole pairs
+   logic [`FP_WIDTH-1:0] 	  w_fp_srcA, w_fp_srcB;     // the operands: a single's half, low-justified
+   logic [`FP_WIDTH-1:0] 	  w_fp_srcC;                // the old pair of a single dst (rd4)
    logic [`FP_WIDTH-1:0] 	  r_fp_rd_srcB, r_fp_rd_dq; // mem reads (rd2/rd3)
    logic [N_INT_PRF_ENTRIES-1:0]  r_fp_prf_inflight, n_fp_prf_inflight;
 
    logic 			  t_wr_int_prf;
    logic 			  t_wr_fcsr;
-   logic [31:0]			  r_fcsr, n_fcsr;   /* FCR31 */
+   /* the SPARC FSR, all but fcc (bits 11:10, renamed in r_fcr_prf[1:0]): RD 31:30,
+    * TEM 27:23, NS 22, ver 19:17, ftt 16:14, qne 13, aexc 9:5, cexc 4:0.  The FPU's
+    * flags are {V,Z,O,U,I}; the FSR's {NV,OF,UF,DZ,NX} (sparc_exc). */
+   logic [31:0]			  r_fcsr, n_fcsr;
+   logic 			  t_ldfsr_wr;
+   localparam [31:0] FSR_LD_MASK = 32'hcfc003ff;   /* ldfsr: RD TEM NS aexc cexc */
+   function automatic logic [4:0] sparc_exc(input logic [4:0] f);
+      begin
+	 sparc_exc = {f[4], f[2], f[1], f[3], f[0]};
+      end
+   endfunction
+   wire [1:0] w_fsr_rd = r_fcsr[31:30];
+   /* TEM in the FPU's flag order */
+   wire [4:0] w_fsr_tem = {r_fcsr[27], r_fcsr[24], r_fcsr[26], r_fcsr[25], r_fcsr[23]};
+   wire [31:0] w_fsr = r_fcsr | {20'd0, r_fcr_prf[r_sd_fcr][1:0], 10'd0};
    
    logic 	t_wr_hilo;
    logic	t_overflow;
@@ -444,7 +475,7 @@ module exec(clk,
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_ld, n_mem_sched_ld;          /* simple load */
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_st, n_mem_sched_st;          /* plain store */
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_ser, n_mem_sched_ser;        /* CACHE hit op: serializing */
-   logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_old1, n_mem_sched_old1;      /* SC/SCD: a held store that issues only when oldest */
+   logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_old1, n_mem_sched_old1;      /* ldstub/swap: a held op that issues only when oldest */
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_mg, n_mem_sched_mg;          /* LWL/LWR/LDL/LDR: needs the old rt (captured) before issue */
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_mv, n_mem_sched_mv;          /* MFC1/MTC1/DMFC1/DMTC1: register move, no memory ordering */
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_sched_issued, n_mem_sched_issued;  /* address pass issued */
@@ -470,7 +501,7 @@ module exec(clk,
    logic [`LG_MEM_SCHED_ENTRIES:0] t_mem_cmt_ptr, t_mem_sd_ptr;
    uop_t t_picked_mem_uop;
    logic 	t_mem_issue, t_mem_issue_addr, t_mem_issue_cmt;
-   logic 	t_mem_uq_generic_load, t_mem_uq_plain_store, t_mem_uq_serial, t_mem_uq_old1, t_mem_uq_merge, t_mem_uq_move;
+   logic 	t_mem_uq_generic_load, t_mem_uq_plain_store, t_mem_uq_serial, t_mem_uq_old1, t_mem_uq_merge, t_mem_uq_move, t_mem_uq_atomic, t_mem_uq_mmureg;
    /* the issued op, one stage on (AGU) */
    logic [`LG_MEM_SCHED_ENTRIES-1:0] r_mem_uq_lsu_idx;
    logic 	r_mem_uq_lsu_hold, r_mem_uq_commit, r_mem_uq_color;
@@ -478,6 +509,8 @@ module exec(clk,
    logic [N_MEM_SCHED_ENTRIES-1:0] r_mem_uq_older_st, r_mem_uq_older_ep;
    /* store data capture */
    logic 	t_sd_go, r_sd_go, r_sd_fp, r_sd_fp_hi, r_sd_zero, r_sd_std;
+   logic 	r_sd_fsr;   /* stfsr: the FSR is the data */
+   logic [`LG_FCR_PRF_ENTRIES-1:0] r_sd_fcr;   /* its fcc register */
    /* SPARC std reads its two data registers through the one store-data port on
     * consecutive cycles: r_sd_std_ph2 = this cycle reads rd+1 (r_sd_hi holds rd) */
    logic 	r_sd_std_ph2;
@@ -1419,7 +1452,7 @@ module exec(clk,
        .fp_src_a(w_fp_srcA),
        .fp_src_b(w_fp_srcB),
 `endif
-       .fp_rm(r_fcsr[1:0]),
+       .fp_rm(w_fsr_rd),
        .fp_rob_ptr_in(r_fp_iss_uop.rob_ptr),
        .fp_dst_ptr_in(r_fp_iss_uop.dst),
        .fp_wb_slot_used(t_fdiv_wb_used),
@@ -1557,25 +1590,21 @@ module exec(clk,
 	  .rdptr1(fp_uq.srcB),
 	  .rdptr2(t_picked_mem_uop.srcB),
 	  .rdptr3(t_sd_src),
-`ifdef ENABLE_MIPS4
 	  .rdptr4(fp_uq.srcC),
-`else
-	  .rdptr4('d0),
-`endif
 	  /* bank0 write port shared by fpu-arith result and single-cycle convert
 	   * (mutually exclusive by r_fp_wb_bitvec) */
-	  .wrptr0(w_fdiv_complete ? w_fdiv_dst_ptr : w_fpu_result_valid ? w_fpu_dst_ptr : r_cvt_dst),
+	  .wrptr0(w_fp_wb0_ptr),
 	  .wrptr1(mem_rsp_dst_ptr),
 	  .wen0(w_fdiv_complete | w_fpu_result_valid | r_cvt_valid),
 	  .wen1(mem_rsp_dst_valid & mem_rsp_fp_dst),
-	  .wr0(w_fdiv_complete ? w_fdiv_y : w_fpu_result_valid ? w_fpu_result : r_cvt_result),
+	  .wr0(w_fp_wb0_data),
 	  /* FR=0 lwc1 merge: splice the loaded 32 into the fp_hi half, keep fp_pres. */
 	  .wr1(mem_rsp_fp_merge
 	       ? (mem_rsp_fp_hi ? {mem_rsp_load_data[31:0], mem_rsp_fp_pres}
 				: {mem_rsp_fp_pres, mem_rsp_load_data[31:0]})
 	       : mem_rsp_load_data),
-	  .rd0(w_fp_srcA),
-	  .rd1(w_fp_srcB),
+	  .rd0(w_fp_rawA),
+	  .rd1(w_fp_rawB),
 	  .rd2(r_fp_rd_srcB),
 	  .rd3(r_fp_rd_dq),
 	  .rd4(w_fp_srcC)
@@ -1771,6 +1800,40 @@ module exec(clk,
    logic       r_fp_iss_valid;
    logic [7:0] r_fp_iss_fcr;
 
+   /* SPARC FP registers are 64-bit pairs (decode_sparc.sv fidx): d[2k] is the
+    * whole pair, f[2k] its high word, f[2k+1] its low word.  An operand's part
+    * (decode's fsel, jmp_imm[2:1] for srcA, [4:3] for srcB) is picked here; a
+    * single goes to the units low-justified, as they expect. */
+   function automatic logic [63:0] fp_part(input logic [63:0] pair, input logic [1:0] sel);
+      begin
+	 fp_part = (sel == 2'd1) ? {32'd0, pair[31:0]} :
+		   (sel == 2'd2) ? {32'd0, pair[63:32]} : pair;
+      end
+   endfunction // fp_part
+   assign w_fp_srcA = fp_part(w_fp_rawA, r_fp_iss_uop.jmp_imm[2:1]);
+   assign w_fp_srcB = fp_part(w_fp_rawB, r_fp_iss_uop.jmp_imm[4:3]);
+
+   /* A single destination writes half its pair: at issue, keep the other half of
+    * the old pair (srcC) by the destination register; the bank0 writeback (fpu,
+    * divider or the single-cycle path, any latency) merges the result into it. */
+   logic [N_INT_PRF_ENTRIES-1:0] r_fp_mrg_v;
+   logic [N_INT_PRF_ENTRIES-1:0] r_fp_mrg_hi;
+   logic [31:0] 	     r_fp_mrg_keep[N_INT_PRF_ENTRIES-1:0];
+   always_ff@(posedge clk)
+     begin
+	if(r_fp_iss_valid)
+	  begin
+	     r_fp_mrg_v[r_fp_iss_uop.dst] <= r_fp_iss_uop.jmp_imm[5];
+	     r_fp_mrg_hi[r_fp_iss_uop.dst] <= r_fp_iss_uop.jmp_imm[0];
+	     r_fp_mrg_keep[r_fp_iss_uop.dst] <= r_fp_iss_uop.jmp_imm[0] ? w_fp_srcC[31:0] : w_fp_srcC[63:32];
+	  end
+     end // always_ff@ (posedge clk)
+   wire [`LG_PRF_ENTRIES-1:0] w_fp_wb0_ptr = w_fdiv_complete ? w_fdiv_dst_ptr : w_fpu_result_valid ? w_fpu_dst_ptr : r_cvt_dst;
+   wire [63:0] w_fp_wb0_res = w_fdiv_complete ? w_fdiv_y : w_fpu_result_valid ? w_fpu_result : r_cvt_result;
+   wire [63:0] w_fp_wb0_data = !r_fp_mrg_v[w_fp_wb0_ptr] ? w_fp_wb0_res :
+			       r_fp_mrg_hi[w_fp_wb0_ptr] ? {w_fp_wb0_res[31:0], r_fp_mrg_keep[w_fp_wb0_ptr]} :
+			       {r_fp_mrg_keep[w_fp_wb0_ptr], w_fp_wb0_res[31:0]};
+
    // ---- FP UQ pointers / full-empty / push-pop bookkeeping ----
    always_comb
      begin
@@ -1834,12 +1897,12 @@ module exec(clk,
 	t_fpu_srcB_rdy = fp_uq.fp_srcB_valid ? !r_fp_prf_inflight[fp_uq.srcB] : 1'b1;
 	t_fpu_fcr_rdy  = fp_uq.fcr_src_valid ? !r_fcr_prf_inflight[fp_uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] : 1'b1;
 	t_fpu_srcs_rdy = t_fpu_srcA_rdy && t_fpu_srcB_rdy && t_fpu_fcr_rdy;
-`ifdef ENABLE_MIPS4
-	/* madd's fr */
+	/* a single destination's old pair (and madd's fr) */
 	if(fp_uq.fp_srcC_valid && r_fp_prf_inflight[fp_uq.srcC])
 	  begin
 	     t_fpu_srcs_rdy = 1'b0;
 	  end
+`ifdef ENABLE_MIPS4
 	/* movz/movn.fmt: GPR rt (srcC) must be written, so its zero flag is valid */
 	if(fp_uq.srcC_valid && r_prf_inflight[fp_uq.srcC])
 	  begin
@@ -1969,7 +2032,7 @@ module exec(clk,
 	.src_c({`FP_WIDTH{1'b0}}),
 `endif
 	.src_fcr(r_fp_iss_fcr),
-	.rm(r_fcsr[1:0]),   /* FCSR.RM; CTC1 serializes so this is stable per FP op */
+	.rm(w_fsr_rd),   /* FCSR.RM; CTC1 serializes so this is stable per FP op */
 	.rob_ptr_in(r_fp_iss_uop.rob_ptr),
 	.dst_ptr_in(r_fp_iss_uop.dst),
 	.fcr_ptr_in(r_fp_iss_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]),
@@ -1994,7 +2057,7 @@ module exec(clk,
 		      (r_fp_iss_uop.op == CVT_L_D);
    wire w_f2i_dst_l = (r_fp_iss_uop.op == CVT_L_S) || (r_fp_iss_uop.op == CVT_L_D);
    wire [1:0] w_f2i_rm = ((r_fp_iss_uop.op == TRUNC_W_S) || (r_fp_iss_uop.op == TRUNC_W_D)) ? 2'b01
-			 : r_fp_iss_uop.imm[2] ? r_fcsr[1:0]
+			 : r_fp_iss_uop.imm[2] ? w_fsr_rd
 			 : r_fp_iss_uop.imm[1:0];
    fpu_f2i f2i0(.in(w_fp_srcA),
 		.fmt(w_f2i_src_d),
@@ -2004,13 +2067,13 @@ module exec(clk,
    fpu_i2f i2f0(.in(w_fp_srcA),
 		.src_long((r_fp_iss_uop.op == CVT_S_L) || (r_fp_iss_uop.op == CVT_D_L)),
 		.fmt((r_fp_iss_uop.op == CVT_D_W) || (r_fp_iss_uop.op == CVT_D_L)),
-		.rm(r_fcsr[1:0]),
+		.rm(w_fsr_rd),
 		.out(w_i2f_out), .fflags(w_i2f_fflags));
    /* FP<->FP convert: CVT.D.S widens (to_double=1, exact); CVT.S.D narrows (rounds
     * per FCSR.RM, E-trap via denorm on underflow / denorm operand). */
    fpu_f2f f2f0(.in(w_fp_srcA),
 		.to_double(r_fp_iss_uop.op == CVT_D_S),
-		.rm(r_fcsr[1:0]),
+		.rm(w_fsr_rd),
 		.out(w_f2f_out), .denorm(w_f2f_denorm), .fflags(w_f2f_fflags));
    always_ff@(posedge clk)
      begin
@@ -2042,7 +2105,7 @@ module exec(clk,
     * ROB is_fpe bit -> ARCH_FAULT.  (convert raises no denorm.) */
    wire [4:0] w_fp_cmpl_fflags = w_fdiv_complete ? w_fdiv_fflags : (w_fpu_result_valid | w_fpu_fcr_valid) ? w_fpu_fflags : r_cvt_fflags;
    wire       w_fp_cmpl_denorm = w_fdiv_complete ? w_fdiv_denorm : (w_fpu_result_valid | w_fpu_fcr_valid) ? w_fpu_denorm : r_cvt_denorm;
-   wire       w_fp_fault = w_fp_cmpl_denorm | (|(w_fp_cmpl_fflags & r_fcsr[11:7]));
+   wire       w_fp_fault = w_fp_cmpl_denorm | (|(w_fp_cmpl_fflags & w_fsr_tem));
 
    // ---- FCR PRF: inflight tracking + write ----
    always_comb
@@ -2059,6 +2122,8 @@ module exec(clk,
 	 * that never comes. */
 	if(r_start_int & t_wr_fcsr)
 	  n_fcr_prf_inflight[int_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] = 1'b0;
+	if(t_ldfsr_wr)
+	  n_fcr_prf_inflight[r_ldfsr_fcr] = 1'b0;
      end
    always_ff@(posedge clk)
      begin
@@ -2078,6 +2143,8 @@ module exec(clk,
 	  r_fcr_prf[w_fpu_fcr_ptr] <= w_fpu_result[7:0];
 	else if(r_start_int & t_wr_fcsr)
 	  r_fcr_prf[int_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]] <= {t_srcA[31:25], t_srcA[23]};
+	else if(t_ldfsr_wr)
+	  r_fcr_prf[r_ldfsr_fcr] <= {6'd0, mem_rsp_load_data[11:10]};
      end
 
    // ---- FP completion -> ROB port 2 ----
@@ -2207,6 +2274,32 @@ module exec(clk,
 	 eval_icc = c[3] ? !r : r;
       end
    endfunction // eval_icc
+
+   /* FBfcc: c's taken set over fcc (0 =, 1 <, 2 >, 3 unordered), as a mask */
+   function automatic logic eval_fcc(input logic [3:0] c, input logic [1:0] fcc);
+      logic [3:0] m;
+      begin
+	 case(c)
+	   4'd1: m = 4'b1110;   /* fbne   */
+	   4'd2: m = 4'b0110;   /* fblg   */
+	   4'd3: m = 4'b1010;   /* fbul   */
+	   4'd4: m = 4'b0010;   /* fbl    */
+	   4'd5: m = 4'b1100;   /* fbug   */
+	   4'd6: m = 4'b0100;   /* fbg    */
+	   4'd7: m = 4'b1000;   /* fbu    */
+	   4'd8: m = 4'b1111;   /* fba    */
+	   4'd9: m = 4'b0001;   /* fbe    */
+	   4'd10: m = 4'b1001;  /* fbue   */
+	   4'd11: m = 4'b0101;  /* fbge   */
+	   4'd12: m = 4'b1101;  /* fbuge  */
+	   4'd13: m = 4'b0011;  /* fble   */
+	   4'd14: m = 4'b1011;  /* fbule  */
+	   4'd15: m = 4'b0111;  /* fbo    */
+	   default: m = 4'b0000; /* fbn  */
+	 endcase // case (c)
+	 eval_fcc = m[fcc];
+      end
+   endfunction // eval_fcc
 
    
    always_comb
@@ -2433,6 +2526,15 @@ module exec(clk,
 	       t_pc = `M_WIDTH'(t_take_br ? w_s_branch_target : w_s_pc8);
 	       t_alu_valid = 1'b1;
 	    end
+	  S_FBFCC:
+	    begin
+	       /* as S_BICC, on fcc (the renamed FCR register's [1:0]) */
+	       t_take_br = eval_fcc(int_uop.cond, r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][1:0]);
+	       t_mispred_br = (int_uop.br_pred != t_take_br) |
+			      (int_uop.has_nullifying_delay_slot & !t_take_br);
+	       t_pc = `M_WIDTH'(t_take_br ? w_s_branch_target : w_s_pc8);
+	       t_alu_valid = 1'b1;
+	    end
 	  S_CALL:
 	    begin
 	       t_take_br = 1'b1;
@@ -2502,6 +2604,8 @@ module exec(clk,
 	    end
 	  S_FLUSH:
 	    begin
+	       /* the EA, for the retire-time L1I line invalidate (core.sv) */
+	       t_result = `M_WIDTH'(w_s_add[31:0]);
 	       t_alu_valid = 1'b1;
 	    end
 	  S_RETT:
@@ -2624,6 +2728,7 @@ module exec(clk,
 				    ((head_of_rob_ptr_valid && (head_of_rob_ptr == r_mem_sched_uops[i].rob_ptr)) ||
 				     (head_of_rob_ds_committable && (next_head_of_rob_ptr == r_mem_sched_uops[i].rob_ptr)))) ||
 				   ((r_mem_sched_blk[i] == BLK_SB_CONFLICT) && ((r_mem_sched_blk_st[i] & ~t_mem_free_entry) == 'd0)) ||
+				   ((r_mem_sched_blk[i] == BLK_TLB) && !mem_tlb_busy) ||
 				   ((r_mem_sched_blk[i] == BLK_SB_DATA) &&
 				    ((r_mem_sched_blk_st[i] & ~t_mem_free_entry & ~r_mem_sched_sd_ok) == 'd0));
 	     end // always_comb
@@ -2639,6 +2744,8 @@ module exec(clk,
 								      .y(t_mem_cmt_ptr));
    find_lowest_set_bit#(`LG_MEM_SCHED_ENTRIES) ffs_mem_sched_sd( .in(t_mem_sd_rdy),
 								     .y(t_mem_sd_ptr));
+
+   assign lsu_st_pending = |(r_mem_sched_valid & r_mem_sched_st);
 
    /* restart color (rv64core's r_restart_counter, 1 bit) */
    always_ff@(posedge clk)
@@ -2680,7 +2787,8 @@ module exec(clk,
 	     t_mem_ldd_out[j] = r_mem_sched_valid[j] & r_mem_sched_uops[j].dst2_valid &
 				(r_mem_sched_issued[j] | ((r_mem_sched_blk[j] != BLK_NONE) & !r_mem_sched_blk[j][2]));
 	  end
-	t_mem_pending = t_mem_strict | (t_mem_st_live & ~r_mem_sched_issued);
+	/* an atomic (old1) holds back everything younger until it is answered */
+	t_mem_pending = t_mem_strict | (r_mem_sched_valid & r_mem_sched_old1) | (t_mem_st_live & ~r_mem_sched_issued);
      end // always_comb
 
    always_comb
@@ -2725,16 +2833,26 @@ module exec(clk,
 	 * SPARC integer load merges (MIPS LWL/LWR did); kept for the FP singles
 	 * that land in half of a 64-bit FP register. */
 	t_mem_uq_merge = 1'b0;
+	/* ldstub/swap (rv64core's AMOs): held like a load (a block replays it),
+	 * issued only as the oldest LSU op so every older store has drained and
+	 * nothing younger passes it, and performed non-speculatively by the l1d as
+	 * one read-modify-write.  swap's rd (the store data) is captured into its
+	 * store-buffer data slot before issue, as a merging load's old register. */
+	t_mem_uq_atomic = (t_mem_uq.op == S_LDSTUB) | (t_mem_uq.op == S_SWAP);
+	/* lda/sta to a non-memory ASI (SRMMU registers, flushes, module registers,
+	 * cache diagnostics) go the same way: held, oldest, performed by the l1d at
+	 * the ROB head (a store's data captured first) */
+	t_mem_uq_mmureg = !asi_is_memory(t_mem_uq.asi);
 	t_mem_uq_generic_load = (t_mem_uq.op == LW) |
 				(t_mem_uq.op == LB) | (t_mem_uq.op == LBU) |
 				(t_mem_uq.op == LH) | (t_mem_uq.op == LHU) |
 				(t_mem_uq.op == LD) | (t_mem_uq.op == LWC1) |
-				(t_mem_uq.op == LDC1) | t_mem_uq_merge;
-	t_mem_uq_plain_store = is_lsu_store(t_mem_uq.op);
+				(t_mem_uq.op == LDC1) | (t_mem_uq.op == S_LDFSR) | t_mem_uq_merge | t_mem_uq_atomic | t_mem_uq_mmureg;
+	t_mem_uq_plain_store = is_lsu_store(t_mem_uq.op) & !t_mem_uq_mmureg;
 	t_mem_uq_serial = (t_mem_uq.op == CHWB) | (t_mem_uq.op == CHWBINV) | (t_mem_uq.op == CHINV) |
 			  (t_mem_uq.op == CHBWBINV) | (t_mem_uq.op == CHBINV) | (t_mem_uq.op == CHBIDX);
-	/* issue only as the oldest op (MIPS SC/SCD used it; ldstub/swap will) */
-	t_mem_uq_old1 = 1'b0;
+	/* issue only as the oldest op */
+	t_mem_uq_old1 = t_mem_uq_atomic | t_mem_uq_mmureg;
 	/* GPR<->FPR moves only borrow the mem pipe as a cross-register-file path (MEM_MOV,
 	 * echoed by the l1d with no cache access): no memory ordering either way */
 	t_mem_uq_move = (t_mem_uq.op == MFC1) | (t_mem_uq.op == MTC1) |
@@ -2772,7 +2890,8 @@ module exec(clk,
 	     n_mem_sched_st[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_plain_store;
 	     n_mem_sched_ser[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_serial;
 	     n_mem_sched_old1[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_old1;
-	     n_mem_sched_mg[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_merge;
+	     n_mem_sched_mg[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_merge | (t_mem_uq.op == S_SWAP) |
+										    (t_mem_uq_mmureg & is_lsu_store(t_mem_uq.op));
 	     n_mem_sched_mv[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_move;
 	     n_mem_sched_ep[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = !r_mem_sched_ep[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]];
 	  end
@@ -2941,6 +3060,8 @@ module exec(clk,
 	     r_sd_zero <= !(r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].fp_srcB_valid |
 			    r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].srcB_valid);
 	     r_sd_rob <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].rob_ptr;
+	     r_sd_fsr <= (r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].op == S_STFSR);
+	     r_sd_fcr <= r_mem_sched_uops[t_mem_sd_ptr[`LG_MEM_SCHED_ENTRIES-1:0]].hilo_src[`LG_FCR_PRF_ENTRIES-1:0];
 	  end
      end // always_ff@ (posedge clk)
 
@@ -2957,7 +3078,8 @@ module exec(clk,
 	lsu_sb.data_valid = r_sd_go;
 	lsu_sb.data_idx = r_sd_idx;
 	/* FR=0 swc1 odd reg (fp_hi): store the HIGH 32b half (placed low for MEM_SW) */
-	lsu_sb.data = r_sd_zero ? 64'd0 :
+	lsu_sb.data = r_sd_fsr ? {32'd0, w_fsr} :
+		      r_sd_zero ? 64'd0 :
 		      r_sd_fp ? (r_sd_fp_hi ? {32'd0, r_fp_rd_dq[63:32]} : r_fp_rd_dq) :
 		      /* std: rd at the address, rd+1 after it (big-endian MEM_SD) */
 		      r_sd_std ? {r_sd_hi, w_mem_srcB[31:0]} :
@@ -3041,11 +3163,14 @@ module exec(clk,
    wire		       w_cached, w_mapped;
    wire [1:0]	       w_seg;
    
-   /* SPARC, SRMMU not yet wired: MMU off, the access goes out at its VA, cached.
-    * (The MIPS segment map is gone; ASI-driven cacheability comes with the LSU.) */
+   /* SPARC: the access goes out at its VA with its ASI; the l1d translates the
+    * user/supervisor insn and data ASIs (0x8-0xb) through the SRMMU (PA = VA with
+    * the MMU off).  The bypass ASIs 0x20-0x2f put PA[35:32] = ASI[3:0] and go
+    * uncached (device space).  The other ASIs (MMU registers, probe/flush, cache
+    * diagnostics) are not plumbed yet and go out untranslated. */
    assign w_agu_la = w_agu;
-   assign w_cached = 1'b1;
-   assign w_mapped = 1'b0;
+   assign w_cached = (mem_uq.asi[7:4] != 4'h2) & asi_is_memory(mem_uq.asi);
+   assign w_mapped = (mem_uq.asi[7:2] == 6'b000010);
    assign w_seg = 2'd0;
    assign w_bad_seg_perms = 1'b0;
 
@@ -3071,6 +3196,7 @@ module exec(clk,
 	t_mem_tail.bad_addr = 1'b0;
 	t_mem_tail.cached = w_cached;
 	t_mem_tail.mapped = w_mapped;
+	t_mem_tail.asi = mem_uq.asi;
 	t_mem_tail.pc = mem_uq.pc;   /* un-guarded for synth: store-tracer PC watchpoint */
 	t_mem_tail.lsu_hold = r_mem_uq_lsu_hold;
 	t_mem_tail.lsu_idx = r_mem_uq_lsu_idx;
@@ -3158,6 +3284,24 @@ module exec(clk,
 	       t_mem_tail.dst_valid = 1'b0;
 	       t_mem_tail.bad_addr = (w_agu[2:0] != 3'd0) | w_bad_seg_perms;
 	    end
+	  S_LDSTUB:
+	    begin
+	       /* the l1d writes 0xff and answers the old byte (its data is not used) */
+	       t_mem_tail.op = MEM_LDSTUB;
+	       t_mem_tail.is_store = 1'b1;
+	       t_mem_tail.is_atomic = 1'b1;
+	       t_mem_tail.dst_valid = mem_uq.dst_valid;
+	       t_mem_tail.bad_addr = w_bad_seg_perms;
+	    end
+	  S_SWAP:
+	    begin
+	       /* the store data (rd) is in the l1d store-buffer slot (captured first) */
+	       t_mem_tail.op = MEM_SWAP;
+	       t_mem_tail.is_store = 1'b1;
+	       t_mem_tail.is_atomic = 1'b1;
+	       t_mem_tail.dst_valid = mem_uq.dst_valid;
+	       t_mem_tail.bad_addr = (w_agu[1:0] != 2'd0) | w_bad_seg_perms;
+	    end
 	  LWC1:
 	    begin
 	       /* FP load (word): normal L1D load, result writes the FP PRF.  FR=0
@@ -3196,6 +3340,29 @@ module exec(clk,
 	       t_mem_tail.dst_valid = 1'b0;
 	       t_mem_tail.bad_addr = (w_agu[2:0] != 3'd0) | w_bad_seg_perms;
 	    end
+	  S_STFSR:
+	    begin
+	       /* serializing: the FSR (r_fcsr and fcc) is the store data */
+	       t_mem_tail.op = MEM_SW;
+	       t_mem_tail.is_store = 1'b1;
+	       t_mem_tail.dst_valid = 1'b0;
+	       t_mem_tail.bad_addr = (w_agu[1:0] != 2'd0) | w_bad_seg_perms;
+	    end
+	  S_STDFQ:
+	    begin
+	       /* the FP queue is always empty (no deferred FP traps): stores 0 */
+	       t_mem_tail.op = MEM_SD;
+	       t_mem_tail.is_store = 1'b1;
+	       t_mem_tail.dst_valid = 1'b0;
+	       t_mem_tail.bad_addr = (w_agu[2:0] != 3'd0) | w_bad_seg_perms;
+	    end
+	  S_LDFSR:
+	    begin
+	       /* serializing: the response writes the FSR (r_ldfsr_*), no register */
+	       t_mem_tail.op = MEM_LW;
+	       t_mem_tail.dst_valid = 1'b0;
+	       t_mem_tail.bad_addr = (w_agu[1:0] != 2'd0) | w_bad_seg_perms;
+	    end
 	  default:
 	    begin
 	    end
@@ -3211,6 +3378,7 @@ module exec(clk,
 	     t_mem_tail.bad_addr = 1'b0;
 	     t_mem_tail.cached = 1'b1;
 	     t_mem_tail.mapped = 1'b0;
+	     t_mem_tail.asi = 8'h0b;
 	     t_mem_tail.addr = 'd0;
 	  end
      end // always_comb
@@ -3379,10 +3547,25 @@ module exec(clk,
 	  begin
 	     n_fcsr = t_srcA[31:0] & ~FCC_MASK;   /* FCC lives in r_fcr_prf */
 	  end
+	else if(t_ldfsr_wr)
+	  begin
+	     /* ldfsr writes RD, TEM, NS, aexc and cexc (fcc goes to r_fcr_prf);
+	      * ver, ftt and qne are kept (interpret.cc FSR_LDFSR_MASK) */
+	     n_fcsr = (r_fcsr & ~FSR_LD_MASK) | (mem_rsp_load_data[31:0] & FSR_LD_MASK);
+	  end
+	else if(core_fsr_trap)
+	  begin
+	     n_fcsr[16:14] = core_fsr_ftt;
+	     if(core_fsr_ftt == 3'd1)
+	       begin
+		  n_fcsr[4:0] = sparc_exc(core_fsr_cexc5);
+	       end
+	  end
 	else if(core_fcsr_we)
 	  begin
-	     n_fcsr[17:12] = core_fcsr_cause6;          /* Cause = this op's exceptions */
-	     n_fcsr[6:2]   = r_fcsr[6:2] | core_fcsr_flags5; /* Flags accumulate (0 on trap) */
+	     n_fcsr[4:0] = sparc_exc(core_fcsr_cause6[4:0]);              /* cexc */
+	     n_fcsr[9:5] = r_fcsr[9:5] | sparc_exc(core_fcsr_flags5);     /* aexc */
+	     n_fcsr[16:14] = 3'd0;                                         /* ftt */
 	  end
      end // always_comb
 
@@ -3390,6 +3573,34 @@ module exec(clk,
      begin
 	r_fcsr <= reset ? 32'd0 : n_fcsr;
      end // always_ff
+
+   /* ldfsr (serializing, so alone in the machine): its load response, unless it
+    * trapped, writes the FSR and its fcc register */
+   logic r_ldfsr_valid;
+   logic [`LG_ROB_ENTRIES-1:0] r_ldfsr_rob;
+   logic [`LG_FCR_PRF_ENTRIES-1:0] r_ldfsr_fcr;
+   wire w_ldfsr_issue = r_mem_ready & !r_mem_uq_commit & (mem_uq.op == S_LDFSR);
+   assign t_ldfsr_wr = r_ldfsr_valid & mem_rsp_valid & (mem_rsp_rob_ptr == r_ldfsr_rob) & !mem_rsp_faulted;
+   always_ff@(posedge clk)
+     begin
+	if(reset || t_flash_clear)
+	  begin
+	     r_ldfsr_valid <= 1'b0;
+	  end
+	else if(w_ldfsr_issue)
+	  begin
+	     r_ldfsr_valid <= 1'b1;
+	  end
+	else if(t_ldfsr_wr)
+	  begin
+	     r_ldfsr_valid <= 1'b0;
+	  end
+	if(w_ldfsr_issue)
+	  begin
+	     r_ldfsr_rob <= mem_uq.rob_ptr;
+	     r_ldfsr_fcr <= mem_uq.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0];
+	  end
+     end // always_ff@ (posedge clk)
 
    
    always_ff@(posedge clk)

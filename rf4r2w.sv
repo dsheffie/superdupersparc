@@ -36,6 +36,19 @@ module rf4r2w(clk, reset,
     * write port 1 = MEM (load) results -> MEM bank, so each bank has a single
     * write port.  Reads pick the bank by the source pointer's MSB. */
    localparam HALF = 1 << (LG_DEPTH-1);
+`ifdef VERILATOR
+   /* checkpoint resume (Verilator only): at reset, seed every physical register
+    * from the harness (loadprf: the value the reset rename map gives it) */
+   import "DPI-C" function int have_checkpoint();
+   import "DPI-C" function longint loadprf(input int preg, input int depth);
+   /* one entry of each bank per reset cycle: the harness holds reset for at
+    * least HALF cycles when it resumes a checkpoint */
+   logic [LG_DEPTH-2:0] r_seed_idx;
+   always_ff@(posedge clk)
+     begin
+	r_seed_idx <= reset ? (r_seed_idx + 'd1) : 'd0;
+     end
+`endif
    `RF_RAM_STYLE logic [WIDTH-1:0] 	    r_ram_alu[HALF-1:0];
    `RF_RAM_STYLE logic [WIDTH-1:0] 	    r_ram_mem[HALF-1:0];
 
@@ -65,13 +78,23 @@ module rf4r2w(clk, reset,
 	/* NEVER write phys reg 0 ($0): the FPGA read path dropped the rdptr==0->0 mux
 	 * on the invariant that $0 is never written, but an r0-dest op reaches here
 	 * with wrptr0==0 & wen0.  This gate enforces it. */
-	if(wen0 & (wrptr0 != 'd0))
+`ifdef VERILATOR
+	if(reset && (have_checkpoint() != 0))
 	  begin
-	     r_ram_alu[wrptr0[LG_DEPTH-2:0]] <= wr0;
+	     r_ram_alu[r_seed_idx] <= WIDTH'(loadprf(32'(r_seed_idx), 1 << LG_DEPTH));
+	     r_ram_mem[r_seed_idx] <= WIDTH'(loadprf(32'(r_seed_idx) + HALF, 1 << LG_DEPTH));
 	  end
-	if(wen1)
+	else
+`endif
 	  begin
-	     r_ram_mem[wrptr1[LG_DEPTH-2:0]] <= wr1;
+	     if(wen0 & (wrptr0 != 'd0))
+	       begin
+		  r_ram_alu[wrptr0[LG_DEPTH-2:0]] <= wr0;
+	       end
+	     if(wen1)
+	       begin
+		  r_ram_mem[wrptr1[LG_DEPTH-2:0]] <= wr1;
+	       end
 	  end
 `ifdef VERILATOR
 	/* BANK INVARIANT.  Writes choose the bank by PORT (port0->alu, port1->mem) and

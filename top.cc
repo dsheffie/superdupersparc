@@ -1,13 +1,23 @@
 #include "top.hh"
 #include <cstring>
 #include <deque>
+#include "sun4m.hh"
+#include "ckpt.hh"
 
 /* SPARC V8 Verilator testbench.  s = the architectural state the RTL's retire
  * stream writes back (and the memory image the RTL's memory port serves); ss =
  * the checker ISS (interpret.cc), stepped once per retired instruction.
  *
- * Devices: none yet -- the memory port is RAM only (sun4m.cc devices get wired
- * in with the SRMMU / sun4m phase). */
+ * Devices: with --checkpoint (an ss10sim full-system checkpoint) the memory
+ * port serves RAM below ram_size and the sun4m devices (sun4m.cc, the same code
+ * ss10sim runs) above it.  The device side effects happen once: an RTL device
+ * load reads the board and its value is queued for the checker's replay (the
+ * RTL issues uncached loads only at the ROB head, so the queue is in retire
+ * order); a device store is performed when the checker retires it, and the
+ * RTL's later write is only compared against it.  Time is the retired
+ * instruction count (ss->icnt), as in ss10sim, so a run follows the same
+ * device timeline the checkpoint did.  The board's interrupt level drives the
+ * core's irl; the checker takes an interrupt where the RTL reports it took one. */
 
 bool globals::enClockFuncts = false;
 uint64_t globals::cycle = 0;
@@ -26,20 +36,268 @@ extern "C" void l2_line_log(int, unsigned long long, unsigned long long,
 extern "C" void l2_chk_log(unsigned long long, int, int, int, int,
                            unsigned long long, unsigned long long) {}
 
-/* Checkpoint-resume DPI seed hooks (used by the henry full-system tb to inject a
- * fast-forwarded ISS state at reset).  ooo_core never resumes from a checkpoint, so
- * have_checkpoint() returns 0 -> the RTL seed branches are dead; these stubs only
- * satisfy the linker for the `ifdef VERILATOR` DPI imports in the core RTL. */
+/* Checkpoint-resume DPI seed hooks: at reset the RTL takes its integer
+ * registers (rf4r2w), PSR/WIM/TBR (core.sv) and SRMMU registers (mmu_preload)
+ * from the restored checker state.  icc, Y, FSR and the FP registers stay at
+ * their reset values (the checker is set to match: see restore_full_system). */
+static state_t *g_ckpt_state = nullptr;
 extern "C" {
-  int       have_checkpoint(void)               { return 0; }
+  int       have_checkpoint(void)               { return g_ckpt_state != nullptr; }
   int       have_ckpt_t(void)                   { return 0; }
   long long loadgpr(int regid)                  { (void)regid; return 0; }
   long long loadfpr(int regid)                  { (void)regid; return 0; }
+  /* physical register preg of a depth-entry banked PRF under core.sv's
+   * reset_preg map: arch a < N/2 -> a, else depth/2 + a - N/2 */
+  long long loadprf(int preg, int depth) {
+    if(g_ckpt_state == nullptr) {
+      return 0;
+    }
+    const int half = depth / 2, n2 = N_ARCH_REGS / 2;
+    int a = -1;
+    if(preg < half) {
+      a = (preg < n2) ? preg : -1;
+    }
+    else if(preg - half < N_ARCH_REGS - n2) {
+      a = preg - half + n2;
+    }
+    return (a > 0) ? static_cast<long long>(g_ckpt_state->r[a]) : 0;
+  }
+  int ckpt_sreg(int id) {
+    if(g_ckpt_state == nullptr) {
+      return 0;
+    }
+    switch(id)
+      {
+      case 0: return static_cast<int>(g_ckpt_state->get_psr());
+      case 1: return static_cast<int>(g_ckpt_state->wim);
+      case 2: return static_cast<int>(g_ckpt_state->tbr);
+      default: return 0;
+      }
+  }
 }
 
-/* l1d.sv's co-sim hooks (ENABLE_STORE_CHECK etc.); no SPARC consumer yet */
-extern "C" void wr_log(long long, int, unsigned long long, unsigned long long, int) {
+/* ---------------------------------------------------------------- devices */
+
+static sun4m_t *g_board = nullptr;
+static bool g_dev_error = false;
+
+/* reads the PROM serves have no side effects: both sides read it directly */
+static bool dev_plain(uint64_t pa) {
+  return pa >= SUN4M_PROM_BASE and pa < SUN4M_PROM_BASE + SUN4M_PROM_SIZE;
 }
+
+struct dev_rec_t {
+  uint64_t pa;
+  uint32_t size, v;
+  bool bus_error;
+};
+
+/* the checker's device space: loads replay what the RTL read, stores happen
+ * here (at retirement, as in ss10sim) and wait for the RTL's to compare */
+class replay_dev : public dev_if {
+public:
+  std::deque<dev_rec_t> reads, writes;
+  uint32_t read(state_t *st, uint64_t pa, uint32_t size, bool *bus_error) override {
+    if(dev_plain(pa)) {
+      return g_board->read(st, pa, size, bus_error);
+    }
+    if(reads.empty() or reads.front().pa != pa or reads.front().size != size) {
+      std::cout << "DEVICE DESYNC: the checker loads " << size << " bytes at pa " << std::hex << pa
+		<< " (pc " << st->pc << ") but the RTL read ";
+      if(reads.empty()) {
+	std::cout << "nothing";
+      }
+      else {
+	std::cout << reads.front().size << " bytes at pa " << reads.front().pa;
+      }
+      std::cout << std::dec << "\n";
+      g_dev_error = true;
+      return 0;
+    }
+    dev_rec_t r = reads.front();
+    reads.pop_front();
+    *bus_error = r.bus_error;
+    return r.v;
+  }
+  void write(state_t *st, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) override {
+    g_board->write(st, pa, size, v, bus_error);
+    writes.push_back(dev_rec_t{pa, size, v, *bus_error});
+  }
+};
+static replay_dev g_replay;
+
+/* one RTL access to device space (size 1, 2 or 4), at the board's current time */
+static uint32_t rtl_dev_read(uint64_t pa, uint32_t size, bool *bus_error) {
+  if(ss->icnt >= g_board->next_event_icnt) {
+    g_board->timer_event(ss);
+  }
+  uint32_t v = g_board->read(ss, pa, size, bus_error);
+  if(not dev_plain(pa)) {
+    g_replay.reads.push_back(dev_rec_t{pa, size, v, *bus_error});
+  }
+  return v;
+}
+
+static void rtl_dev_write(uint64_t pa, uint32_t size, uint32_t v) {
+  if(g_replay.writes.empty()) {
+    std::cout << "DEVICE DESYNC: the RTL writes " << size << " bytes = " << std::hex << v << " at pa " << pa
+	      << " that the checker never stored" << std::dec << "\n";
+    g_dev_error = true;
+    return;
+  }
+  dev_rec_t w = g_replay.writes.front();
+  g_replay.writes.pop_front();
+  if(w.pa != pa or w.size != size or w.v != v) {
+    std::cout << "DEVICE DESYNC: the RTL writes " << size << " bytes = " << std::hex << v << " at pa " << pa
+	      << ", the checker stored " << std::dec << w.size << " bytes = " << std::hex << w.v
+	      << " at pa " << w.pa << std::dec << "\n";
+    g_dev_error = true;
+  }
+}
+
+/* the memory port's 16-byte line + byte mask to device accesses: each run of
+ * enabled bytes is one access (an 8-byte run is two words, high then low, as
+ * the checker's ldd/std make them).  data[i] holds bytes line+4i.. in host
+ * order of the big-endian image (perform_word_load's layout). */
+static void dev_line_access(bool store, uint64_t line, uint16_t mask, uint32_t data[4], bool *bus_error) {
+  uint8_t bytes[16];
+  for(int i = 0; i < 16; i++) {
+    bytes[i] = static_cast<uint8_t>(data[i / 4] >> (8 * (i % 4)));
+  }
+  int k = 0;
+  while(k < 16) {
+    if(not ((mask >> k) & 1)) {
+      ++k;
+      continue;
+    }
+    int e = k;
+    while(e < 16 and ((mask >> e) & 1)) {
+      ++e;
+    }
+    for(int a = k; a < e; ) {
+      uint32_t size = static_cast<uint32_t>(std::min(e - a, 4));
+      if(size == 3) {
+	size = 2;
+      }
+      uint64_t pa = line + a;
+      if(store) {
+	uint32_t v = 0;
+	for(uint32_t b = 0; b < size; b++) {
+	  v = (v << 8) | bytes[a + b];
+	}
+	rtl_dev_write(pa, size, v);
+      }
+      else {
+	bool be = false;
+	uint32_t v = rtl_dev_read(pa, size, &be);
+	*bus_error |= be;
+	for(uint32_t b = 0; b < size; b++) {
+	  bytes[a + b] = static_cast<uint8_t>(v >> (8 * (size - 1 - b)));
+	}
+      }
+      a += size;
+    }
+    k = e;
+  }
+  if(not store) {
+    for(int i = 0; i < 4; i++) {
+      data[i] = 0;
+      for(int j = 0; j < 4; j++) {
+	data[i] |= static_cast<uint32_t>(bytes[4 * i + j]) << (8 * j);
+      }
+    }
+  }
+}
+
+/* SRMMU registers at reset (--mmu-ctrl/--mmu-ctpr/--mmu-ctx), until lda/sta to
+ * ASI 0x4 reach the RTL's MMU: mmu.sv reads them at reset and the checker ISS
+ * starts with the same values. */
+static uint32_t g_mmu_preload[3] = {0x800 /* MCR_RESET: MBus mode */, 0, 0};
+extern "C" int mmu_preload(int regid) {
+  return static_cast<int>(g_mmu_preload[regid]);
+}
+/* the walker set R in a PTE, possibly for a wrong-path access the ISS never
+ * makes: mirror it into the checker's memory so the halt-time compare agrees.
+ * (The R bit is bit 5 of the big-endian word: the byte at pte_pa + 3.) */
+extern "C" void mmu_set_ref(long long pte_pa, int pte) {
+  (void)pte;
+  uint64_t a = static_cast<uint64_t>(pte_pa) + 3;
+  ss->mem.set<uint8_t>(a, ss->mem.get<uint8_t>(a) | 0x20);
+}
+
+/* the FP register compare: the RTL's architectural FP state is its FP retire RAT
+ * (even arch entries: SPARC pairs, decode_sparc.sv fidx) over its FP PRF, both
+ * mirrored here as they are written (fp_regfile.sv / core.sv); the PRF and the
+ * retire RAT start as the reset seed (identity, all zero), as the ISS's FP
+ * registers do */
+static uint64_t g_rtl_fp_prf[1024] = {0};
+static uint32_t g_rtl_fp_rrat[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+				    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+extern "C" void fp_prf_wr(int ptr, long long data) {
+  g_rtl_fp_prf[ptr & 1023] = static_cast<uint64_t>(data);
+}
+extern "C" void fp_rrat_wr(int arch, int preg) {
+  g_rtl_fp_rrat[arch & 31] = static_cast<uint32_t>(preg);
+}
+static uint64_t rtl_fp_pair(uint32_t k) {
+  return g_rtl_fp_prf[g_rtl_fp_rrat[2 * k] & 1023];
+}
+
+/* the store check (r9999's, from rv64core): l1d.sv reports each store it writes
+ * into the L1D array (wr_log, ENABLE_STORE_CHECK), the ISS each store it writes
+ * into cacheable RAM (interpret.cc STORE_CHECK); both are program order, so the
+ * first front-to-front mismatch is the root store -- a lost, extra or wrong
+ * store, caught where it happens rather than when something reads it back */
+#ifdef STORE_CHECK
+std::deque<store_rec> g_iss_stores;
+bool g_store_check = false;
+static std::deque<store_rec> g_rtl_stores;
+static bool g_store_diverged = false;
+static uint64_t g_stores_checked = 0;
+#endif
+extern "C" void wr_log(long long pc, int rob_ptr, unsigned long long addr,
+		       unsigned long long data, int is_atomic) {
+  (void)rob_ptr;
+  (void)is_atomic;
+#ifdef STORE_CHECK
+  if(g_store_check) {
+    g_rtl_stores.emplace_back(static_cast<uint64_t>(pc), addr, data);
+  }
+#else
+  (void)pc;
+  (void)addr;
+  (void)data;
+#endif
+}
+#ifdef STORE_CHECK
+static void drain_store_check() {
+  while(not g_iss_stores.empty() and not g_rtl_stores.empty()) {
+    const store_rec &i = g_iss_stores.front(), &r = g_rtl_stores.front();
+    if((static_cast<uint32_t>(i.pc) != static_cast<uint32_t>(r.pc)) or (i.addr != r.addr) or (i.data != r.data)) {
+      fprintf(stderr, "[STORE-CHECK] ROOT STORE DIVERGENCE at cycle %llu (%llu stores matched)\n"
+	      "  ISS pc=%08x addr=%09llx data=%016llx\n"
+	      "  RTL pc=%08x addr=%09llx data=%016llx\n",
+	      static_cast<unsigned long long>(globals::cycle), static_cast<unsigned long long>(g_stores_checked),
+	      static_cast<uint32_t>(i.pc), static_cast<unsigned long long>(i.addr), static_cast<unsigned long long>(i.data),
+	      static_cast<uint32_t>(r.pc), static_cast<unsigned long long>(r.addr), static_cast<unsigned long long>(r.data));
+      fprintf(stderr, "  [queues] ISS depth=%zu RTL depth=%zu\n", g_iss_stores.size(), g_rtl_stores.size());
+      for(size_t k = 0; (k < 8) and (k < g_iss_stores.size()); k++) {
+	fprintf(stderr, "    ISS[%zu] pc=%08x addr=%09llx data=%016llx\n", k, static_cast<uint32_t>(g_iss_stores[k].pc),
+		static_cast<unsigned long long>(g_iss_stores[k].addr), static_cast<unsigned long long>(g_iss_stores[k].data));
+      }
+      for(size_t k = 0; (k < 8) and (k < g_rtl_stores.size()); k++) {
+	fprintf(stderr, "    RTL[%zu] pc=%08x addr=%09llx data=%016llx\n", k, static_cast<uint32_t>(g_rtl_stores[k].pc),
+		static_cast<unsigned long long>(g_rtl_stores[k].addr), static_cast<unsigned long long>(g_rtl_stores[k].data));
+      }
+      g_store_diverged = true;
+      return;
+    }
+    g_iss_stores.pop_front();
+    g_rtl_stores.pop_front();
+    g_stores_checked++;
+  }
+}
+#endif
 extern "C" void l1d_wb_log(unsigned long long, unsigned long long, unsigned long long) {
 }
 extern "C" void rd_log(long long, unsigned long long, unsigned long long, int) {
@@ -572,6 +830,8 @@ int main(int argc, char **argv) {
   std::string branch_name = "branch_info.txt";
   uint64_t heartbeat = 1UL<<36, start_trace_at = ~0UL;
   uint64_t max_cycle = 0, max_icnt = 0, mem_lat = 2;
+  std::string mmu_ctrl = "0x800", mmu_ctpr = "0", mmu_ctx = "0";
+  std::string ckpt_file;
   std::map<uint32_t, uint64_t> pushout_histo;
   std::map<uint64_t, double> tip_map;          /* full per-cycle attribution (TIP, ported from rv64core) */
   int64_t mem_reply_cycle = -1L;
@@ -581,6 +841,7 @@ int main(int argc, char **argv) {
       ("help", "Print help messages")
       ("checker,c", po::value<bool>(&enable_checker)->default_value(true), "use checker")
       ("file,f", po::value<std::string>(&sparc_binary), "sparc elf binary")
+      ("checkpoint", po::value<std::string>(&ckpt_file), "full system: resume an ss10sim checkpoint (sun4m devices, interrupts) instead of an elf")
       ("user,u", po::bool_switch(&user), "checker ISS: linux user-mode emulation (syscalls + window spill/fill)")
       ("heartbeat,h", po::value<uint64_t>(&heartbeat)->default_value(1<<24), "heartbeat for stats")
       ("log,l", po::value<std::string>(&log_name), "stats log filename")
@@ -594,12 +855,15 @@ int main(int argc, char **argv) {
       ("maxcycle", po::value<uint64_t>(&max_cycle)->default_value(1UL<<34), "maximum cycles")
       ("maxicnt", po::value<uint64_t>(&max_icnt)->default_value(1UL<<50), "maximum icnt")
       ("trace,t", po::value<bool>(&globals::trace_retirement)->default_value(false), "trace retired instruction stream")
+      ("mmu-ctrl", po::value<std::string>(&mmu_ctrl), "SRMMU control register at reset (sim: until ASI 0x4 is plumbed)")
+      ("mmu-ctpr", po::value<std::string>(&mmu_ctpr), "SRMMU context table pointer at reset")
+      ("mmu-ctx", po::value<std::string>(&mmu_ctx), "SRMMU context at reset")
       ("starttrace,s", po::value<uint64_t>(&start_trace_at)->default_value(~0UL), "start tracing retired instructions")
       ;
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
-    if(vm.count("help") or sparc_binary.empty()) {
+    if(vm.count("help") or (sparc_binary.empty() and ckpt_file.empty())) {
       std::cout << desc << "\n";
       return -1;
     }
@@ -623,9 +887,51 @@ int main(int argc, char **argv) {
   ss->user_emu = user;
   initState(s);
   initState(ss);
+#ifdef STORE_CHECK
+  g_store_check = enable_checker;
+#endif
   initCapstone();
-  load_elf(sparc_binary.c_str(), s);
-  load_elf(sparc_binary.c_str(), ss);
+  if(not ckpt_file.empty()) {
+    /* both the RTL's memory image (s) and the checker (ss) start from it; the
+     * board is the checker's copy of the devices */
+    if(not load_checkpoint(ckpt_file.c_str(), s) or not load_checkpoint(ckpt_file.c_str(), ss)) {
+      return -1;
+    }
+    delete s->sun4m;
+    s->sun4m = nullptr;
+    g_board = ss->sun4m;
+    if(ss->npc != ss->pc + 4) {
+      std::cerr << "checkpoint: npc " << std::hex << ss->npc << " is not pc + 4 (" << ss->pc << std::dec
+		<< "): the RTL resumes from one pc\n";
+      return -1;
+    }
+    /* what the RTL does not seed starts at its reset value on both sides */
+    for(state_t *st : {s, ss}) {
+      st->y = 0;
+      st->icc_n = st->icc_z = st->icc_v = st->icc_c = false;
+      memset(st->f, 0, sizeof(st->f));
+      st->fsr = 0;
+      st->fq_addr = st->fq_insn = 0;
+      st->mmu_fsr = st->mmu_far = 0;
+    }
+    std::cerr << "checkpoint: icc, Y, FSR, the FP registers and the MMU fault registers start at their reset values\n";
+    ss->dev = &g_replay;
+    ss->ext_irq = true;
+    g_ckpt_state = ss;
+    g_mmu_preload[0] = ss->mmu_ctrl;
+    g_mmu_preload[1] = ss->mmu_ctpr;
+    g_mmu_preload[2] = ss->mmu_ctx;
+  }
+  else {
+    load_elf(sparc_binary.c_str(), s);
+    load_elf(sparc_binary.c_str(), ss);
+    g_mmu_preload[0] = std::stoul(mmu_ctrl, nullptr, 0);
+    g_mmu_preload[1] = std::stoul(mmu_ctpr, nullptr, 0) & ~3u;
+    g_mmu_preload[2] = std::stoul(mmu_ctx, nullptr, 0) & 0xffffu;
+    ss->mmu_ctrl = g_mmu_preload[0];
+    ss->mmu_ctpr = g_mmu_preload[1];
+    ss->mmu_ctx = g_mmu_preload[2];
+  }
 
   std::unique_ptr<Vcore_l1d_l1i> tb(new Vcore_l1d_l1i);
   uint64_t last_match_pc = 0;
@@ -638,7 +944,10 @@ int main(int argc, char **argv) {
   //assert reset
   tb->retire_allowed = 1;
   tb->mem_rsp_bad = 0;
-  for(globals::cycle = 0; (globals::cycle < 4) && !Verilated::gotFinish(); ++globals::cycle) {
+  /* a checkpoint resume seeds the register file one entry per bank per reset
+   * cycle (rf4r2w.sv): hold reset past its depth */
+  const uint64_t reset_cycles = g_ckpt_state ? 2 * (1u << 10) : 4;
+  for(globals::cycle = 0; (globals::cycle < reset_cycles) && !Verilated::gotFinish(); ++globals::cycle) {
     contextp->timeInc(1);
     tb->mem_rsp_valid = 0;
     tb->reset = 1;
@@ -677,10 +986,38 @@ int main(int argc, char **argv) {
   tb->single_step = 0;
   tb->step = 0;
   double t0 = timestamp();
+  bool irq_pending = false;
+  uint32_t irq_pc = 0, irq_level = 0;
   while(!Verilated::gotFinish() && (globals::cycle < max_cycle) && (insns_retired < max_icnt)) {
+    if(g_board) {
+      /* an APC halt (sun4m.cc) holds retirement; time skips to the next timer
+       * event until an interrupt is requested (ss10sim's rule) */
+      if(g_board->cpu_halted) {
+	if(ss->et and ss->irl != 0) {
+	  g_board->cpu_halted = false;
+	}
+	else if(not g_board->warp_to_next_event(ss)) {
+	  std::cout << "FAIL: the CPU halted with no timer event to wake it\n";
+	  incorrect = true;
+	  break;
+	}
+      }
+      tb->retire_allowed = g_board->cpu_halted ? 0 : 1;
+      tb->irl = ss->irl;
+    }
+    else {
+      tb->irl = 0;
+    }
     contextp->timeInc(1);
     tb->clk = 1;
     tb->eval();
+    if(tb->trap_taken and ((tb->trap_taken_tt & 0xf0) == 0x10) and (tb->trap_taken_tt & 0xf)) {
+      /* an interrupt: its TRAP_L2 retires with the interrupted pc, which the
+       * checker then takes the interrupt at instead of executing */
+      irq_pending = true;
+      irq_pc = tb->trap_taken_pc;
+      irq_level = tb->trap_taken_tt & 0xf;
+    }
 
     if(tb->retire_reg_valid) {
       s->r[tb->retire_reg_ptr] = tb->retire_reg_data;
@@ -761,14 +1098,52 @@ int main(int argc, char **argv) {
 	}
 	continue;
       }
-      execSparc(ss);
+      if(g_board and i == 0 and tb->retire_insn != 0) {
+	/* the retired instruction word against what the checker fetches there: a
+	 * difference is a bad fetch (translation or I-cache) caught at retirement */
+	uint32_t iw = 0;
+	if(debug_fetch(ss, rpc, &iw) and iw != static_cast<uint32_t>(tb->retire_insn)) {
+	  static uint64_t n_bad_fetch = 0;
+	  if(n_bad_fetch++ < 10) {
+	    std::cout << "BAD FETCH at pc " << std::hex << rpc << ": rtl " << tb->retire_insn << " "
+		      << getAsmString(tb->retire_insn, rpc) << ", memory " << iw << " " << getAsmString(iw, rpc)
+		      << std::dec << " (retired " << insns_retired << ", cycle " << globals::cycle << ")\n";
+	  }
+	}
+      }
+      if(g_board and ss->icnt >= g_board->next_event_icnt) {
+	g_board->timer_event(ss);
+      }
+      if(irq_pending and rpc == irq_pc) {
+	take_interrupt(ss, irq_level);
+	irq_pending = false;
+      }
+      else {
+	execSparc(ss);
+      }
       ++n_checks;
       last_check = 0;
       last_match_pc = rpc;
       if(ss->brk) {
+	/* the RTL retired an instruction the ISS trapped on into error mode
+	 * (the RTL should have halted on it, without retiring it) */
+	if(ss->error_mode) {
+	  std::cout << "FAIL: the RTL retired pc " << std::hex << rpc << std::dec
+		    << ", where the ISS took a trap into error mode\n";
+	  incorrect = true;
+	}
 	break;
       }
     }
+    if(g_dev_error) {
+      incorrect = true;
+    }
+#ifdef STORE_CHECK
+    drain_store_check();
+    if(g_store_diverged) {
+      incorrect = true;
+    }
+#endif
     if(incorrect or (enable_checker and ss->brk)) {
       break;
     }
@@ -793,6 +1168,18 @@ int main(int argc, char **argv) {
 	  incorrect = true;
 	}
       }
+      for(uint32_t k = 0; k < 16; k++) {
+	const uint64_t iss = (static_cast<uint64_t>(ss->f[2 * k]) << 32) | ss->f[2 * k + 1];
+	const uint64_t rtl = rtl_fp_pair(k);
+	if(rtl != iss) {
+	  ++mismatches;
+	  std::cout << "fp register d" << (2 * k) << " (f" << (2 * k) << ":f" << (2 * k + 1)
+		    << ") does not match : rtl " << std::hex << rtl << " simulator " << iss << std::dec
+		    << " after " << std::hex << last_match_pc << std::dec
+		    << " : " << getAsmString(get_insn(last_match_pc, s), last_match_pc) << "\n";
+	  incorrect = true;
+	}
+      }
       if(s->y != ss->y) {
 	++mismatches;
 	std::cout << "Y does not match : rtl " << std::hex << s->y << " simulator " << ss->y << std::dec
@@ -803,18 +1190,49 @@ int main(int argc, char **argv) {
       if(incorrect) {
 	std::cout << "iss: pc " << std::hex << ss->pc << " npc " << ss->npc << " psr " << ss->get_psr()
 		  << " wim " << ss->wim << std::dec << "\n";
+	if(g_board) {
+	  /* the instruction at the mismatch through each side's memory image (and
+	   * the checker's MMU state): a difference means the RTL's memory diverged */
+	  uint32_t iw_rtl = 0, iw_iss = 0;
+	  state_t probe(*sm0);
+	  probe.mmu_ctrl = ss->mmu_ctrl;
+	  probe.mmu_ctpr = ss->mmu_ctpr;
+	  probe.mmu_ctx = ss->mmu_ctx;
+	  probe.ram_size = ss->ram_size;
+	  {
+	    uint32_t pte = 0, lvl = 0;
+	    uint64_t wpa = 0;
+	    if(debug_walk(ss, static_cast<uint32_t>(last_match_pc), &pte, &lvl, &wpa)) {
+	      std::cout << "walk for " << std::hex << last_match_pc << ": level " << lvl << " pte " << pte << " pa " << wpa << std::dec << "\n";
+	    }
+	  }
+	  bool ok_rtl = debug_fetch(&probe, static_cast<uint32_t>(last_match_pc), &iw_rtl);
+	  bool ok_iss = debug_fetch(ss, static_cast<uint32_t>(last_match_pc), &iw_iss);
+	  std::cout << "insn at " << std::hex << last_match_pc << ": rtl image " << (ok_rtl ? "" : "(no xlate) ") << iw_rtl
+		    << " " << getAsmString(iw_rtl, last_match_pc) << ", iss image " << (ok_iss ? "" : "(no xlate) ") << iw_iss
+		    << " " << getAsmString(iw_iss, last_match_pc) << std::dec << "\n";
+	}
 	std::cout << "rtl registers:\n";
 	dump_regs(s);
+	std::cout << "iss registers:\n";
+	dump_regs(ss);
 	break;
       }
     }
 
     ++last_retire;
+    if(g_board and g_board->cpu_halted) {
+      last_retire = 0;
+    }
     if(last_retire > (1U<<16) && not(tb->in_flush_mode)) {
       std::cerr << "no retire in " << last_retire << " cycles, last retired "
 		<< std::hex << last_retired_pc << std::dec
 		<< " " << getAsmString(get_insn(last_retired_pc, s), last_retired_pc)
-		<< "\ncore state " << static_cast<int>(tb->core_state) << "\n";
+		<< "\ncore state " << static_cast<int>(tb->core_state)
+		<< ", rob head pc " << std::hex << tb->dbg_head_pc << " status " << static_cast<int>(tb->dbg_head_status) << std::dec
+		<< ", checker pc " << std::hex << ss->pc << std::dec << " irl " << ss->irl << " pil " << ss->pil << " et " << ss->et
+		<< ", lsu device reads queued " << g_replay.reads.size() << " writes " << g_replay.writes.size()
+		<< ", l1i state " << static_cast<int>(tb->l1i_state) << " l1d state " << static_cast<int>(tb->l1d_state) << "\n";
       break;
     }
     if(tb->got_break) {
@@ -881,7 +1299,27 @@ int main(int argc, char **argv) {
       last_retire = 0;
       mem_reply_cycle = -1;
       assert(tb->mem_req_valid);
-      if(tb->mem_req_opcode == 4) { /* load line */
+      tb->mem_rsp_bad = 0;
+      const uint64_t pa = tb->mem_req_addr;
+      if(g_board and pa >= s->ram_size) {
+	/* sun4m device space (uncached, so one access per request) */
+	uint32_t d[4] = {0, 0, 0, 0};
+	bool be = false;
+	if(tb->mem_req_opcode == 7) {
+	  for(int i = 0; i < 4; i++) {
+	    d[i] = tb->mem_req_store_data[i];
+	  }
+	}
+	dev_line_access(tb->mem_req_opcode == 7, pa & ~15ULL, m, d, &be);
+	if(tb->mem_req_opcode == 4) {
+	  for(int i = 0; i < 4; i++) {
+	    tb->mem_rsp_load_data[i] = d[i];
+	  }
+	  tb->mem_rsp_bad = be ? 1 : 0;
+	}
+	tb->mem_rsp_valid = 1;
+      }
+      else if(tb->mem_req_opcode == 4) { /* load line */
 	for(int i = 0; i < 4; i++) {
 	  uint32_t ea = (tb->mem_req_addr + 4*i) & (~0U);
 	  tb->mem_rsp_load_data[i] = perform_word_load(s, ea, m);
@@ -1112,6 +1550,10 @@ int main(int argc, char **argv) {
     std::cout << "total_retire = " << total_retire << "\n";
     std::cout << "total_cycle  = " << total_cycle << "\n";
     std::cout << "total ipc    = " << static_cast<double>(total_retire) / total_cycle << "\n";
+#ifdef STORE_CHECK
+    std::cout << "stores checked = " << g_stores_checked << " (unmatched: ISS " << g_iss_stores.size()
+	      << ", RTL " << g_rtl_stores.size() << ")\n";
+#endif
     /* L1D/L1I/L2 access+hit counters (l1d.sv).  Tied off at the henry_soc level,
      * so nothing has ever read them -- print here to establish WHAT THEY COUNT
      * before wiring them to AXI regs. */

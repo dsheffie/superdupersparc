@@ -3,7 +3,7 @@
 //   dst_long : 0 = dest i32, 1 = dest i64
 //   rm[1:0]  : 0=RN 1=RZ(trunc) 2=RP(ceil/+inf) 3=RM(floor/-inf)
 // Covers CVT.W/L (rm=FCSR.RM), TRUNC (RZ), ROUND (RN), CEIL (RP), FLOOR (RM).
-// Out-of-range / NaN / inf -> Invalid (V), value don't-care (R4000 punt);
+// Out-of-range / NaN / inf -> Invalid (V), the saturated value (SPARC);
 // non-integer source -> Inexact (I).
 
 module fpu_f2i(in, fmt, dst_long, rm, out, fflags);
@@ -66,7 +66,9 @@ module fpu_f2i(in, fmt, dst_long, rm, out, fflags);
    wire [63:0] 	 signed_res = sign ? (~mag + 64'd1) : mag;
    wire [63:0] 	 val = dst_long ? signed_res : {32'd0, signed_res[31:0]};
 
-   assign out    = w_overflow ? 64'd0 : val;   // value don't-care on overflow
+   /* SPARC fstoi/fdtoi: NaN and positive overflow give the largest int, negative
+    * overflow the smallest (interpret.cc f2i) */
+   assign out    = !w_overflow ? val : (is_nan | !sign) ? lim_pos : lim_neg;
    assign fflags = {w_overflow, 1'b0, 1'b0, 1'b0, ~w_overflow & w_inexact};
 
 endmodule // fpu_f2i

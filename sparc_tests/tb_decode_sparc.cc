@@ -56,8 +56,14 @@ static inline uint32_t sext13(uint32_t insn) {
   return static_cast<uint32_t>(static_cast<int32_t>(insn << 19) >> 19);
 }
 
-static inline uint32_t fidx(uint32_t r, bool dbl) {
-  return dbl ? (r & ~1u) : r;
+/* the FP arch index of register r: its 64-bit pair (decode_sparc.sv fidx) */
+static inline uint32_t fidx(uint32_t r) {
+  return r & ~1u;
+}
+/* the part of its pair an operand is: 0 a double, 1 a single in the low
+ * word (odd r), 2 in the high word (even r) */
+static inline uint32_t fsel(uint32_t r, bool dbl) {
+  return dbl ? 0 : ((r & 1) ? 1 : 2);
 }
 
 int main(int argc, char **argv) {
@@ -227,7 +233,9 @@ int main(int argc, char **argv) {
     };
 
     /* 1: decode-time traps */
-    const bool iss_dec_trap = trapped and decode_tt(tt);
+    /* an unimplemented FPop (ftt 3) is the decoder's fp_exception too */
+    const bool iss_dec_trap = trapped and (decode_tt(tt) or
+					   ((tt == TT_FP_EXCEPTION) and (((s->fsr >> FSR_FTT_SHIFT) & 7) == FTT_UNIMP)));
     /* WRPSR's CWP-range check is the ISS's illegal_instruction too, but it
      * depends on the operand: an execution-time trap */
     const bool wrpsr_cwp = trapped and (tt == TT_ILLEGAL) and tb->is_wrpsr;
@@ -390,18 +398,26 @@ int main(int argc, char **argv) {
 	    if(sh.opf != opf) {
 	      continue;
 	    }
-	    const uint32_t a = sh.unary ? fidx(rs2, sh.sd) : fidx(rs1, sh.sd);
-	    if(not tb->fp_srcA_valid or tb->srcA != a or tb->fp_srcB_valid == sh.unary or
-	       (not sh.unary and tb->srcB != fidx(rs2, sh.sd)) or
-	       not tb->fp_dst_valid or tb->dst != fidx(rd, sh.dd)) {
+	    const uint32_t ra = sh.unary ? rs2 : rs1;
+	    /* jmp_imm (imm32[31:16]): [2:1] srcA's part, [4:3] srcB's, [5] a single
+	     * destination (its old pair is srcC), [0] that it is the high word */
+	    const uint32_t hi = tb->imm32 >> 16;
+	    const uint32_t want_hi = (fsel(ra, sh.sd) << 1) | (fsel(rs2, sh.sd) << 3) |
+				     ((sh.dd ? 0u : 1u) << 5) | ((rd & 1) ? 0u : 1u);
+	    if(not tb->fp_srcA_valid or tb->srcA != fidx(ra) or tb->fp_srcB_valid == sh.unary or
+	       (not sh.unary and tb->srcB != fidx(rs2)) or
+	       not tb->fp_dst_valid or tb->dst != fidx(rd) or
+	       tb->fp_srcC_valid == sh.dd or (not sh.dd and tb->srcC != fidx(rd)) or
+	       hi != want_hi) {
 	      fail("FPop1 operands");
 	    }
 	  }
 	}
 	else if(opf == 0x051 or opf == 0x052 or opf == 0x055 or opf == 0x056) {
 	  const bool d = (opf & 3) == 2;
-	  if(tb->srcA != fidx(rs1, d) or tb->srcB != fidx(rs2, d) or not tb->fp_srcA_valid or
-	     not tb->fp_srcB_valid or not tb->fcr_dst_valid or (tb->imm32 & 1) != ((opf >> 2) & 1)) {
+	  if(tb->srcA != fidx(rs1) or tb->srcB != fidx(rs2) or not tb->fp_srcA_valid or
+	     not tb->fp_srcB_valid or not tb->fcr_dst_valid or ((tb->imm32 >> 6) & 1) != ((opf >> 2) & 1) or
+	     (tb->imm32 >> 16) != ((fsel(rs1, d) << 1) | (fsel(rs2, d) << 3))) {
 	    fail("fcmp operands");
 	  }
 	}
@@ -416,8 +432,11 @@ int main(int argc, char **argv) {
 	 * carries in srcC (the LSU's index slot; srcB is its store data) */
 	const bool op2_valid = (op == 3) ? tb->srcC_valid : tb->srcB_valid;
 	const uint32_t op2_ptr = (op == 3) ? tb->srcC : tb->srcB;
+	/* an FP memory op's jmp_imm is its half bit: the AGU sign-extends imm alone */
+	const bool fp_mem = (op == 3) and ((op3 & 0x20) != 0);
+	const uint32_t imm_mask = fp_mem ? 0xffffu : 0xffffffffu;
 	if(not tb->srcA_valid or tb->srcA != w_rs1 or op2_valid != op2_reg or
-	   (op2_reg and op2_ptr != w_rs2) or (not op2_reg and tb->imm32 != op2_imm)) {
+	   (op2_reg and op2_ptr != w_rs2) or (not op2_reg and (tb->imm32 & imm_mask) != (op2_imm & imm_mask))) {
 	  fail("rs1 / operand 2");
 	}
 	if(op == 2 and op3 == 0x3a) {
@@ -431,12 +450,16 @@ int main(int argc, char **argv) {
 	  const uint32_t base = fp ? op3 : (op3 & 0xf);
 	  const bool alt = not fp and (op3 & 0x10);
 	  const bool int_data = not fp and (base == 0x4 or base == 0x5 or base == 0x6 or base == 0x7 or base == 0xf);
-	  const bool fp_data = fp and (op3 == 0x24 or op3 == 0x27);
+	  /* stf/stdf read their data, ldf the old pair it merges into */
+	  const bool fp_data = fp and (op3 == 0x20 or op3 == 0x24 or op3 == 0x27);
 	  if(tb->srcB_valid != int_data or (int_data and tb->srcB != w_rd)) {
 	    fail("store data register");
 	  }
-	  if(tb->fp_srcB_valid != fp_data or (fp_data and tb->srcB != fidx(rd, op3 == 0x27))) {
+	  if(tb->fp_srcB_valid != fp_data or (fp_data and tb->srcB != fidx(rd))) {
 	    fail("fp store data register");
+	  }
+	  if(fp and ((tb->imm32 >> 16) != (((op3 & 3) == 0 and not (rd & 1)) ? 1u : 0u))) {
+	    fail("fp single half");
 	  }
 	  if(tb->fp_srcC_valid) {
 	    fail("memory op with an fp srcC");

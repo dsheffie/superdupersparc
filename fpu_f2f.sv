@@ -2,7 +2,9 @@
 //   to_double : 1 = f32 -> f64 (CVT.D.S, widen, exact)
 //               0 = f64 -> f32 (CVT.S.D, narrow, rounds; rm picks mode)
 // Denormal operand or a narrowing result that underflows -> denorm (punt, R4000
-// E-trap); narrowing overflow -> inf/max by rm (O,I); NaN propagated (V on sNaN).
+// E-trap); narrowing overflow -> inf/max by rm (O,I); NaN payload kept, quieted (V on sNaN).
+
+`include "fp_nan.vh"
 
 module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    input  logic [63:0] in;
@@ -20,14 +22,8 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    wire 	 s_inf  = (&s_exp) & ~(|s_frac);
    wire 	 s_zero = (s_exp == 8'd0) & ~(|s_frac);
    wire 	 s_den  = (s_exp == 8'd0) &  (|s_frac);
-/* MIPS legacy NaN semantics (the R4400 predates IEEE-754-2008 and has no FCSR.NAN2008 bit):
- *   - a NaN is SIGNALING when its fraction MSB is SET (the inverse of the 2008 rule);
- *   - default-NaN mode is always on: ANY NaN result is the architectural default NaN,
- *     the input NaN's payload is NOT propagated;
- *   - default NaN = 0x7FF7FFFFFFFFFFFF (double) / 0x7FBFFFFF (single): sign 0, exponent all
- *     ones, fraction = 0 followed by all ones.
- * Verified against a MIPS-legacy Berkeley SoftFloat specialization via TestFloat. */
-   wire 	 s_snan = s_nan & s_frac[22];
+/* SPARC NaN semantics (fp_nan.vh): IEEE quiet bit, a NaN keeps its payload, quieted */
+   wire 	 s_snan = s_nan & !s_frac[22];
 
    // ---- source f64 fields (narrow) ----
    wire 	 d_sign = in[63];
@@ -37,10 +33,10 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    wire 	 d_inf  = (&d_exp) & ~(|d_frac);
    wire 	 d_zero = (d_exp == 11'd0) & ~(|d_frac);
    wire 	 d_den  = (d_exp == 11'd0) &  (|d_frac);
-   wire 	 d_snan = d_nan & d_frac[51];
+   wire 	 d_snan = d_nan & !d_frac[51];
 
    // ===== widen f32 -> f64 (exact) =====
-   wire [63:0] 	 wide_nan  = {1'b0, 11'h7ff, 1'b0, 51'h7ffffffffffff};   /* default NaN, not propagated */
+   wire [63:0] 	 wide_nan  = {s_sign, 11'h7ff, 1'b1, s_frac[21:0], 29'd0};   /* the payload, quieted */
    wire [63:0] 	 wide_inf  = {s_sign, 11'h7ff, 52'd0};
    wire [63:0] 	 wide_zero = {s_sign, 63'd0};
    wire [10:0] 	 wide_exp  = {3'd0, s_exp} + 11'd896;   // bias 1023 - 127
@@ -48,7 +44,7 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    wire [63:0] 	 wide_y = s_nan ? wide_nan : s_inf ? wide_inf : s_zero ? wide_zero : wide_norm;
 
    // ===== narrow f64 -> f32 (round 52->23) =====
-   wire [31:0] 	 narrow_nan  = {1'b0, 8'hff, 1'b0, 22'h3fffff};           /* default NaN, not propagated */
+   wire [31:0] 	 narrow_nan  = {d_sign, 8'hff, 1'b1, d_frac[50:29]};         /* the payload's top, quieted */
    wire [31:0] 	 narrow_inf  = {d_sign, 8'hff, 23'd0};
    wire [31:0] 	 narrow_zero = {d_sign, 31'd0};
 
@@ -78,7 +74,9 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
 		 n_overflow ? n_ovf_y : narrow_norm;
 
    wire 	 n_is_special = d_nan | d_inf | d_zero;
-   wire 	 narrow_denorm = d_den | (~n_is_special & n_underflow);
+   /* the unfinished_FPop punt: a denormal operand, or a value below the smallest
+    * single normal before rounding (interpret.cc fp_unfinished) */
+   wire 	 narrow_denorm = d_den | (~n_is_special & (n_e <= 13'sd0));
 
    // ===== select =====
    assign out = to_double ? wide_y : {32'd0, narrow_y32};

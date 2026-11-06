@@ -119,8 +119,10 @@ module fpu(clk,
    /* one unified single/double comparator (fmt selects format).  All 16 C.cond
     * predicates handled in-unit via cmp_cond; fmt picks the operand width. */
    wire 			   w_cmp;
-   wire 			   w_is_cmp = (opcode == SP_CMP) || (opcode == DP_CMP);
-   wire 			   w_cmp_fmt = (opcode == DP_CMP);
+   wire [1:0] 			   w_fcc;
+   wire 			   w_is_cmp = (opcode == SP_CMP) || (opcode == DP_CMP) ||
+					      (opcode == S_FCMPS) || (opcode == S_FCMPD);
+   wire 			   w_cmp_fmt = (opcode == DP_CMP) || (opcode == S_FCMPD);
 
    fpu_compare #(.D(FPU_LAT))
    scmp(.clk(clk),
@@ -130,6 +132,7 @@ module fpu(clk,
 	.cond(cmp_cond),
 	.fmt(w_cmp_fmt),
 	.y(w_cmp),
+	.fcc(w_fcc),
 	.fflags(w_cmp_fflags));
 
    
@@ -205,7 +208,7 @@ module fpu(clk,
 	       y = t_mult_result;
 	       val = r_val[0];
 	    end
-	  DP_MUL:
+	  DP_MUL, S_FSMULD:
 	    begin
 	       y = t_mult_result;
 	       val = r_val[0];
@@ -222,6 +225,12 @@ module fpu(clk,
 	    begin
 	       cmp_val = r_val[0];
 	       y = handle_fcr(w_cmp, r_fcr_sel[0], fcr_reg);
+	    end
+	  S_FCMPS, S_FCMPD:
+	    begin
+	       /* SPARC: all of fcc (the FCR register's [1:0]) */
+	       cmp_val = r_val[0];
+	       y = {62'd0, w_fcc};
 	    end
 `ifdef ENABLE_MIPS4
 	  SP_MADD, DP_MADD, SP_MSUB, DP_MSUB, SP_NMADD, DP_NMADD, SP_NMSUB, DP_NMSUB:
@@ -252,7 +261,7 @@ module fpu(clk,
 	case(r_opcode[0])
 	  SP_ADD, SP_SUB, DP_ADD, DP_SUB:
 	    begin fflags = w_add_fflags; denorm = w_add_denorm; end
-	  SP_MUL, DP_MUL:
+	  SP_MUL, DP_MUL, S_FSMULD:
 	    begin fflags = w_mul_fflags; denorm = w_mul_denorm; end
 `ifdef ENABLE_MIPS4
 	  SP_MADD, DP_MADD, SP_MSUB, DP_MSUB, SP_NMADD, DP_NMADD, SP_NMSUB, DP_NMSUB:
@@ -261,7 +270,7 @@ module fpu(clk,
 	       denorm = w_add_denorm | r_mflags[0][5];
 	    end
 `endif
-	  SP_CMP, DP_CMP:
+	  SP_CMP, DP_CMP, S_FCMPS, S_FCMPD:
 	    fflags = w_cmp_fflags;
 	  /* DIV/SQRT + any unimplemented COP1: raise E (denorm) -> FPE at retirement,
 	   * OS soft-float emulates */
@@ -338,12 +347,25 @@ module fpu(clk,
    
    /* one unified single/double multiplier: fmt selects format.
     * Rounding mode comes from FCSR.RM (the rm port). */
-   wire w_mul_is_double = (opcode == DP_MUL) || madd_dbl(opcode);
-   wire w_mul_en        = (opcode == SP_MUL) || (opcode == DP_MUL) || is_madd(opcode);
+   wire w_fsmuld        = (opcode == S_FSMULD);
+   wire w_mul_is_double = (opcode == DP_MUL) || madd_dbl(opcode) || w_fsmuld;
+   wire w_mul_en        = (opcode == SP_MUL) || (opcode == DP_MUL) || is_madd(opcode) || w_fsmuld;
+   /* fsmuld: the singles widened as they stand (no quieting: the quiet bit lands
+    * on the double's, so the double multiply picks and quiets a NaN as the single
+    * one would), then a double multiply, always exact (24x24 bits, no over- or
+    * underflow).  A denormal widens to a double denormal: the E punt, as for a
+    * single multiply. */
+   function automatic logic [63:0] widen32(input logic [31:0] x);
+      begin
+	 widen32 = (x[30:23] == 8'hff) ? {x[31], 11'h7ff, x[22:0], 29'd0} :
+		   (x[30:23] == 8'h00) ? {x[31], 11'h000, x[22:0], 29'd0} :
+		   {x[31], {3'd0, x[30:23]} + 11'd896, x[22:0], 29'd0};
+      end
+   endfunction // widen32
    fpu_mul #(.MUL_LAT(FPU_LAT))
    smul (.clk(clk),
-	 .a(src_a),
-	 .b(src_b),
+	 .a(w_fsmuld ? widen32(src_a[31:0]) : src_a),
+	 .b(w_fsmuld ? widen32(src_b[31:0]) : src_b),
 	 .en(w_mul_en),
 	 .rm(rm),
 	 .fmt(w_mul_is_double),

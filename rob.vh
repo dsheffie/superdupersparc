@@ -3,6 +3,7 @@
 
 `include "machine.vh"
 
+
 typedef struct packed {
    logic       faulted;
    logic       is_ii;
@@ -11,6 +12,7 @@ typedef struct packed {
    logic       overflow;
    logic       trap;
    logic       is_bad_addr;
+   mmu_fault_t mmu;
    logic       is_bus_err;   /* the memory response came back bad: DBE (cause 7) */
    logic       is_ret;
    logic       is_call;
@@ -138,6 +140,7 @@ typedef struct packed {
    logic overflow;
    logic trap;
    logic is_bad_addr;
+   mmu_fault_t mmu;
    logic is_bus_err;
    logic [(`M_WIDTH-1):0] target_pc;
    logic take_br;
@@ -188,7 +191,8 @@ typedef struct packed {
    logic [`LG_BPU_TBL_SZ-1:0] bpu_idx;
    logic		    misaligned;
    logic		    bad_va;       /* i-side AdEL: mipsseg bad_perms (access-level / VA out-of-range) */
-   logic		    tlb_miss;
+   logic		    tlb_miss;     /* instruction_access_exception (mmu has the FSR fields) */
+   mmu_fault_t		    mmu;
    logic		    is_branch;
 `ifdef ENABLE_CYCLE_ACCOUNTING
    logic [63:0] 	    fetch_cycle;
@@ -207,8 +211,9 @@ typedef enum logic [2:0] {
    BLK_ST_CONFLICT = 3'd2,  /* same set + byte overlap with a store in the l1d MQ */
    BLK_SB_CONFLICT = 3'd4,  /* overlaps older LSU store(s), cannot forward: wait for them to drain */
    BLK_SB_DATA = 3'd5,      /* would forward, but the youngest overlapping store has no data yet */
-   BLK_UNCACHEABLE = 3'd6   /* uncached (segment or TLB C) and not yet non-speculative:
+   BLK_UNCACHEABLE = 3'd6,  /* uncached (segment or TLB C) and not yet non-speculative:
 			     * re-issue once at the ROB head (or its committable delay slot) */
+   BLK_TLB = 3'd7           /* dtlb miss: re-issue once the walk is done (tlb_busy drops) */
 } blk_code_t;
 
 /* exec LSU -> l1d store-buffer view.  The LSU owns the stores (allocation, age,
@@ -232,8 +237,9 @@ typedef struct packed {
    logic	is_atomic;
    mem_op_t op;
    logic 	bad_addr;   
-   logic	mapped;
+   logic	mapped;     /* SRMMU-translated ASI (0x8-0xb) */
    logic	cached;
+   logic [7:0]	asi;
    logic [`LG_ROB_ENTRIES-1:0] rob_ptr;
    logic [`LG_PRF_ENTRIES-1:0] dst_ptr;
    logic 		       dst_valid;
@@ -292,6 +298,7 @@ typedef struct packed {
    logic [31:0]		       fp_pres;
    logic 		       bad_addr;
    logic 		       bus_err;    /* the bus answered with an error (MC): DBE */
+   mmu_fault_t		       mmu;        /* SRMMU fault (data = the VA) */
    logic 		       lsu_hold;   /* echo of mem_req_t.lsu_hold */
    logic [`LG_MEM_SCHED_ENTRIES-1:0] lsu_idx;
    blk_code_t		       blk;        /* valid with core_mem_blk_valid */
@@ -300,50 +307,24 @@ typedef struct packed {
 } mem_rsp_t;
 
 
-/* tlb_stored_t = what each TLB array slot actually holds.  It is tlb_data_t WITHOUT
- * the `entry` (write-index) field: the array position IS the index, so storing it
- * is pure duplication.  KEEP THESE TWO IN SYNC (same fields/order minus entry) --
- * the write casts tlb_data_t -> tlb_stored_t, which drops the leading `entry`. */
+/* SRMMU table-walk result (mmu.sv -> the L1 TLBs).  level: 0 = a context-table
+ * PTE (4 GB), 1 = 16 MB, 2 = 256 KB, 3 = 4 KB.  On a fault, ft is the fault type
+ * (FT_* below) and level is where the walk stopped. */
 typedef struct packed {
-   logic [11:0] pagemask;
-   logic [7:0]  asid;
-   logic [1:0]  r;      /* region: va[63:62] */
-   logic [`VPN2_WIDTH-1:0] vpn;    /* va[SEGBITS-1:13] */
+   logic	fault;
+   logic [2:0]	ft;
+   logic [1:0]	level;
+   logic [23:0] ppn;    /* PTE[31:8] = PA[35:12] */
+   logic	c;      /* cacheable */
+   logic	m;      /* modified */
+   logic [2:0]	acc;
+} page_walk_rsp_t;
 
-   logic [`TLB_PFN_WIDTH-1:0] pfn0;   /* stored PFN, zero-padded to PFN_WIDTH on read */
-   logic        d0;
-   logic        v0;
-   logic        g0;
-   logic [2:0]  c0;
-
-   logic [`TLB_PFN_WIDTH-1:0] pfn1;   /* stored PFN, zero-padded to PFN_WIDTH on read */
-   logic        d1;
-   logic        v1;
-   logic        g1;
-   logic [2:0]  c1;
-} tlb_stored_t;
-
-/* tlb_data_t = the write-interface (plumbing) type: tlb_stored_t + the `entry`
- * write-index as the leading (MSB) field, so tlb_stored_t'(x) truncates it off. */
-typedef struct packed {
-
-   logic [5:0]  entry;
-   logic [11:0] pagemask;
-   logic [7:0]  asid;
-   logic [1:0]  r;      /* region: va[63:62] */
-   logic [`VPN2_WIDTH-1:0] vpn;    /* va[SEGBITS-1:13] */
-
-   logic [`PFN_WIDTH-1:0] pfn0;   /* pa[PA_WIDTH-1:12] = PA_WIDTH-12 bits (24 for 36-bit PA) */
-   logic        d0;
-   logic        v0;
-   logic        g0;
-   logic [2:0]  c0;
-
-   logic [`PFN_WIDTH-1:0] pfn1;   /* pa[PA_WIDTH-1:12] = PA_WIDTH-12 bits (24 for 36-bit PA) */
-   logic        d1;
-   logic        v1;
-   logic        g1;
-   logic [2:0]  c1;
-} tlb_data_t;
+/* SRMMU fault types (fault status register FT) */
+localparam logic [2:0] FT_NONE        = 3'd0;
+localparam logic [2:0] FT_INVALID     = 3'd1;
+localparam logic [2:0] FT_PROTECTION  = 3'd2;
+localparam logic [2:0] FT_PRIVILEGE   = 3'd3;
+localparam logic [2:0] FT_TRANSLATION = 3'd4;
 
 `endif

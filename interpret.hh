@@ -10,6 +10,7 @@
 #include "sparse_mem.hh"
 
 class sun4m_t;
+class state_t;
 
 /* SPARC V8 golden ISS.
  *
@@ -73,6 +74,7 @@ enum trap_type : uint32_t {
 #define FEXC_NV 0x10
 /* ftt */
 #define FTT_IEEE   1
+#define FTT_UNFINISHED 2
 #define FTT_UNIMP  3
 
 /* superdupersparc presents as a TI SuperSPARC (Viking) sun4m module.  Linux
@@ -94,6 +96,16 @@ enum trap_type : uint32_t {
 enum mmu_ft : uint32_t {
   FT_NONE = 0, FT_INVALID = 1, FT_PROTECTION = 2, FT_PRIVILEGE = 3, FT_TRANSLATION = 4,
   FT_BUS_ERROR = 5
+};
+
+/* an alternative device space for the physical accesses above RAM (the
+ * co-simulation checker replays what the RTL saw there instead of touching the
+ * devices itself); same contract as sun4m_t::read/write */
+class dev_if {
+public:
+  virtual ~dev_if() {}
+  virtual uint32_t read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) = 0;
+  virtual void write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) = 0;
 };
 
 class state_t {
@@ -121,11 +133,21 @@ public:
   uint32_t mmu_ctx = 0;
   uint32_t mmu_fsr = 0;
   uint32_t mmu_far = 0;
+  /* ASI 0x2 module registers (qemu's mxccregs, present even without an MXCC):
+   * [3] control 0x01c00a00, [5] module reset 0x01c00c00, [6] error 0x01c00e00,
+   * [7] MBus port address 0x01c00f00 = (MID 8 + cpu) << 24 */
+  uint64_t mxcc[8] = {0, 0, 0, 0, 0, 0, 0, 8ULL << 24};
+  /* the 32-byte MXCC stream buffer (0x01c00000-0x01c0001f); a store to the
+   * stream source (0x01c00100) fills it from memory, one to the stream
+   * destination (0x01c00200) writes it out: Linux's viking_mxcc_flush_page */
+  uint64_t mxccdata[4] = {0, 0, 0, 0};
 
   /* PA below ram_size is sparse_mem RAM; everything else is sun4m device space
    * (with no sun4m attached -- the user-mode tests -- all 4GB is RAM) */
   uint64_t ram_size = 1ULL << 32;
   sun4m_t *sun4m = nullptr;
+  dev_if *dev = nullptr;     /* when set, device-space accesses go here instead of sun4m */
+  bool ext_irq = false;      /* interrupts are taken only through take_interrupt() (co-sim) */
   bool bus_error = false;    /* set by a physical access to an unassigned address */
 
   uint32_t irl = 0;          /* external interrupt request level, 0 = none */
@@ -134,6 +156,7 @@ public:
   uint32_t last_tt = 0;      /* trap type of the most recent trap, error mode included (tb_decode_sparc) */
   int exit_code = 0;
   uint64_t icnt = 0;
+  uint64_t ntraps = 0;       /* traps taken (interrupts included) */
 
   /* --user: start in user mode and emulate the Linux sparc32 syscall ABI (ta 0x10)
    * plus the kernel's window spill/fill, so the same static ELF runs under
@@ -155,5 +178,28 @@ std::ostream &operator<<(std::ostream &out, const state_t &s);
 
 void initState(state_t *s);
 void execSparc(state_t *s);
+/* take interrupt_level_n now, at s->pc (the co-sim checker, where the RTL took it) */
+void take_interrupt(state_t *s, uint32_t level);
+/* the instruction at va as the CPU would fetch it now (no side effects); false
+ * if it does not translate or is not in RAM/PROM */
+bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn);
+/* the SRMMU walk for va with s's current tables (no R/M updates): its PTE,
+ * level (0-3) and the PA; false if it faults */
+bool debug_walk(state_t *s, uint32_t va, uint32_t *pte, uint32_t *level, uint64_t *pa);
+
+#ifdef STORE_CHECK
+#include <deque>
+/* the co-sim store check (ooo_core's top.cc): each store the ISS writes into
+ * cacheable RAM, in program order (the stores the RTL's L1D writes into its
+ * array, l1d.sv wr_log); data is the stored value, right-justified, size bytes */
+struct store_rec {
+  uint64_t pc;
+  uint64_t addr;
+  uint64_t data;
+  store_rec(uint64_t pc, uint64_t addr, uint64_t data) : pc(pc), addr(addr), data(data) {}
+};
+extern std::deque<store_rec> g_iss_stores;
+extern bool g_store_check;
+#endif
 
 #endif

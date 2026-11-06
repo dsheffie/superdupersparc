@@ -75,6 +75,10 @@ module core_l1d_l1i(clk,
 		    l2_cache_accesses,
 		    l2_cache_hits,
 		    got_break,
+		    irl,
+		    trap_taken,
+		    trap_taken_tt,
+		    trap_taken_pc,
 		    got_ud,
 		    got_bad_addr,
 		    core_state,
@@ -262,6 +266,10 @@ module core_l1d_l1i(clk,
 
    
    output logic 			  got_break;
+   input logic [3:0] 			  irl;
+   output logic 			  trap_taken;
+   output logic [7:0] 			  trap_taken_tt;
+   output logic [31:0] 			  trap_taken_pc;
    output logic 			  got_ud;
    output logic 			  got_bad_addr;
    
@@ -652,8 +660,20 @@ module core_l1d_l1i(clk,
    typedef enum logic [1:0] {
       IDLE = 'd0,
       GNT_L1D = 'd1,
-      GNT_L1I = 'd2			    
+      GNT_L1I = 'd2,
+      GNT_MMU = 'd3
    } state_t;
+
+   /* the SRMMU walker: a third requester on the L1 -> L2 port (uncached word
+    * reads/writes), ahead of both L1s; mem_lock keeps the port for it between a
+    * PTE read and its R/M write-back */
+   wire 				  w_mmu_mem_req_valid;
+   wire [`PA_WIDTH-1:0] 		  w_mmu_mem_req_addr;
+   wire 				  w_mmu_mem_req_store;
+   wire [15:0] 				  w_mmu_mem_req_mask;
+   wire [127:0] 			  w_mmu_mem_req_data;
+   wire 				  w_mmu_mem_lock;
+   logic 				  t_mmu_mem_req_ack, t_mmu_mem_rsp_valid;
    
    logic 				  l1d_mem_req_ack;
    logic 				  l1d_mem_req_valid;
@@ -690,6 +710,7 @@ module core_l1d_l1i(clk,
    logic				  t_l2_req_cacheable;
    logic [15:0]				  t_l2_req_mask;
    logic				  t_l2_passthru;
+   logic [127:0]			  t_l2_req_store_data;
 
 
    
@@ -705,20 +726,34 @@ module core_l1d_l1i(clk,
 	n_req = r_req;
 	
 	//mem_req_valid = n_req;	
-	t_l2_req_addr = (r_state == GNT_L1I) ? l1i_mem_req_addr: l1d_mem_req_addr;
-	//mem_req_store_data = l1d_mem_req_store_data;
-	t_l2_req_opcode = (r_state == GNT_L1I) ? l1i_mem_req_opcode : l1d_mem_req_opcode;
-	t_l2_req_cacheable = (r_state == GNT_L1I) ? l1i_mem_req_cacheable : 
-			     l1d_mem_req_cacheable;
-	t_l2_req_mask = (r_state == GNT_L1I) ? l1i_mem_req_mask : l1d_mem_req_mask;
+	t_l2_req_addr = (r_state == GNT_MMU) ? w_mmu_mem_req_addr :
+			(r_state == GNT_L1I) ? l1i_mem_req_addr : l1d_mem_req_addr;
+	t_l2_req_opcode = (r_state == GNT_MMU) ? (w_mmu_mem_req_store ? MEM_SW : MEM_LW) :
+			  (r_state == GNT_L1I) ? l1i_mem_req_opcode : l1d_mem_req_opcode;
+	t_l2_req_cacheable = (r_state == GNT_MMU) ? 1'b0 :
+			     (r_state == GNT_L1I) ? l1i_mem_req_cacheable : l1d_mem_req_cacheable;
+	t_l2_req_mask = (r_state == GNT_MMU) ? w_mmu_mem_req_mask :
+			(r_state == GNT_L1I) ? l1i_mem_req_mask : l1d_mem_req_mask;
+	t_l2_req_store_data = (r_state == GNT_MMU) ? w_mmu_mem_req_data : l1d_mem_req_store_data;
 	
 	l1d_mem_rsp_valid = 1'b0;
 	l1i_mem_rsp_valid = 1'b0;
+	t_mmu_mem_req_ack = 1'b0;
+	t_mmu_mem_rsp_valid = 1'b0;
 
 	case(r_state)
 	  IDLE:
 	    begin
-	       if(n_l1d_req && !n_l1i_req)
+	       if(w_mmu_mem_req_valid)
+		 begin
+		    n_state = GNT_MMU;
+		    n_req = 1'b1;
+		 end
+	       else if(w_mmu_mem_lock)
+		 begin
+		    /* between a PTE read and its write-back: hold the port */
+		 end
+	       else if(n_l1d_req && !n_l1i_req)
 		 begin
 		    n_state = GNT_L1D;
 		    n_req = 1'b1;
@@ -767,6 +802,20 @@ module core_l1d_l1i(clk,
 		    n_req = 1'b0;		    
 		    n_state = IDLE;
 		    l1i_mem_rsp_valid = 1'b1;
+		 end
+	    end
+	  GNT_MMU:
+	    begin
+	       if(w_l1_mem_req_ack)
+		 begin
+		    n_req = 1'b0;
+		    t_mmu_mem_req_ack = 1'b1;
+		 end
+	       if(w_l1_mem_rsp_valid)
+		 begin
+		    n_req = 1'b0;
+		    n_state = IDLE;
+		    t_mmu_mem_rsp_valid = 1'b1;
 		 end
 	    end
 	  default:
@@ -846,10 +895,10 @@ module core_l1d_l1i(clk,
 	       .l1_mem_req_addr(t_l2_req_addr),
 	       .l1_mem_req_cacheable(t_l2_req_cacheable),
 	       .l1_mem_req_mask(t_l2_req_mask),
-	       .l1_mem_req_store_data(l1d_mem_req_store_data),
+	       .l1_mem_req_store_data(t_l2_req_store_data),
 	       .l1_mem_req_opcode(t_l2_req_opcode),
 	       .l1_mem_req_from_d(r_state != GNT_L1I),
-	       .l1_mem_req_colour((r_state != GNT_L1I) ? l1d_mem_req_colour : '0),
+	       .l1_mem_req_colour(((r_state != GNT_L1I) && (r_state != GNT_MMU)) ? l1d_mem_req_colour : '0),
 		       .l2_nocache(l2_nocache),
 	       
 	       .l1_mem_rsp_valid(w_l1_mem_rsp_valid),
@@ -905,6 +954,68 @@ module core_l1d_l1i(clk,
 	     r_req <= n_req;	     
 	  end
      end
+
+   /* SRMMU walker + registers: walks for the dtlb, the core records faults at
+    * the trap, and M-marks for the dtlb; walks for the itlb. */
+   wire 			  w_dtlb_walk_req;
+   wire [31:0] 			  w_dtlb_walk_va;
+   wire 			  w_dtlb_walk_mark;
+   wire 			  w_itlb_walk_req;
+   wire [31:0] 			  w_itlb_walk_va;
+   wire 			  w_psr_s;
+   wire 			  w_tlb_busy;
+   wire 			  w_mmu_fault_valid;
+   mmu_fault_t 			  w_mmu_fault;
+   wire [31:0] 			  w_mmu_fault_va;
+   wire 			  w_mmu_ctrl_e;
+   wire [`SRMMU_CTX_BITS-1:0] 	  w_mmu_ctx;
+   page_walk_rsp_t 		  w_page_walk_rsp;
+   wire 			  w_dtlb_walk_probe;
+   wire [31:0] 			  w_walk_pte;
+   wire 			  w_mmu_l1i_rsp_valid, w_mmu_l1d_rsp_valid;
+   wire w_mmureg_wr, w_mmureg_fsr_clr, w_tlb_flush, w_asi_tlb_flush;
+   wire [2:0] w_mmureg_sel;
+   wire [31:0] w_mmureg_wdata, w_mmureg_ctrl, w_mmureg_ctpr, w_mmureg_fsr, w_mmureg_far;
+   mmu mmu0(
+	    .clk(clk),
+	    .reset(reset),
+	    .ctrl_e(w_mmu_ctrl_e),
+	    .ctx(w_mmu_ctx),
+	    .l1i_req(w_itlb_walk_req),
+	    .l1i_va(w_itlb_walk_va),
+	    .l1d_req(w_dtlb_walk_req),
+	    .l1d_va(w_dtlb_walk_va),
+	    .l1d_mark(w_dtlb_walk_mark),
+	    .l1d_probe(w_dtlb_walk_probe),
+	    .page_walk_rsp(w_page_walk_rsp),
+	    .walk_pte(w_walk_pte),
+	    .l1i_rsp_valid(w_mmu_l1i_rsp_valid),
+	    .l1d_rsp_valid(w_mmu_l1d_rsp_valid),
+	    .fault_valid(w_mmu_fault_valid),
+	    .fault_ft(w_mmu_fault.ft),
+	    .fault_level(w_mmu_fault.level),
+	    .fault_at(w_mmu_fault.at),
+	    .fault_va(w_mmu_fault_va),
+	    .mem_req_valid(w_mmu_mem_req_valid),
+	    .mem_req_addr(w_mmu_mem_req_addr),
+	    .mem_req_store(w_mmu_mem_req_store),
+	    .mem_req_mask(w_mmu_mem_req_mask),
+	    .mem_req_data(w_mmu_mem_req_data),
+	    .mem_lock(w_mmu_mem_lock),
+	    .mem_req_ack(t_mmu_mem_req_ack),
+	    .mem_rsp_valid(t_mmu_mem_rsp_valid),
+	    .mem_rsp_data(w_l1_mem_load_data),
+	    .reg_wr(w_mmureg_wr),
+	    .reg_fsr_clr(w_mmureg_fsr_clr),
+	    .reg_sel(w_mmureg_sel),
+	    .reg_wdata(w_mmureg_wdata),
+	    .reg_ctrl(w_mmureg_ctrl),
+	    .reg_ctpr(w_mmureg_ctpr),
+	    .reg_fsr(w_mmureg_fsr),
+	    .reg_far(w_mmureg_far),
+	    .flush_req(w_asi_tlb_flush),
+	    .tlb_flush(w_tlb_flush)
+	    );
 
    logic 			  drain_ds_complete;
    logic [(1<<`LG_ROB_ENTRIES)-1:0] dead_rob_mask;
@@ -980,7 +1091,27 @@ module core_l1d_l1i(clk,
 	       .mem_rsp_load_data(w_l1_mem_load_data),
 
 	       .cache_accesses(l1d_cache_accesses),
-	       .cache_hits(l1d_cache_hits)
+	       .cache_hits(l1d_cache_hits),
+	       .mmu_ctrl_e(w_mmu_ctrl_e),
+	       .mmu_ctx(w_mmu_ctx),
+	       .page_walk_req_valid(w_dtlb_walk_req),
+	       .page_walk_req_va(w_dtlb_walk_va),
+	       .page_walk_req_mark(w_dtlb_walk_mark),
+	       .page_walk_req_probe(w_dtlb_walk_probe),
+	       .page_walk_rsp_valid(w_mmu_l1d_rsp_valid),
+	       .page_walk_rsp(w_page_walk_rsp),
+	       .page_walk_pte(w_walk_pte),
+	       .tlb_busy(w_tlb_busy),
+	       .mmureg_wr(w_mmureg_wr),
+	       .mmureg_fsr_clr(w_mmureg_fsr_clr),
+	       .mmureg_sel(w_mmureg_sel),
+	       .mmureg_wdata(w_mmureg_wdata),
+	       .mmureg_ctrl(w_mmureg_ctrl),
+	       .mmureg_ctpr(w_mmureg_ctpr),
+	       .mmureg_fsr(w_mmureg_fsr),
+	       .mmureg_far(w_mmureg_far),
+	       .asi_tlb_flush(w_asi_tlb_flush),
+	       .tlb_flush(w_tlb_flush)
 	       );
 
    l1i icache(
@@ -1030,7 +1161,15 @@ module core_l1d_l1i(clk,
 	      .mem_rsp_valid(l1i_mem_rsp_valid),
 	      .mem_rsp_load_data(w_l1_mem_load_data),
 	      .cache_accesses(l1i_cache_accesses),
-	      .cache_hits(l1i_cache_hits)
+	      .cache_hits(l1i_cache_hits),
+	      .mmu_ctrl_e(w_mmu_ctrl_e),
+	      .mmu_ctx(w_mmu_ctx),
+	      .tlb_flush(w_tlb_flush),
+	      .psr_s(w_psr_s),
+	      .page_walk_req_valid(w_itlb_walk_req),
+	      .page_walk_req_va(w_itlb_walk_va),
+	      .page_walk_rsp_valid(w_mmu_l1i_rsp_valid),
+	      .page_walk_rsp(w_page_walk_rsp)
 	      );
 
    core cpu (
@@ -1148,6 +1287,10 @@ module core_l1d_l1i(clk,
 	     .retired_rob_ptr(retired_rob_ptr),
 	     .retired_rob_ptr_two(retired_rob_ptr_two),
 	     .got_break(got_break),
+	     .irl(irl),
+	     .trap_taken(trap_taken),
+	     .trap_taken_tt(trap_taken_tt),
+	     .trap_taken_pc(trap_taken_pc),
 	     .got_ud(got_ud),
 	     .got_bad_addr(got_bad_addr),
 	     .core_state(core_state),
@@ -1168,7 +1311,12 @@ module core_l1d_l1i(clk,
 	     .dbg_oldest_first_pending(dbg_oldest_first_pending),
 	     .dbg_trace_index(dbg_trace_index),
 	     .dbg_trace_data(w_core_trace_data),
-	     .dbg_trace_wptr(w_core_trace_wptr)
+	     .dbg_trace_wptr(w_core_trace_wptr),
+	     .mmu_fault_valid(w_mmu_fault_valid),
+	     .mmu_fault(w_mmu_fault),
+	     .mmu_fault_va(w_mmu_fault_va),
+	     .tlb_busy(w_tlb_busy),
+	     .psr_s(w_psr_s)
 	     );
 
    /* ---- L2<->AXI event trace ring (debug the uncached-turnaround deadlock) ----

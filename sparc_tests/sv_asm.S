@@ -13,9 +13,8 @@ trap_table:
 	.endr
 	ba window_overflow; nop; nop; nop	/* tt 0x05 */
 	ba window_underflow; nop; nop; nop	/* tt 0x06 */
-	.rept 2
 	rd %tbr, %g7; ba bad_trap; nop; nop
-	.endr
+	ba fp_trap; nop; nop; nop		/* tt 0x08 */
 	ba data_fault; nop; nop; nop		/* tt 0x09 */
 	.rept 0x11 - 10
 	rd %tbr, %g7; ba bad_trap; nop; nop
@@ -120,6 +119,21 @@ irq_trap:
 	jmp %l1
 	rett %l2
 
+/* fp_exception (precise, the FQ empty): log the FSR (its ftt says why) and skip
+ * the FPop, leaving its destination as it was -- an OS would emulate it here */
+	.globl fp_traps, fp_fsr_log
+fp_trap:
+	set fp_traps, %l4
+	ld [%l4], %l5
+	and %l5, 63, %l6
+	sll %l6, 2, %l6
+	set fp_fsr_log, %l7
+	st %fsr, [%l7 + %l6]
+	add %l5, 1, %l5
+	st %l5, [%l4]
+	jmp %l2
+	rett %l2 + 4
+
 soft_trap:			/* g5++, resume after the ta */
 	add %g5, 1, %g5
 	jmp %l2
@@ -148,6 +162,8 @@ mmu_far_seen:	.word 0
 mmu_faults:	.word 0
 irq_seen:	.word 0
 irq_count:	.word 0
+fp_traps:	.word 0
+fp_fsr_log:	.skip 256
 
 	.bss
 	.align 16

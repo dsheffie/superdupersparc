@@ -36,6 +36,8 @@ import "DPI-C" function void pt_retire(input int rob_ptr);
 `endif
 import "DPI-C" function void record_ds_restart(input int delay_cycles);
 import "DPI-C" function int check_insn_bytes(input longint pc, input int data);
+/* the co-sim checker's copy of the FP retire RAT (top.cc: the FP register compare) */
+import "DPI-C" function void fp_rrat_wr(input int arch, input int preg);
 
 
 `endif
@@ -164,6 +166,10 @@ module core(clk,
 	    retired_rob_ptr_two,
 	    
 	    got_break,
+	    irl,
+	    trap_taken,
+	    trap_taken_tt,
+	    trap_taken_pc,
 	    got_ud,
 	    got_bad_addr,
 	    core_state,
@@ -185,7 +191,12 @@ module core(clk,
 	    dbg_oldest_first_pending,
 	    dbg_trace_index,
 	    dbg_trace_data,
-	    dbg_trace_wptr);
+	    dbg_trace_wptr,
+	    mmu_fault_valid,
+	    mmu_fault,
+	    mmu_fault_va,
+	    tlb_busy,
+	    psr_s);
 
    input logic clk;
    input logic reset;
@@ -351,6 +362,13 @@ module core(clk,
    
    
    output logic 			  got_break;
+   /* the external interrupt request level (sun4m interrupt controller), 0 = none */
+   input logic [3:0] 			  irl;
+   /* a trap was taken this cycle (tt, the trapped pc): the harness steps the
+    * checker into an interrupt with it */
+   output logic 			  trap_taken;
+   output logic [7:0] 			  trap_taken_tt;
+   output logic [31:0] 			  trap_taken_pc;
    output logic 			  got_ud;
    output logic 			  got_bad_addr;
    output logic [`LG_ROB_ENTRIES:0] 	  inflight;
@@ -378,6 +396,16 @@ module core(clk,
    input logic [19:0] dbg_trace_index;
    output logic [31:0] 			  dbg_trace_data;
    output logic [15:0] 			  dbg_trace_wptr;
+   /* a trap on an SRMMU fault: the walker records it in its fault status and
+    * address registers */
+   output logic 			  mmu_fault_valid;
+   output mmu_fault_t 			  mmu_fault;
+   output logic [31:0] 			  mmu_fault_va;
+   /* a dtlb walk is pending: BLK_TLB loads/stores wait it out in the LSU */
+   input logic 				  tlb_busy;
+   /* PSR.S, committed: the L1I's ASI (0x8/0x9) for the itlb's permission check
+    * (it changes only at a trap or a serializing rett/wrpsr, both restart fetch) */
+   output logic 			  psr_s;
 
    /* the trapping instruction's pc (error-mode halt reports it as epc) */
    logic [`M_WIDTH-1:0]			  r_epc, n_epc;
@@ -389,6 +417,15 @@ module core(clk,
     * clusters (prf_pool_split: ALU = the low half, MEM = the high half) and a
     * writer allocates from its own, so the arch registers are split between
     * them: identity-mapping all 136 would fill the ALU cluster and starve it. */
+   /* the flat arch register index (0..N_INT_ARCH-1) rides in PRF-width uop fields;
+    * narrow it to index the integer RATs */
+   localparam LG_N_INT_ARCH = $clog2(`N_INT_ARCH_REGS);
+   function automatic logic [LG_N_INT_ARCH-1:0] arch_idx(input logic [`LG_PRF_ENTRIES-1:0] a);
+      begin
+	 arch_idx = a[LG_N_INT_ARCH-1:0];
+      end
+   endfunction // arch_idx
+
    function automatic logic [`LG_PRF_ENTRIES-1:0] reset_preg(input integer a);
       begin
 	 integer t;
@@ -531,6 +568,7 @@ module core(clk,
       r.overflow = e.overflow;
       r.trap = e.trap;
       r.is_bad_addr = e.is_bad_addr;
+      r.mmu = e.mmu;
       r.is_bus_err = e.is_bus_err;
       r.target_pc = e.target_pc;
       r.take_br = e.take_br;
@@ -557,6 +595,7 @@ module core(clk,
       r.overflow = c.overflow;
       r.trap = c.trap;
       r.is_bad_addr = c.is_bad_addr;
+      r.mmu = c.mmu;
       r.is_bus_err = c.is_bus_err;
       r.is_ret = m.is_ret;
       r.is_call = m.is_call;
@@ -1056,7 +1095,9 @@ module core(clk,
     * be allowed to issue -- unless it is the NULLIFIED slot of a not-taken
     * branch-likely: an oldest_first op there (mtc0 EntryLo/Index, tlbwr, an uncached
     * access) would otherwise execute its side effect and then be discarded. */
-   assign head_of_rob_ptr_valid = (r_state == ACTIVE) |
+   /* WAIT_FOR_SERIALIZE_AND_RESTART: the serializing op is alone in the ROB (an
+    * SRMMU register access, performed by the l1d at the head) */
+   assign head_of_rob_ptr_valid = (r_state == ACTIVE) | (r_state == WAIT_FOR_SERIALIZE_AND_RESTART) |
 				  ( (r_state==DRAIN) && !r_ds_done &&
 				    !(r_has_nullifying_delay_slot && !r_take_br) );
    assign head_of_rob_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
@@ -1569,7 +1610,7 @@ module core(clk,
 		       (dbg_trace_index[4:0] == 5'd3) ? {{(32-N_ROB_ENTRIES){1'b0}}, r_rob_inflight} :
 		       (dbg_trace_index[4:0] == 5'd4) ? {24'd0, mem_quiet, mem_color_busy, restart_color, w_exec_color_pending, memq_empty, 1'b0} :
 		       (dbg_trace_index[4:0] == 5'd5) ? r_snap_since_retire :
-		       (dbg_trace_index[4:0] == 5'd6) ? {1'b0, r_alloc_rat[27], 1'b0, r_retire_rat[27], 1'b0, r_alloc_rat[26], 1'b0, r_retire_rat[26]} :
+		       (dbg_trace_index[4:0] == 5'd6) ? {1'b0, r_alloc_rat[arch_idx(27)], 1'b0, r_retire_rat[arch_idx(27)], 1'b0, r_alloc_rat[arch_idx(26)], 1'b0, r_retire_rat[arch_idx(26)]} :
 		       (dbg_trace_index[4:0] == 5'd7) ? {{(8-`LG_ROB_ENTRIES-1){1'b0}}, r_rob_tail_ptr, 24'd0} :
 		       (dbg_trace_index[4:0] >= 5'd8 && dbg_trace_index[4:0] < 5'd18) ? w_dbg_exec_snap[{dbg_trace_index[4:0] - 5'd8, 5'd0} +: 32] :
 		       32'hDEADBEEF;
@@ -2214,6 +2255,7 @@ module core(clk,
 		       (t_rob_head.is_ii |
 			t_rob_head.is_fpe |
 			t_rob_head.is_bad_addr |
+			t_rob_head.mmu.fault |
 			t_rob_head.is_bus_err |
 			t_rob_head.overflow | 
 			t_rob_head.trap | 
@@ -2525,7 +2567,11 @@ module core(clk,
 	    end
 	  WAIT_FOR_SERIALIZE_AND_RESTART:
 	    begin
-	       if(t_rob_head_complete)
+	       /* a SPARC flush makes earlier stores visible to instruction fetch: its
+		* L1I line invalidate (and the refetch, whose fill probes the L1D)
+		* waits for every older store to be written into the L1D -- an LSU
+		* store slot frees only when the l1d has written it (st_done) */
+	       if(t_rob_head_complete && !((t_rob_head.opcode == S_FLUSH) && w_lsu_st_pending))
 		 begin
 		    if(t_rob_head.is_cache | is_xflush(t_rob_head.opcode))
 		      begin
@@ -2911,6 +2957,21 @@ module core(clk,
 	     r_fp_retire_rat <= n_fp_retire_rat;
 	  end
      end // always_ff@ (posedge clk)
+`ifdef VERILATOR
+   always_ff@(posedge clk)
+     begin
+	if(!reset)
+	  begin
+	     for(integer i = 0; i < 32; i = i + 2)
+	       begin
+		  if(n_fp_retire_rat[i] != r_fp_retire_rat[i])
+		    begin
+		       fp_rrat_wr(i, 32'(n_fp_retire_rat[i]));
+		    end
+	       end
+	  end
+     end // always_ff@ (posedge clk)
+`endif
 
    // always_ff@(negedge clk)
    //   begin
@@ -2962,11 +3023,11 @@ module core(clk,
 	
 	if(t_uop.srcA_valid)
 	  begin
-	     t_alloc_uop.srcA = r_alloc_rat[t_uop.srcA];
+	     t_alloc_uop.srcA = r_alloc_rat[arch_idx(t_uop.srcA)];
 	  end
 	if(t_uop.srcB_valid)
 	  begin
-	     t_alloc_uop.srcB = r_alloc_rat[t_uop.srcB];
+	     t_alloc_uop.srcB = r_alloc_rat[arch_idx(t_uop.srcB)];
 	  end
 	/* FP sources: looked up in the FP RAT (mutually exclusive with the int valids above) */
 	if(t_uop.fp_srcA_valid)
@@ -2975,7 +3036,7 @@ module core(clk,
 	  t_alloc_uop.srcB = r_fp_alloc_rat[t_uop.srcB[4:0]];
 	if(t_uop.srcD_valid)
 	  begin
-	     t_alloc_uop.srcD = r_alloc_rat[t_uop.srcD];
+	     t_alloc_uop.srcD = r_alloc_rat[arch_idx(t_uop.srcD)];
 	  end
 	/* an icc reader's srcC is the youngest icc writer's register */
 	if(t_uop.flags_src_valid)
@@ -2984,7 +3045,7 @@ module core(clk,
 	  end
 	else if(t_uop.srcC_valid)
 	  begin
-	     t_alloc_uop.srcC = r_alloc_rat[t_uop.srcC];
+	     t_alloc_uop.srcC = r_alloc_rat[arch_idx(t_uop.srcC)];
 	  end
 	if(t_uop.fp_srcC_valid)
 	  t_alloc_uop.srcC = r_fp_alloc_rat[t_uop.srcC[4:0]];
@@ -3003,12 +3064,12 @@ module core(clk,
 	if(t_uop2.srcA_valid)
 	  begin
 	     t_alloc_uop2.srcA = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcA == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[t_uop2.srcA];
+				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcA)];
 	  end
 	if(t_uop2.srcB_valid )
 	  begin
 	     t_alloc_uop2.srcB = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcB == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[t_uop2.srcB];
+				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcB)];
 	  end
 	/* FP sources for slot 1, with bypass from a slot-0 FP dst */
 	if(t_uop2.fp_srcA_valid)
@@ -3020,7 +3081,7 @@ module core(clk,
 	if(t_uop2.srcD_valid)
 	  begin
 	     t_alloc_uop2.srcD = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcD == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[t_uop2.srcD];
+				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcD)];
 	  end
 	if(t_uop2.flags_src_valid)
 	  begin
@@ -3029,7 +3090,7 @@ module core(clk,
 	else if(t_uop2.srcC_valid)
 	  begin
 	     t_alloc_uop2.srcC = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcC == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[t_uop2.srcC];
+				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcC)];
 	  end
 	if(t_uop2.fp_srcC_valid)
 	  t_alloc_uop2.srcC = (t_uop.fp_dst_valid && (t_uop2.srcC[4:0] == t_uop.dst[4:0])) ?
@@ -3055,7 +3116,7 @@ module core(clk,
 		  /* a write to %g0 (cmp) gets a register but leaves %g0 mapped to p0 */
 		  if(t_uop.dst != 'd0)
 		    begin
-		       n_alloc_rat[t_uop.dst] = n_prf_entry;
+		       n_alloc_rat[arch_idx(t_uop.dst)] = n_prf_entry;
 		    end
 		  if(t_uop.flags_dst_valid)
 		    begin
@@ -3064,7 +3125,7 @@ module core(clk,
 		  t_alloc_uop.dst = n_prf_entry;
 		  if(t_uop.dst2_valid)
 		    begin
-		       n_alloc_rat[t_uop.dst2] = n_prf_entry2;
+		       n_alloc_rat[arch_idx(t_uop.dst2)] = n_prf_entry2;
 		       t_alloc_uop.dst2 = n_prf_entry2;
 		    end
 	       end
@@ -3094,7 +3155,7 @@ module core(clk,
 	       begin
 		  if(t_uop2.dst != 'd0)
 		    begin
-		       n_alloc_rat[t_uop2.dst] = n_prf_entry2;
+		       n_alloc_rat[arch_idx(t_uop2.dst)] = n_prf_entry2;
 		    end
 		  if(t_uop2.flags_dst_valid)
 		    begin
@@ -3115,7 +3176,7 @@ module core(clk,
 
    //always_ff@(negedge clk)
    //begin
-   //$display("r_cycle %d : $v1 -> %d", r_cycle, n_alloc_rat['d3]);
+   //$display("r_cycle %d : $v1 -> %d", r_cycle, n_alloc_rat[arch_idx('d3)]);
    //end
   
    always_comb
@@ -3156,7 +3217,7 @@ module core(clk,
 	       begin
 		  if(t_rob_head.ldst != 'd0)
 		    begin
-		       n_retire_rat[t_rob_head.ldst] = t_rob_head.pdst;
+		       n_retire_rat[arch_idx(t_rob_head.ldst)] = t_rob_head.pdst;
 		    end
 		  if(t_rob_head.valid_flags_dst)
 		    begin
@@ -3164,7 +3225,7 @@ module core(clk,
 		    end
 		  if(t_rob_head.valid_dst2)
 		    begin
-		       n_retire_rat[t_rob_head.ldst + 'd1] = t_rob_head.pdst2;
+		       n_retire_rat[arch_idx(t_rob_head.ldst + 'd1)] = t_rob_head.pdst2;
 		    end
 	       end
 	     else if(t_rob_head.valid_fcr_dst)
@@ -3197,7 +3258,7 @@ module core(clk,
 	       begin
 		  if(t_rob_next_head.ldst != 'd0)
 		    begin
-		       n_retire_rat[t_rob_next_head.ldst] = t_rob_next_head.pdst;
+		       n_retire_rat[arch_idx(t_rob_next_head.ldst)] = t_rob_next_head.pdst;
 		    end
 		  if(t_rob_next_head.valid_flags_dst)
 		    begin
@@ -3269,6 +3330,7 @@ module core(clk,
 	t_rob_tail.trap = 1'b0;
 	
 	t_rob_tail.is_bad_addr = 1'b0;
+	t_rob_tail.mmu = '0;
 	t_rob_tail.is_bus_err = 1'b0;
 	t_rob_tail.take_br = 1'b0;
 	t_rob_tail.is_br = t_alloc_uop.is_br;
@@ -3317,6 +3379,7 @@ module core(clk,
 	
 	t_rob_next_tail.is_ii = 1'b0;
 	t_rob_next_tail.is_bad_addr = 1'b0;
+	t_rob_next_tail.mmu = '0;
 	t_rob_next_tail.is_bus_err = 1'b0;
 	t_rob_next_tail.take_br = 1'b0;
 	t_rob_next_tail.is_br = t_alloc_uop2.is_br;	
@@ -3356,12 +3419,12 @@ module core(clk,
 		  /* this is correct, we do not want the renamed version */
 		  t_rob_tail.ldst = t_uop.dst;
 		  t_rob_tail.pdst = n_prf_entry;
-		  t_rob_tail.old_pdst = r_alloc_rat[t_uop.dst];
+		  t_rob_tail.old_pdst = r_alloc_rat[arch_idx(t_uop.dst)];
 		  t_rob_tail.valid_flags_dst = t_uop.flags_dst_valid;
 		  t_rob_tail.old_flags_pdst = r_flags_alloc_rat;
 		  t_rob_tail.valid_dst2 = t_uop.dst2_valid;
 		  t_rob_tail.pdst2 = n_prf_entry2;
-		  t_rob_tail.old_pdst2 = r_alloc_rat[t_uop.dst2];
+		  t_rob_tail.old_pdst2 = r_alloc_rat[arch_idx(t_uop.dst2)];
 	       end
 	     else if(t_uop.fcr_dst_valid)
 	       begin
@@ -3393,6 +3456,7 @@ module core(clk,
 		       t_rob_tail.faulted = 1'b1;
 		       t_rob_tail.is_ii = 1'b1;
 		       t_rob_tail.data = `MEM_WIDTH'(t_uop.imm[7:0]);   /* the decode trap type */
+		       t_rob_tail.mmu = t_uop.mmu;   /* an instruction_access_exception's FSR */
 		    end
 		  else if(t_uop.op == IRQ)
 		    begin
@@ -3422,7 +3486,7 @@ module core(clk,
 		  t_rob_next_tail.ldst = t_uop2.dst;
 		  t_rob_next_tail.pdst = n_prf_entry2;
 		  t_rob_next_tail.old_pdst = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop.dst == t_uop2.dst)) ?
-					     t_rob_tail.pdst : r_alloc_rat[t_uop2.dst];
+					     t_rob_tail.pdst : r_alloc_rat[arch_idx(t_uop2.dst)];
 		  t_rob_next_tail.valid_flags_dst = t_uop2.flags_dst_valid;
 		  t_rob_next_tail.old_flags_pdst = t_uop.flags_dst_valid ? t_rob_tail.pdst : r_flags_alloc_rat;
 	       end
@@ -3447,6 +3511,7 @@ module core(clk,
 		       t_rob_next_tail.faulted = 1'b1;
 		       t_rob_next_tail.is_ii = 1'b1;
 		       t_rob_next_tail.data = `MEM_WIDTH'(t_uop2.imm[7:0]);
+		       t_rob_next_tail.mmu = t_uop2.mmu;
 		    end
 		  else if(t_uop2.op == IRQ)
 		    begin
@@ -3717,7 +3782,8 @@ module core(clk,
 	       begin
 		  if(core_mem_rsp.rob_ptr[0]) begin
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err;
+		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.mmu.fault;
+		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].mmu <= core_mem_rsp.mmu;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bus_err <= core_mem_rsp.bus_err;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -3728,7 +3794,8 @@ module core(clk,
 		  end
 		  else begin
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err;
+		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.mmu.fault;
+		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].mmu <= core_mem_rsp.mmu;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bus_err <= core_mem_rsp.bus_err;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -4288,6 +4355,7 @@ module core(clk,
     * move CWP; WRPSR/WRWIM/WRTBR and RETT are serializing, so nothing younger
     * has decoded against the old values when they retire. */
    logic		  r_psr_s, n_psr_s;
+   assign psr_s = r_psr_s;
    logic		  r_psr_ps, n_psr_ps;
    logic		  r_psr_et, n_psr_et;
    logic		  r_psr_ef, n_psr_ef;
@@ -4303,6 +4371,43 @@ module core(clk,
    logic [`LG_NWINDOWS-1:0] r_dec_cwp, n_dec_cwp;
    wire [`LG_NWINDOWS-1:0] w_dec0_next_cwp, w_dec1_next_cwp;
 
+`ifdef VERILATOR
+   /* checkpoint resume: the state registers at reset (0 = PSR, 1 = WIM, 2 = TBR) */
+   import "DPI-C" function int have_checkpoint();
+   import "DPI-C" function int ckpt_sreg(input int id);
+`endif
+
+`ifdef VERILATOR
+   logic [31:0] r_stall_dbg, r_ser_dbg;
+   always_ff@(posedge clk)
+     begin
+	r_ser_dbg <= (reset || (r_state != WAIT_FOR_SERIALIZE_AND_RESTART)) ? 32'd0 : (r_ser_dbg + 32'd1);
+     end
+   always_ff@(posedge clk)
+     begin
+	r_stall_dbg <= (reset || t_alloc || !t_rob_empty || t_dq_empty) ? 32'd0 : (r_stall_dbg + 32'd1);
+     end
+   always_ff@(negedge clk)
+     begin
+	if(!reset && w_take_trap)
+	  begin
+	     $display("[FREE] cyc %0d trap tt %02x pc %x ds %b: retire free %0d alloc free %0d", r_cycle, w_trap_tt, t_rob_head.pc,
+		      t_rob_head.in_delay_slot, $countones(r_retire_prf_free), $countones(r_prf_free));
+	  end
+	if(!reset && (r_state == WAIT_FOR_SERIALIZE_AND_RESTART) && (r_ser_dbg == 32'd5000))
+	  begin
+	     $display("[SERSTALL] cyc %0d head pc %x op %0d complete %b st_pending %b memq_empty %b", r_cycle, t_rob_head.pc, t_rob_head.opcode,
+		      t_rob_head_complete, w_lsu_st_pending, memq_empty);
+	  end
+	if(!reset && (r_stall_dbg == 32'd5000))
+	  begin
+	     $display("[STALL] cyc %0d state %0d: dq head pc %x op %0d ser %b ii %b | rob_full %b uq_full %b iprf %b hlprf %b fprf %b fcrprf %b trap_inj %b dec_hold %b ds %b",
+		      r_cycle, r_state, t_uop.pc, t_uop.op, t_uop.serializing_op, (t_uop.op == II), t_rob_full, t_uq_full,
+		      t_enough_iprfs, t_enough_hlprfs, t_enough_fprfs, t_enough_fcrprfs, r_trap_inj, w_dec_hold, r_ds_done);
+	  end
+     end
+`endif
+
    /* ---- SPARC traps ---- */
    /* the trap type of the faulting ROB head: decode traps (II) and exec traps
     * carry it in data[7:0]; an exec op that is not implemented is
@@ -4310,11 +4415,34 @@ module core(clk,
    wire [7:0] w_trap_tt = (t_rob_head.is_ii | t_rob_head.trap) ?
 			  ((t_rob_head.data[7:0] != 8'd0) ? t_rob_head.data[7:0] : 8'h02) :
 			  t_rob_head.is_bad_addr ? 8'h07 :
+			  t_rob_head.mmu.fault ? 8'h09 :   /* data_access_exception */
 			  t_rob_head.is_bus_err ? 8'h29 :
+			  t_rob_head.is_fpe ? 8'h08 :   /* fp_exception */
 			  8'h02;
    /* nPC of the trapped instruction: a delay slot's is its branch's target */
    wire [`M_WIDTH-1:0] w_trap_npc = t_rob_head.in_delay_slot ? r_last_branch_target : (t_rob_head.pc + 'd4);
    wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et;
+   /* an fp_exception's ftt: an FPop the FPU punted (a denormal operand or a tiny
+    * result: unfinished_FPop) or one with an enabled IEEE exception (exec.sv
+    * w_fp_fault), or an unimplemented FPop (decode: II with tt 8) */
+   wire w_fpe_ii = t_rob_head.is_ii & (t_rob_head.data[7:0] == 8'h08);
+   wire w_fsr_trap = w_take_trap & (t_rob_head.is_fpe | w_fpe_ii);
+   wire [2:0] w_fsr_ftt = w_fpe_ii ? 3'd3 :
+			  r_fp_flags[r_rob_head_ptr[`LG_ROB_ENTRIES-1:0]][5] ? 3'd2 : 3'd1;
+   assign trap_taken = w_take_trap;
+   assign trap_taken_tt = w_trap_tt;
+   assign trap_taken_pc = t_rob_head.pc[31:0];
+   /* an interrupt the next decoded instruction takes instead of executing: traps
+    * enabled and the level above PIL (15 is non-maskable).  PSR writes serialize
+    * decode, so the committed ET/PIL are the ones in force here. */
+   wire w_irq = r_psr_et & (irl != 4'd0) & ((irl == 4'd15) | (irl > r_psr_pil));
+   /* the fault status/address are recorded with the trap, never for a wrong-path
+    * access (the ISS records them at the access, which is the same instruction) */
+   assign mmu_fault_valid = (r_state == ARCH_FAULT) & t_rob_head.mmu.fault;
+   assign mmu_fault = t_rob_head.mmu;
+   /* FAR: a data fault's VA (the ROB data), an instruction fault's pc (an II's
+    * data is its trap type) */
+   assign mmu_fault_va = t_rob_head.is_ii ? t_rob_head.pc[31:0] : t_rob_head.data[31:0];
 `ifdef VERILATOR
    always_ff@(negedge clk)
      begin
@@ -4477,6 +4605,22 @@ module core(clk,
 	     r_wim <= 'd0;
 	     r_tbr_tba <= 'd0;
 	     r_tbr_tt <= 'd0;
+`ifdef VERILATOR
+	     if(have_checkpoint() != 0)
+	       begin
+		  /* resume a checkpoint: PSR (S, PS, ET, EF, PIL, CWP), WIM, TBR */
+		  r_psr_s <= 1'((ckpt_sreg(0) >> 7) & 1);
+		  r_psr_ps <= 1'((ckpt_sreg(0) >> 6) & 1);
+		  r_psr_et <= 1'((ckpt_sreg(0) >> 5) & 1);
+		  r_psr_ef <= 1'((ckpt_sreg(0) >> 12) & 1);
+		  r_psr_pil <= 4'((ckpt_sreg(0) >> 8) & 15);
+		  r_arch_cwp <= `LG_NWINDOWS'(ckpt_sreg(0) & 31);
+		  r_dec_cwp <= `LG_NWINDOWS'(ckpt_sreg(0) & 31);
+		  r_wim <= `NWINDOWS'(ckpt_sreg(1));
+		  r_tbr_tba <= 20'(ckpt_sreg(2) >> 12);
+		  r_tbr_tt <= 8'((ckpt_sreg(2) >> 4) & 255);
+	       end
+`endif
 	  end
 	else
 	  begin
@@ -4499,8 +4643,10 @@ module core(clk,
 		      .ef(r_psr_ef),
 		      .cwp(r_dec_cwp),
 		      .wim(r_wim),
-		      .irq(1'b0),
+		      .irq(w_irq),
+		      .irq_level(irl),
 		      .iacc_exc(insn.tlb_miss | insn.bad_va),
+		      .iacc_mmu(insn.mmu),
 		      .iacc_err(1'b0),
 		      .insn(insn.data),
 		      .pc(insn.pc),
@@ -4519,8 +4665,10 @@ module core(clk,
 		      .ef(r_psr_ef),
 		      .cwp(w_dec0_next_cwp),
 		      .wim(r_wim),
-		      .irq(1'b0),
+		      .irq(w_irq),
+		      .irq_level(irl),
 		      .iacc_exc(insn_two.tlb_miss | insn_two.bad_va),
+		      .iacc_mmu(insn_two.mmu),
 		      .iacc_err(1'b0),
 		      .insn(insn_two.data),
 		      .pc(insn_two.pc),
@@ -4549,6 +4697,7 @@ module core(clk,
    logic [319:0] w_dbg_exec_snap;
    wire w_ldd_lo_done;
    wire [`LG_ROB_ENTRIES-1:0] w_ldd_lo_rob;
+   wire w_lsu_st_pending;
    exec e (
 	   .ldd_lo_done(w_ldd_lo_done),
 	   .ldd_lo_rob(w_ldd_lo_rob),
@@ -4561,6 +4710,9 @@ module core(clk,
 	   .core_fcsr_we(core_fcsr_we),
 	   .core_fcsr_cause6(core_fcsr_cause6),
 	   .core_fcsr_flags5(core_fcsr_flags5),
+	   .core_fsr_trap(w_fsr_trap),
+	   .core_fsr_ftt(w_fsr_ftt),
+	   .core_fsr_cexc5(r_fp_flags[r_rob_head_ptr[`LG_ROB_ENTRIES-1:0]][4:0]),
 
 	   .divide_ready(t_divide_ready),
 `ifdef VERILATOR
@@ -4604,6 +4756,7 @@ module core(clk,
 	   .mem_rsp_fp_pres(core_mem_rsp.fp_pres),
 	   .mem_rsp_load_data(core_mem_rsp.data),
 	   .mem_rsp_rob_ptr(core_mem_rsp.rob_ptr),
+	   .mem_rsp_faulted(core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.mmu.fault),
 	   .mem_rsp_valid(core_mem_rsp_valid),
 	   .mem_rsp_lsu_hold(core_mem_rsp.lsu_hold),
 	   .mem_rsp_lsu_idx(core_mem_rsp.lsu_idx),
@@ -4611,6 +4764,8 @@ module core(clk,
 	   .mem_blk_code(core_mem_rsp.blk),
 	   .mem_blk_st(core_mem_rsp.blk_st),
 	   .mem_wake_valid(core_mem_wake_valid),
+	   .mem_tlb_busy(tlb_busy),
+	   .lsu_st_pending(w_lsu_st_pending),
 	   .mem_st_done_valid(core_mem_st_done_valid),
 	   .mem_st_done_idx(core_mem_st_done_idx),
 	   .lsu_sb(lsu_sb),

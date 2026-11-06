@@ -1,5 +1,14 @@
 /* freestanding Linux sparc32 user-mode runtime: runs under qemu-sparc and
- * sparc_iss --user.  _start sets its own %sp so register state is deterministic. */
+ * sparc_iss --user.  _start sets its own %sp so register state is deterministic.
+ * -DBARE: for ooo_core (no syscalls), linked with sv_asm.S's _start: puthex
+ * appends to out_buf, which the halt-time memory compare checks. */
+#ifdef BARE
+static volatile unsigned out_buf[4096];
+static unsigned out_n;
+static void puts_(const char *s) { (void)s; }
+static void puthex(unsigned v) { out_buf[out_n++ & 4095] = v; }
+int main(void);
+#else
 static inline long sys3(long n, long a, long b, long c) {
   register long g1 asm("g1") = n;
   register long o0 asm("o0") = a;
@@ -25,3 +34,4 @@ __attribute__((naked)) void _start(void) {
 	       "call main\n\t nop\n\t"
 	       "mov 1, %%g1\n\t ta 0x10\n\t" :: "i"(stack));
 }
+#endif

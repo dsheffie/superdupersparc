@@ -11,6 +11,7 @@
 #include <utility>
 #include <cstdint>
 #include <list>
+#include <functional>
 
 
 #include "helper.hh"
@@ -174,3 +175,40 @@ void load_elf(const char* fn, state_t *ms) {
   //exit(-1);
 }
 
+
+bool for_each_elf_segment(const char *fn,
+			  const std::function<void(uint32_t, const uint8_t *, uint32_t, uint32_t)> &f,
+			  uint32_t *entry, uint64_t *total) {
+  int fd = open(fn, O_RDONLY);
+  if(fd < 0) {
+    return false;
+  }
+  struct stat st;
+  if(fstat(fd, &st) < 0 or static_cast<size_t>(st.st_size) < sizeof(Elf32_Ehdr)) {
+    close(fd);
+    return false;
+  }
+  const uint8_t *buf = static_cast<const uint8_t *>(mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0));
+  close(fd);
+  if(buf == MAP_FAILED) {
+    return false;
+  }
+  const Elf32_Ehdr *eh = reinterpret_cast<const Elf32_Ehdr *>(buf);
+  bool ok = checkElf(eh) and check32Bit(eh) and checkBigEndian(eh) and
+    (bswap_(eh->e_machine) == 2 or bswap_(eh->e_machine) == 18);
+  if(ok) {
+    *entry = bswap_(eh->e_entry);
+    *total = 0;
+    const Elf32_Phdr *ph = reinterpret_cast<const Elf32_Phdr *>(buf + bswap_(eh->e_phoff));
+    for(uint32_t i = 0; i < bswap_(eh->e_phnum); i++, ph++) {
+      if(bswap_(ph->p_type) != PT_LOAD) {
+	continue;
+      }
+      uint32_t memsz = bswap_(ph->p_memsz);
+      f(bswap_(ph->p_vaddr), buf + bswap_(ph->p_offset), bswap_(ph->p_filesz), memsz);
+      *total += memsz;
+    }
+  }
+  munmap(const_cast<uint8_t *>(buf), st.st_size);
+  return ok;
+}

@@ -1,5 +1,6 @@
 `include "uop.vh"
 `include "machine.vh"
+`include "fp_nan.vh"
 
 /* Unified iterative divider: MIPS integer div/divu/ddiv/ddivu + IEEE-754 FP
  * divide + FP square root (SP/DP) on ONE restoring recurrence and ONE subtractor.
@@ -234,15 +235,9 @@ module uni_divider(clk,
    wire        b_is_nan = (exp_b == INF_EXP) & (frac_b != 'd0);
    wire        a_is_inf = (exp_a == INF_EXP) & (frac_a == 'd0);
    wire        b_is_inf = (exp_b == INF_EXP) & (frac_b == 'd0);
-/* MIPS legacy NaN semantics (the R4400 predates IEEE-754-2008 and has no FCSR.NAN2008 bit):
- *   - a NaN is SIGNALING when its fraction MSB is SET (the inverse of the 2008 rule);
- *   - default-NaN mode is always on: ANY NaN result is the architectural default NaN,
- *     the input NaN's payload is NOT propagated;
- *   - default NaN = 0x7FF7FFFFFFFFFFFF (double) / 0x7FBFFFFF (single): sign 0, exponent all
- *     ones, fraction = 0 followed by all ones.
- * Verified against a MIPS-legacy Berkeley SoftFloat specialization via TestFloat. */
-   wire        a_is_snan = a_is_nan & (w_fmt_op ? w_in_a[51] : w_in_a[22]);
-   wire        b_is_snan = b_is_nan & (w_fmt_op ? w_in_b[51] : w_in_b[22]);
+/* SPARC NaN semantics (fp_nan.vh): IEEE quiet bit, operand NaN propagated quieted */
+   wire        a_is_snan = fp_is_snan(w_in_a, w_fmt_op);
+   wire        b_is_snan = fp_is_snan(w_in_b, w_fmt_op);
    /* denormal operand -> raise E, trap to the emulator (HW path is normalized-only) */
    wire        w_in_denorm = ((exp_a == 'd0) & (frac_a != 'd0)) |
 			     (~w_is_sqrt_op & (exp_b == 'd0) & (frac_b != 'd0));
@@ -250,26 +245,26 @@ module uni_divider(clk,
    /* result sign: div = a^b; sqrt = a (sqrt(-0)=-0) */
    wire        w_sign = w_is_sqrt_op ? sgn_a : (sgn_a ^ sgn_b);
 
-   wire [63:0] DEF_NAN = w_fmt_op ? {1'b0, 11'h7ff, 1'b0, 51'h7ffffffffffff} : {32'd0, 1'b0, 8'hff, 1'b0, 22'h3fffff};
+   wire [63:0] DEF_NAN = w_fmt_op ? SPARC_DNAN_D : SPARC_DNAN_S;
    wire [63:0] inf_y  = w_fmt_op ? {w_sign, 11'h7ff, 52'd0} : {32'd0, w_sign, 8'hff, 23'd0};
    wire [63:0] zero_y = w_fmt_op ? {w_sign, 63'd0} : {32'd0, w_sign, 31'd0};
 
    /* DIV specials: 0/0 & inf/inf invalid; x/0 (x!=0) -> DZ + inf; inf/x -> inf;
-    * x/inf -> 0; nan -> the default NaN */
+    * x/inf -> 0; nan -> sparc_nan */
    wire        any_nan   = a_is_nan | b_is_nan;
    wire        div_dz    = ~a_is_nan & ~a_is_inf & ~b_is_nan & ~b_is_inf & b_is_zero & ~a_is_zero;
    wire        div_inv   = a_is_snan | b_is_snan | (a_is_zero & b_is_zero) | (a_is_inf & b_is_inf);
    wire        div_early = any_nan | a_is_inf | b_is_inf | a_is_zero | b_is_zero;
-   wire [63:0] div_early_y = any_nan ? DEF_NAN
+   wire [63:0] div_early_y = any_nan ? sparc_nan(w_in_a, w_in_b, w_fmt_op)
 			   : ((a_is_zero & b_is_zero) | (a_is_inf & b_is_inf)) ? DEF_NAN
 			   : (a_is_inf | b_is_zero) ? inf_y
 			   : zero_y;
    /* SQRT specials: negative (nonzero, non-nan) -> invalid qNaN; sqrt(+-0)=+-0;
-    * +inf -> +inf; nan -> the default NaN.  A normal operand never over/underflows. */
+    * +inf -> +inf; nan -> it, quieted.  A normal operand never over/underflows. */
    wire        sqrt_inv   = a_is_snan | (sgn_a & ~a_is_zero & ~a_is_nan);
    wire        sqrt_early = a_is_nan | a_is_inf | a_is_zero | sqrt_inv;
    wire [63:0] sqrt_inf_y = w_fmt_op ? {1'b0, 11'h7ff, 52'd0} : {32'd0, 1'b0, 8'hff, 23'd0};
-   wire [63:0] sqrt_early_y = (a_is_nan | sqrt_inv) ? DEF_NAN
+   wire [63:0] sqrt_early_y = a_is_nan ? fp_quiet(w_in_a, w_fmt_op) : sqrt_inv ? DEF_NAN
 			    : a_is_inf ? sqrt_inf_y : zero_y;
 
    wire        w_op_inv     = w_is_sqrt_op ? sqrt_inv     : div_inv;
@@ -624,7 +619,11 @@ module uni_divider(clk,
    /* special/early result (NaN/Inf/zero/DZ-inf) bypasses the arithmetic pack;
     * a denormal operand or an underflowing result raises E so the op traps. */
    wire [63:0] w_y = r_special ? r_early_y : w_overflow ? ovf_y : norm_y;
-   wire        w_denorm = r_inden | (~r_special & w_underflow);
+   /* the unfinished_FPop punt (the same rule in interpret.cc fp_unfinished): any
+    * denormal operand, or a nonzero exact result below the smallest normal
+    * (tininess before rounding) */
+   wire        w_tiny = w_arith & (r_ebase[EW+2] | ~(|r_ebase));
+   wire        w_denorm = r_inden | w_tiny;
    wire        w_f_inexact = w_arith & (w_inexact | w_overflow);
    wire [4:0]  w_fflags = {r_inv, r_dz, w_arith & w_overflow, w_arith & w_underflow, w_f_inexact};
 

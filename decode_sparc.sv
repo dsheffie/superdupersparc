@@ -23,6 +23,13 @@
  *
  * Not yet handled here: the jmpl;rett
  * couple, and every other DCTI couple. */
+/* the ASIs that reach memory: 8/9 user/supervisor instruction, 0xa/0xb
+ * user/supervisor data (translated), 0x20-0x2f MMU bypass (interpret.cc
+ * asi_is_memory) */
+function automatic logic asi_is_memory(input logic [7:0] asi);
+   asi_is_memory = (asi == 8'h08) | (asi == 8'h09) | (asi == 8'h0a) | (asi == 8'h0b) | (asi[7:4] == 4'h2);
+endfunction
+
 module decode_sparc(
 		    s,
 		    et,
@@ -30,7 +37,9 @@ module decode_sparc(
 		    cwp,
 		    wim,
 		    irq,
+		    irq_level,
 		    iacc_exc,
+		    iacc_mmu,
 		    iacc_err,
 		    insn,
 		    pc,
@@ -48,7 +57,9 @@ module decode_sparc(
    input logic [`LG_NWINDOWS-1:0] cwp;
    input logic [`NWINDOWS-1:0]	wim;
    input logic			irq;
+   input logic [3:0]		irq_level;   /* with irq: the interrupt level taken (1..15) */
    input logic			iacc_exc;   /* instruction_access_exception (MMU fault on fetch) */
+   input 			mmu_fault_t iacc_mmu;   /* its fault status fields (for the trap) */
    input logic			iacc_err;   /* instruction_access_error (bus error on fetch) */
    input logic [31:0]		insn;
    input logic [`M_WIDTH-1:0]	pc;
@@ -73,6 +84,7 @@ module decode_sparc(
    localparam logic [7:0] TT_WIN_UNDERFLOW = 8'h06;
    localparam logic [7:0] TT_IACCESS_ERROR = 8'h21;
    localparam logic [7:0] TT_CP_DISABLED = 8'h24;
+   localparam logic [7:0] TT_FP_EXCEPTION = 8'h08;
 
    generate
       if((1 << `LG_PRF_ENTRIES) < ARCH_REGS)
@@ -102,12 +114,26 @@ module decode_sparc(
       end
    endfunction // widx
 
-   /* FP register r (5-bit field) as an FP arch index; a double's low bit is ignored */
-   function automatic logic [`LG_PRF_ENTRIES-1:0] fidx(input logic [4:0] r, input logic dbl);
+   /* FP register r (5-bit field) as an FP arch index: the 64-bit pair holding it.
+    * d[2k] is f[2k] (the high word) : f[2k+1] (the low word), so a single is half
+    * of a pair and a double's low bit is ignored.  Only the even arch indices are
+    * used. */
+   function automatic logic [`LG_PRF_ENTRIES-1:0] fidx(input logic [4:0] r);
       begin
-	 fidx = {{(`LG_PRF_ENTRIES-5){1'b0}}, r[4:1], r[0] & !dbl};
+	 fidx = {{(`LG_PRF_ENTRIES-5){1'b0}}, r[4:1], 1'b0};
       end
    endfunction // fidx
+
+   /* which part of its pair an FP operand is (exec.sv FP issue, in jmp_imm):
+    * FSEL_FULL a double, FSEL_LO / FSEL_HI a single (f[2k+1] / f[2k]) */
+   localparam logic [1:0] FSEL_FULL = 2'd0;
+   localparam logic [1:0] FSEL_LO = 2'd1;
+   localparam logic [1:0] FSEL_HI = 2'd2;
+   function automatic logic [1:0] fsel(input logic [4:0] r, input logic dbl);
+      begin
+	 fsel = dbl ? FSEL_FULL : (r[0] ? FSEL_LO : FSEL_HI);
+      end
+   endfunction // fsel
 
    wire [1:0]			op = insn[31:30];
    wire [2:0]			op2 = insn[24:22];
@@ -324,6 +350,7 @@ module decode_sparc(
 	uop.is_cache = 1'b0;
 	uop.cache_act = CA_NONE;
 	uop.asi = s ? 8'h0b : 8'h0a;
+	uop.mmu = '0;
 `ifdef ENABLE_CYCLE_ACCOUNTING
 	uop.fetch_cycle = fetch_cycle;
 `endif
@@ -332,11 +359,16 @@ module decode_sparc(
 	/* `trap(tt)': op stays II, the trap type rides imm */
 	if(irq)
 	  begin
-	     uop.op = IRQ;
+	     /* an external interrupt: the instruction does not execute; it traps
+	      * like a decode trap with tt = interrupt_level_n (0x10 + n), so PC/nPC
+	      * are its own -- the precise SPARC interrupt point */
+	     uop.op = II;
+	     uop.imm = {8'd0, 4'h1, irq_level};
 	  end
 	else if(iacc_exc)
 	  begin
 	     uop.imm = {8'd0, TT_IACCESS};
+	     uop.mmu = iacc_mmu;
 	  end
 	else if(iacc_err)
 	  begin
@@ -570,31 +602,54 @@ module decode_sparc(
 				     if(w_fcmp)
 				       begin
 					  uop.op = w_fcmp_dbl ? S_FCMPD : S_FCMPS;
-					  uop.imm = {15'd0, opf[2]};   /* fcmpe */
+					  uop.imm = {9'd0, opf[2], 6'd0};   /* fpu_compare cond[3]: fcmpe signals on any NaN */
 					  uop.jmp_imm = 'd0;
-					  uop.srcA = fidx(rs1, w_fcmp_dbl);
+					  uop.jmp_imm[2:1] = fsel(rs1, w_fcmp_dbl);
+					  uop.jmp_imm[4:3] = fsel(rs2, w_fcmp_dbl);
+					  uop.srcA = fidx(rs1);
 					  uop.fp_srcA_valid = 1'b1;
-					  uop.srcB = fidx(rs2, w_fcmp_dbl);
+					  uop.srcB = fidx(rs2);
 					  uop.fp_srcB_valid = 1'b1;
 					  uop.fcr_dst_valid = 1'b1;   /* all of fcc */
 				       end
 				     else
 				       begin
-					  uop.op = FP_UNIMPL;
+					  /* quad and reserved: unimplemented_FPop (core.sv: ftt 3) */
+					  uop.op = II;
+					  uop.imm = {8'd0, TT_FP_EXCEPTION};
+					  uop.is_fp = 1'b0;
 				       end
 				  end
 				else
 				  begin
 				     uop.op = fpop1_op(opf);
 				     uop.is_fp = 1'b1;
-				     if(uop.op != FP_UNIMPL)
+				     if(uop.op == FP_UNIMPL)
 				       begin
-					  /* unary ops read rs2; binary rs1 then rs2 */
-					  uop.srcA = w_fp_unary ? fidx(rs2, w_fp_src_dbl) : fidx(rs1, w_fp_src_dbl);
+					  /* quad and reserved: unimplemented_FPop (core.sv: ftt 3) */
+					  uop.op = II;
+					  uop.imm = {8'd0, TT_FP_EXCEPTION};
+					  uop.is_fp = 1'b0;
+				       end
+				     else
+				       begin
+					  /* unary ops read rs2; binary rs1 then rs2.  jmp_imm (exec.sv
+					   * FP issue): [2:1] / [4:3] srcA / srcB's part of its pair,
+					   * [5] a single destination, [0] its half is the high one.  A
+					   * single destination writes half a pair: the old pair is
+					   * srcC, merged at writeback. */
+					  uop.jmp_imm = 'd0;
+					  uop.jmp_imm[2:1] = fsel(w_fp_unary ? rs2 : rs1, w_fp_src_dbl);
+					  uop.jmp_imm[4:3] = fsel(rs2, w_fp_src_dbl);
+					  uop.jmp_imm[5] = !w_fp_dst_dbl;
+					  uop.jmp_imm[0] = !rd[0];
+					  uop.srcA = w_fp_unary ? fidx(rs2) : fidx(rs1);
 					  uop.fp_srcA_valid = 1'b1;
-					  uop.srcB = fidx(rs2, w_fp_src_dbl);
+					  uop.srcB = fidx(rs2);
 					  uop.fp_srcB_valid = !w_fp_unary;
-					  uop.dst = fidx(rd, w_fp_dst_dbl);
+					  uop.srcC = fidx(rd);
+					  uop.fp_srcC_valid = !w_fp_dst_dbl;
+					  uop.dst = fidx(rd);
 					  uop.fp_dst_valid = 1'b1;
 				       end
 				  end
@@ -656,9 +711,14 @@ module decode_sparc(
 			     end
 			   6'h3b: /* flush */
 			     begin
+				/* the I-cache line at the EA (rs1 + rs2/simm13): a serializing
+				 * cache op that invalidates the L1I set the EA indexes, then
+				 * restarts -- so code the kernel patches is refetched */
 				uop.op = S_FLUSH;
 				uop.dst_valid = 1'b0;
 				uop.serializing_op = 1'b1;
+				uop.is_cache = 1'b1;
+				uop.cache_act = CA_I_LINE_INV;
 			     end
 			   6'h3c: /* save */
 			     begin
@@ -756,6 +816,13 @@ module decode_sparc(
 			 if(w_mem_alt)
 			   begin
 			      uop.asi = insn[12:5];
+			      /* a non-memory ASI (SRMMU registers and flushes, module
+			       * registers, cache diagnostics): alone in the machine, then
+			       * the front end restarts, so younger accesses see its effect */
+			      if(!asi_is_memory(insn[12:5]))
+				begin
+				   uop.serializing_op = 1'b1;
+				end
 			   end
 			 if(w_mem_int)
 			   begin
@@ -791,14 +858,18 @@ module decode_sparc(
 			   end
 			 else
 			   begin
+			      /* ldf/stf/lddf/stdf are r9999's lwc1/swc1/ldc1/sdc1 (same
+			       * alignment).  A single is half a pair: ldf reads the old pair
+			       * (srcB) and merges into the jmp_imm[0] half (1 = the high
+			       * word, f[2k]); stf stores that half. */
 			      case(op3)
-				6'h20: uop.op = S_LDF;
+				6'h20: uop.op = LWC1;
 				6'h21: uop.op = S_LDFSR;
-				6'h23: uop.op = S_LDDF;
-				6'h24: uop.op = S_STF;
+				6'h23: uop.op = LDC1;
+				6'h24: uop.op = SWC1;
 				6'h25: uop.op = S_STFSR;
 				6'h26: uop.op = S_STDFQ;
-				6'h27: uop.op = S_STDF;
+				6'h27: uop.op = SDC1;
 				default: uop.op = II;   /* excluded above */
 			      endcase // case (op3)
 			      uop.is_store = op3[2];
@@ -806,9 +877,11 @@ module decode_sparc(
 			      uop.serializing_op = (op3 == 6'h21) | (op3 == 6'h25) | (op3 == 6'h26);
 			      uop.fcr_src_valid = (op3 == 6'h25);
 			      uop.fcr_dst_valid = (op3 == 6'h21);
-			      uop.srcB = fidx(rd, op3[1:0] == 2'b11);
-			      uop.fp_srcB_valid = (op3 == 6'h24) | (op3 == 6'h27);
-			      uop.dst = fidx(rd, op3[1:0] == 2'b11);
+			      uop.jmp_imm = 'd0;
+			      uop.jmp_imm[0] = (op3[1:0] == 2'b00) & !rd[0];
+			      uop.srcB = fidx(rd);
+			      uop.fp_srcB_valid = (op3 == 6'h20) | (op3 == 6'h24) | (op3 == 6'h27);
+			      uop.dst = fidx(rd);
 			      uop.fp_dst_valid = (op3 == 6'h20) | (op3 == 6'h23);
 			   end
 		      end

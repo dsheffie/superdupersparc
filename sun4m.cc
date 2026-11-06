@@ -1,8 +1,10 @@
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "sun4m.hh"
 #include "interpret.hh"
+#include "loadelf.hh"
 
 /* SS-20 version registers (qemu ss20_hwdef) */
 static const uint32_t IOMMU_VERSION = 0x13000000;
@@ -428,8 +430,777 @@ void intctl_t::write(uint64_t pa, uint32_t v) {
 
 /* ---------------------------------------------------------------- sun4m */
 
+/* ---------------------------------------------------------------- fw_cfg */
+
+void fw_cfg_t::add_bytes(uint16_t key, const void *p, size_t n) {
+  const uint8_t *b = static_cast<const uint8_t *>(p);
+  items[key] = std::vector<uint8_t>(b, b + n);
+}
+void fw_cfg_t::add_i16(uint16_t key, uint16_t v) {
+  uint8_t b[2] = {static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8)};
+  add_bytes(key, b, 2);
+}
+void fw_cfg_t::add_i32(uint16_t key, uint32_t v) {
+  uint8_t b[4];
+  for(int i = 0; i < 4; i++) {
+    b[i] = static_cast<uint8_t>(v >> (8 * i));
+  }
+  add_bytes(key, b, 4);
+}
+void fw_cfg_t::add_i64(uint16_t key, uint64_t v) {
+  uint8_t b[8];
+  for(int i = 0; i < 8; i++) {
+    b[i] = static_cast<uint8_t>(v >> (8 * i));
+  }
+  add_bytes(key, b, 8);
+}
+void fw_cfg_t::select(uint16_t key) {
+  cur = key;
+  off = 0;
+}
+uint8_t fw_cfg_t::read() {
+  /* an unknown item, or past its end, reads 0 */
+  auto it = items.find(cur);
+  if(it == items.end() or off >= it->second.size()) {
+    return 0;
+  }
+  return it->second[off++];
+}
+
+/* ------------------------------------------------------------------- fdc */
+
+enum : uint8_t {
+  FD_SRA_NDRV2 = 0x40, FD_SRA_INTPEND = 0x80, FD_DOR_NRESET = 0x04, FD_DOR_DMAEN = 0x08,
+  FD_DSR_SWRESET = 0x80, FD_DSR_PWRDOWN = 0x40, FD_MSR_CMDBUSY = 0x10, FD_MSR_DIO = 0x40,
+  FD_MSR_RQM = 0x80, FD_SR0_SEEK = 0x20, FD_SR0_INVCMD = 0x80, FD_SR0_RDYCHG = 0xc0
+};
+static const uint32_t FD_RESET_SENSEI_COUNT = 4;
+static const uint8_t FD_LAST_SECT = 0xff;   /* an empty drive's last sector, as qemu's DUMPREG shows */
+
+fdc_t::fdc_t() {
+  reset(false);
+}
+
+void fdc_t::raise_irq() {
+  if(not (sra & FD_SRA_INTPEND)) {
+    irq = true;
+    sra |= FD_SRA_INTPEND;
+  }
+  reset_sensei = 0;
+}
+
+void fdc_t::reset_irq() {
+  status0 = 0;
+  if(sra & FD_SRA_INTPEND) {
+    irq = false;
+    sra &= ~FD_SRA_INTPEND;
+  }
+}
+
+void fdc_t::to_command() {
+  phase = CMD;
+  pos = 0;
+  len = 1;
+  msr = (msr & ~(FD_MSR_CMDBUSY | FD_MSR_DIO)) | FD_MSR_RQM;
+}
+
+void fdc_t::to_result(uint32_t n) {
+  phase = RESULT;
+  len = n;
+  pos = 0;
+  msr |= FD_MSR_CMDBUSY | FD_MSR_RQM | FD_MSR_DIO;
+}
+
+/* qemu fdctrl_reset: the sun4m controller has no DMA channel and one (empty) drive */
+void fdc_t::reset(bool do_irq) {
+  reset_irq();
+  sra = FD_SRA_NDRV2;
+  srb = 0xc0;
+  dor = FD_DOR_NRESET;
+  msr = FD_MSR_RQM;
+  reset_sensei = 0;
+  to_command();
+  if(do_irq) {
+    status0 |= FD_SR0_RDYCHG;
+    raise_irq();
+    reset_sensei = FD_RESET_SENSEI_COUNT;
+  }
+}
+
+/* the number of parameter bytes after the command byte */
+static uint32_t fdc_params(uint8_t cmd) {
+  switch(cmd)
+    {
+    case 0x03: return 2;   /* SPECIFY */
+    case 0x07: return 1;   /* RECALIBRATE */
+    case 0x12: return 1;   /* PERPENDICULAR MODE */
+    case 0x13: return 3;   /* CONFIGURE */
+    default: return 0;     /* SENSE INTERRUPT, DUMPREG, VERSION, PART ID, LOCK, unknown */
+    }
+}
+
+void fdc_t::execute() {
+  uint8_t cmd = fifo[0];
+  if((cmd & 0x7f) == 0x14) {                 /* LOCK */
+    lock = (cmd & 0x80) ? 1 : 0;
+    fifo[0] = lock << 4;
+    to_result(1);
+    return;
+  }
+  switch(cmd)
+    {
+    case 0x03:                               /* SPECIFY */
+      timer0 = (fifo[1] >> 4) & 0xf;
+      timer1 = fifo[2] >> 1;
+      dor = (fifo[2] & 1) ? (dor & ~FD_DOR_DMAEN) : (dor | FD_DOR_DMAEN);
+      to_command();
+      break;
+    case 0x07:                               /* RECALIBRATE: track 0, seek-end interrupt */
+      dor = (dor & ~3) | (fifo[1] & 3);
+      to_command();
+      status0 |= FD_SR0_SEEK;
+      raise_irq();
+      break;
+    case 0x08:                               /* SENSE INTERRUPT STATUS */
+      if(reset_sensei > 0) {
+	fifo[0] = FD_SR0_RDYCHG + FD_RESET_SENSEI_COUNT - reset_sensei;
+	reset_sensei--;
+      }
+      else if(not (sra & FD_SRA_INTPEND)) {
+	fifo[0] = FD_SR0_INVCMD;
+	to_result(1);
+	return;
+      }
+      else {
+	fifo[0] = (status0 & ~0x07) | (dor & 3);
+      }
+      fifo[1] = 0;                           /* the track: every drive sits at 0 */
+      to_result(2);
+      reset_irq();
+      status0 = FD_SR0_RDYCHG;
+      break;
+    case 0x0e:                               /* DUMPREG */
+      fifo[0] = fifo[1] = fifo[2] = fifo[3] = 0;
+      fifo[4] = timer0;
+      fifo[5] = (timer1 << 1) | ((dor & FD_DOR_DMAEN) ? 1 : 0);
+      fifo[6] = FD_LAST_SECT;
+      fifo[7] = (lock << 7) | (perpendicular << 2);
+      fifo[8] = config;
+      fifo[9] = precomp;
+      to_result(10);
+      break;
+    case 0x10:                               /* VERSION: 82078 */
+      fifo[0] = 0x90;
+      to_result(1);
+      break;
+    case 0x12:                               /* PERPENDICULAR MODE */
+      if(fifo[1] & 0x80) {
+	perpendicular = fifo[1] & 7;
+      }
+      to_command();
+      break;
+    case 0x13:                               /* CONFIGURE */
+      config = fifo[2];
+      precomp = fifo[3];
+      to_command();
+      break;
+    case 0x18:                               /* PART ID: stepping 1 */
+      fifo[0] = 0x41;
+      to_result(1);
+      break;
+    default:
+      fprintf(stderr, "sun4m: fdc: unmodeled command 0x%02x\n", cmd);
+      fifo[0] = FD_SR0_INVCMD;
+      to_result(1);
+      break;
+    }
+}
+
+uint8_t fdc_t::read(uint32_t reg) {
+  switch(reg & 7)
+    {
+    case 0: return sra;
+    case 1: return srb;
+    case 2: return dor;
+    case 3: return 0;
+    case 4:
+      dsr &= ~FD_DSR_PWRDOWN;
+      return msr;
+    case 5: {
+      dsr &= ~FD_DSR_PWRDOWN;
+      if(not (msr & FD_MSR_RQM) or not (msr & FD_MSR_DIO)) {
+	return 0;
+      }
+      uint8_t v = fifo[pos % sizeof(fifo)];
+      if(++pos == len) {
+	msr &= ~FD_MSR_RQM;
+	to_command();
+	reset_irq();
+      }
+      return v;
+    }
+    default: return 0;
+    }
+}
+
+void fdc_t::write(uint32_t reg, uint8_t v) {
+  switch(reg & 7)
+    {
+    case 2:                                  /* DOR: leaving reset resets the controller */
+      if((v & FD_DOR_NRESET) and not (dor & FD_DOR_NRESET)) {
+	reset(true);
+	dsr &= ~FD_DSR_PWRDOWN;
+      }
+      dor = v;
+      break;
+    case 4:                                  /* DSR */
+      if(not (dor & FD_DOR_NRESET)) {
+	return;
+      }
+      if(v & FD_DSR_SWRESET) {
+	dor &= ~FD_DOR_NRESET;
+	reset(true);
+	dor |= FD_DOR_NRESET;
+      }
+      if(v & FD_DSR_PWRDOWN) {
+	reset(true);
+      }
+      dsr = v;
+      break;
+    case 5: {                                /* FIFO: command and parameter bytes */
+      if(not (dor & FD_DOR_NRESET) or not (msr & FD_MSR_RQM) or (msr & FD_MSR_DIO)) {
+	return;
+      }
+      dsr &= ~FD_DSR_PWRDOWN;
+      uint32_t p = pos++;
+      fifo[p % sizeof(fifo)] = v;
+      if(pos == len) {
+	msr &= ~FD_MSR_RQM;
+      }
+      if(p == 0) {
+	len = fdc_params(v) + 1;
+	if(len > 1) {
+	  msr |= FD_MSR_RQM;
+	}
+	msr |= FD_MSR_CMDBUSY;
+      }
+      if(pos == len) {
+	execute();
+      }
+      break;
+    }
+    default:                                 /* TDR, CCR: no effect without a drive */
+      break;
+    }
+}
+
+/* ------------------------------------------------------------- DMA, ESP */
+
+enum : uint32_t {
+  DMA_INTR = 0x1, DMA_INTREN = 0x10, DMA_DRAIN_FIFO = 0x40, DMA_RESET = 0x80, DMA_EN = 0x200,
+  DMA_LOADED = 0x04000000, DMA_CSR_RO_MASK = 0xfe000007, DMA_VER = 0xa0000000
+};
+
+/* qemu dma_set_irq: the chip's interrupt input */
+void sun4m_t::dma_set_irq(sparc_dma_t &d, bool level) {
+  if(level) {
+    d.r[0] |= DMA_INTR;
+    if(d.r[0] & DMA_INTREN) {
+      d.irq = true;
+    }
+  }
+  else if(d.r[0] & DMA_INTR) {
+    d.r[0] &= ~DMA_INTR;
+    if(d.r[0] & DMA_INTREN) {
+      d.irq = false;
+    }
+  }
+}
+
+/* qemu dma_mem_write (the ESP is the espdma's chip; the ledma's Lance has no
+ * modeled state, so its reset and enable lines go nowhere) */
+void sun4m_t::dma_write(state_t *s, sparc_dma_t &d, bool is_esp, uint32_t reg, uint32_t v) {
+  (void)s;
+  if(reg != 0) {
+    if(reg == 1) {
+      d.r[0] |= DMA_LOADED;
+    }
+    d.r[reg] = v;
+    return;
+  }
+  if(v & DMA_INTREN) {
+    if(d.r[0] & DMA_INTR) {
+      d.irq = true;
+    }
+  }
+  else if(d.r[0] & (DMA_INTR | DMA_INTREN)) {
+    d.irq = false;
+  }
+  if(v & DMA_RESET) {
+    if(is_esp) {             /* the ESP's reset input: a soft reset */
+      esp_set_irq(false);
+      esp_hard_reset();
+    }
+  }
+  else if(v & DMA_DRAIN_FIFO) {
+    v &= ~DMA_DRAIN_FIFO;
+  }
+  else if(v == 0) {
+    v = DMA_DRAIN_FIFO;
+  }
+  if(is_esp and (v & DMA_EN) and not (d.r[0] & DMA_EN)) {
+    esp.dma_enabled = true;  /* qemu esp_dma_enable: run a deferred Select With ATN */
+    if(esp.satn_pending) {
+      esp.satn_pending = false;
+      esp_select_atn();
+    }
+  }
+  else if(is_esp and not (v & DMA_EN) and (d.r[0] & DMA_EN)) {
+    esp.dma_enabled = false;
+  }
+  v &= ~DMA_CSR_RO_MASK;
+  v |= DMA_VER;
+  d.r[0] = (d.r[0] & DMA_CSR_RO_MASK) | v;
+}
+
+enum : uint8_t {
+  ESP_TCLO = 0x0, ESP_TCMID = 0x1, ESP_FIFO = 0x2, ESP_CMD = 0x3, ESP_RSTAT = 0x4, ESP_WBUSID = 0x4,
+  ESP_RINTR = 0x5, ESP_RSEQ = 0x6, ESP_RFLAGS = 0x7, ESP_WSYNO = 0x7, ESP_CFG1 = 0x8, ESP_WCCF = 0x9,
+  ESP_WTEST = 0xa, ESP_CFG2 = 0xb, ESP_CFG3 = 0xc, ESP_RES3 = 0xd, ESP_TCHI = 0xe, ESP_RES4 = 0xf,
+  CMD_DMA = 0x80, CMD_CMD = 0x7f, STAT_TC = 0x10, STAT_INT = 0x80, INTR_FC = 0x08, INTR_DC = 0x20,
+  INTR_RST = 0x80, CFG1_RESREPT = 0x40, TCHI_FAS100A = 0x4, ESP_CMDFIFO_SZ = 32
+};
+
+void sun4m_t::esp_set_irq(bool raise) {
+  if(raise and not (esp.rregs[ESP_RSTAT] & STAT_INT)) {
+    esp.rregs[ESP_RSTAT] |= STAT_INT;
+    esp.irq = true;
+    dma_set_irq(espdma, true);
+  }
+  else if(not raise and (esp.rregs[ESP_RSTAT] & STAT_INT)) {
+    esp.rregs[ESP_RSTAT] &= ~STAT_INT;
+    esp.irq = false;
+    dma_set_irq(espdma, false);
+  }
+}
+
+/* qemu esp_hard_reset (the chip-reset command and the espdma reset line also
+ * lower the interrupt first: esp_soft_reset) */
+void sun4m_t::esp_hard_reset() {
+  bool en = esp.dma_enabled;
+  esp = esp_t();
+  esp.dma_enabled = en;      /* the enable line belongs to the espdma */
+  esp.rregs[ESP_CFG1] = 7;
+}
+
+/* qemu handle_satn -> get_cmd -> esp_select with no device: the command bytes are
+ * fetched (DMA: up to the transfer count, advancing the espdma address), then
+ * the selection times out: status 0, disconnect, sequence 0, interrupt */
+void sun4m_t::esp_select_atn() {
+  if(esp.dma) {
+    uint32_t tc = esp.rregs[ESP_TCLO] | (esp.rregs[ESP_TCMID] << 8) | (esp.rregs[ESP_TCHI] << 16);
+    uint32_t n = (tc < ESP_CMDFIFO_SZ) ? tc : ESP_CMDFIFO_SZ;
+    if(n == 0) {
+      return;                /* qemu: no command bytes, no selection */
+    }
+    espdma.r[1] += n;
+  }
+  else {
+    if(esp.fifo_n == 0) {
+      return;
+    }
+    esp.fifo_n = 0;          /* the FIFO bytes went to the command */
+  }
+  esp.fifo_n = 0;
+  esp.rregs[ESP_RSTAT] = 0;
+  esp.rregs[ESP_RINTR] = INTR_DC;
+  esp.rregs[ESP_RSEQ] = 0;
+  esp_set_irq(true);
+}
+
+uint8_t sun4m_t::esp_read(uint32_t reg) {
+  switch(reg)
+    {
+    case ESP_FIFO: {
+      /* no transfer phase ever starts, so the FIFO only holds what was written */
+      uint8_t v = 0;
+      if(esp.fifo_n > 0) {
+	v = esp.fifo[0];
+	memmove(esp.fifo, esp.fifo + 1, --esp.fifo_n);
+      }
+      esp.rregs[ESP_FIFO] = v;
+      return v;
+    }
+    case ESP_RINTR: {        /* clears the interrupt register, TC and the interrupt */
+      uint8_t v = esp.rregs[ESP_RINTR];
+      esp.rregs[ESP_RINTR] = 0;
+      esp.rregs[ESP_RSTAT] &= ~STAT_TC;
+      esp_set_irq(false);
+      return v;
+    }
+    case ESP_TCHI:           /* the chip id until the register is written */
+      return esp.tchi_written ? esp.rregs[ESP_TCHI] : TCHI_FAS100A;
+    case ESP_RFLAGS:         /* bytes in the FIFO */
+      return static_cast<uint8_t>(esp.fifo_n);
+    default:
+      return esp.rregs[reg];
+    }
+}
+
+void sun4m_t::esp_write(uint32_t reg, uint8_t v) {
+  switch(reg)
+    {
+    case ESP_TCHI:
+      esp.tchi_written = true;
+      /* fall through */
+    case ESP_TCLO:
+    case ESP_TCMID:
+      esp.rregs[ESP_RSTAT] &= ~STAT_TC;
+      break;
+    case ESP_FIFO:
+      if(esp.fifo_n < sizeof(esp.fifo)) {
+	esp.fifo[esp.fifo_n++] = v;
+      }
+      break;
+    case ESP_CMD:
+      esp.rregs[ESP_CMD] = v;
+      if(v & CMD_DMA) {
+	/* reload the transfer count from the start count (0 means 64K) */
+	uint32_t stc = esp.wregs[ESP_TCLO] | (esp.wregs[ESP_TCMID] << 8) | (esp.wregs[ESP_TCHI] << 16);
+	if(stc == 0) {
+	  stc = 0x10000;
+	}
+	esp.dma = true;
+	esp.rregs[ESP_TCLO] = static_cast<uint8_t>(stc);
+	esp.rregs[ESP_TCMID] = static_cast<uint8_t>(stc >> 8);
+	esp.rregs[ESP_TCHI] = static_cast<uint8_t>(stc >> 16);
+      }
+      else {
+	esp.dma = false;
+      }
+      switch(v & CMD_CMD)
+	{
+	case 0x00:           /* NOP */
+	  break;
+	case 0x01:           /* FLUSH */
+	  esp.fifo_n = 0;
+	  break;
+	case 0x02:           /* RESET */
+	  esp_set_irq(false);
+	  esp_hard_reset();
+	  break;
+	case 0x03:           /* BUS RESET (no devices to reset) */
+	  if(not (esp.wregs[ESP_CFG1] & CFG1_RESREPT)) {
+	    esp.rregs[ESP_RINTR] |= INTR_RST;
+	    esp_set_irq(true);
+	  }
+	  break;
+	case 0x41:           /* SELECT, SELECT WITH ATN (and stop): nobody answers */
+	case 0x42:
+	case 0x43:
+	  if(esp.dma and not esp.dma_enabled) {
+	    esp.satn_pending = true;
+	  }
+	  else {
+	    esp_select_atn();
+	  }
+	  break;
+	case 0x12:           /* MESSAGE ACCEPTED */
+	  esp.rregs[ESP_RINTR] |= INTR_DC;
+	  esp.rregs[ESP_RSEQ] = 0;
+	  esp.rregs[ESP_RFLAGS] = 0;
+	  esp_set_irq(true);
+	  break;
+	case 0x18:           /* SET ATN... PAD */
+	  esp.rregs[ESP_RSTAT] = STAT_TC;
+	  esp.rregs[ESP_RINTR] |= INTR_FC;
+	  esp.rregs[ESP_RSEQ] = 0;
+	  break;
+	case 0x1a:           /* SET ATN, RESET ATN */
+	case 0x1b:
+	  break;
+	case 0x44:           /* ENABLE SELECTION */
+	  esp.rregs[ESP_RINTR] = 0;
+	  break;
+	case 0x45:           /* DISABLE SELECTION */
+	  esp.rregs[ESP_RINTR] = 0;
+	  esp_set_irq(true);
+	  break;
+	default:
+	  fprintf(stderr, "sun4m: esp: unmodeled command 0x%02x\n", v);
+	  break;
+	}
+      break;
+    case ESP_CFG1:
+    case ESP_CFG2:
+    case ESP_CFG3:
+    case ESP_RES3:
+    case ESP_RES4:
+      esp.rregs[reg] = v;
+      break;
+    default:                 /* bus id, timeouts, sync, clock conversion, test: write-only */
+      break;
+    }
+  esp.wregs[reg] = v;
+}
+
+/* ------------------------------------------------------- counter/timers */
+
+static const uint64_t CTR_PERIOD_NS = 500;
+static const uint32_t CTR_COUNT_MASK32 = 0xfffffe00u;
+static const uint32_t CTR_LIMIT_MASK32 = 0x7fffffffu;
+static const uint64_t CTR_MAX_COUNT64 = 0x7ffffffffffffe00ULL;
+static const uint64_t CTR_MAX_COUNT32 = 0x7ffffe00ULL;
+static const uint32_t CTR_REACHED = 0x80000000u;
+enum : uint32_t { CTR_LIMIT = 0, CTR_COUNTER = 1, CTR_NORST = 2, CTR_STATUS = 3, CTR_MODE = 4 };
+
+/* counter mode: periods between limit matches (qemu's ptimer limit,
+ * LIMIT_TO_PERIODS: the count shows 0, 512, ... up to limit - 1024, then wraps) */
+static uint64_t ctr_wrap(const slavio_ctr_t &t) {
+  uint64_t l = (t.limit != 0) ? t.limit : CTR_MAX_COUNT32;
+  uint64_t n = (l >> 9) - 1;
+  return (n == 0) ? 1 : n;
+}
+
+uint64_t sun4m_t::now_ns(const state_t *s) const {
+  return (s->icnt << ns_shift) + time_bias_ns;
+}
+
+bool sun4m_t::warp_to_next_event(state_t *s) {
+  if(next_event_ns == ~0ULL) {
+    return false;
+  }
+  uint64_t now = now_ns(s);
+  if(next_event_ns > now) {
+    time_bias_ns += next_event_ns - now;
+  }
+  timer_event(s);
+  return true;
+}
+
+/* qemu reads a counter as limit - ((c + 1) << 9) with c = floor(time to the
+ * next match / 500 ns) (ptimer_get_count): the elapsed periods round UP */
+static uint64_t ctr_periods_up(uint64_t elapsed_ns) {
+  return (elapsed_ns + CTR_PERIOD_NS - 1) / CTR_PERIOD_NS;
+}
+
+uint64_t sun4m_t::ctr_user_count(const slavio_ctr_t &t, uint64_t now) const {
+  uint64_t v = t.ubase;
+  if(t.on) {
+    v += ctr_periods_up(now - t.start_ns) << 9;
+  }
+  return v & CTR_MAX_COUNT64;
+}
+
+void sun4m_t::ctr_restart(slavio_ctr_t &t, uint64_t now) {
+  t.start_ns = now;
+  t.next_ns = now + ctr_wrap(t) * CTR_PERIOD_NS;
+}
+
+void sun4m_t::ctr_schedule(const state_t *s) {
+  (void)s;
+  uint64_t next = ~0ULL;
+  for(uint32_t i = 0; i <= SUN4M_NTIMER_CPUS; i++) {
+    if(ctr[i].on and not ctr_is_user(i) and ctr[i].next_ns < next) {
+      next = ctr[i].next_ns;
+    }
+  }
+  /* the first instruction at or after the match */
+  next_event_ns = next;
+  if(next == ~0ULL) {
+    next_event_icnt = ~0ULL;
+  }
+  else {
+    uint64_t rel = (next > time_bias_ns) ? (next - time_bias_ns) : 0;
+    next_event_icnt = (rel + (1ULL << ns_shift) - 1) >> ns_shift;
+  }
+}
+
+void sun4m_t::timer_event(state_t *s) {
+  uint64_t now = now_ns(s);
+  for(uint32_t i = 0; i <= SUN4M_NTIMER_CPUS; i++) {
+    slavio_ctr_t &t = ctr[i];
+    if(not t.on or ctr_is_user(i) or now < t.next_ns) {
+      continue;
+    }
+    uint64_t step = ctr_wrap(t) * CTR_PERIOD_NS;
+    t.next_ns += ((now - t.next_ns) / step + 1) * step;
+    /* free-run (limit 0): no match, no interrupt */
+    if(t.limit != 0) {
+      t.reached = CTR_REACHED;
+      t.irq = true;
+    }
+  }
+  update_irqs(s);
+  ctr_schedule(s);
+}
+
+uint32_t sun4m_t::ctr_read(state_t *s, uint32_t idx, uint32_t reg) {
+  slavio_ctr_t &t = ctr[idx];
+  uint64_t now = io_now_ns(s);
+  uint32_t v = 0;
+  switch(reg)
+    {
+    case CTR_LIMIT:
+      if(ctr_is_user(idx)) {               /* user timer MSW */
+	uint64_t c = ctr_user_count(t, now);
+	t.count = static_cast<uint32_t>(c) & CTR_COUNT_MASK32;
+	t.counthigh = static_cast<uint32_t>(c >> 32);
+	v = t.counthigh | t.reached;
+      }
+      else {                               /* the limit; the read clears the interrupt */
+	t.irq = false;
+	t.reached = 0;
+	update_irqs(s);
+	v = static_cast<uint32_t>(t.limit) & CTR_LIMIT_MASK32;
+      }
+      break;
+    case CTR_COUNTER:
+      if(ctr_is_user(idx)) {               /* user timer LSW */
+	uint64_t c = ctr_user_count(t, now);
+	t.count = static_cast<uint32_t>(c) & CTR_COUNT_MASK32;
+	t.counthigh = static_cast<uint32_t>(c >> 32);
+	v = t.count;
+      }
+      else {
+	uint64_t c = CTR_MAX_COUNT32 - 512;  /* a counter never started (qemu: count 0) */
+	if(t.on) {
+	  /* periods into the current wrap, rounded up; a match that is due but
+	   * not yet processed reads as the last count before the wrap */
+	  uint64_t n = ctr_wrap(t);
+	  c = (now >= t.next_ns) ? (n << 9) :
+	    (ctr_periods_up(now - (t.next_ns - n * CTR_PERIOD_NS)) << 9);
+	}
+	v = (static_cast<uint32_t>(c) & static_cast<uint32_t>(CTR_MAX_COUNT32)) | t.reached;
+      }
+      break;
+    case CTR_STATUS:
+      v = (idx > 0) ? t.run : 0;
+      break;
+    case CTR_MODE:
+      v = ctr_user_mode;
+      break;
+    default:
+      break;
+    }
+  return v;
+}
+
+void sun4m_t::ctr_write(state_t *s, uint32_t idx, uint32_t reg, uint32_t v) {
+  slavio_ctr_t &t = ctr[idx];
+  uint64_t now = io_now_ns(s);
+  switch(reg)
+    {
+    case CTR_LIMIT:
+      if(ctr_is_user(idx)) {               /* user timer MSW: reset the count to it */
+	t.limit = CTR_MAX_COUNT64;
+	t.counthigh = v & static_cast<uint32_t>(CTR_MAX_COUNT64 >> 32);
+	t.reached = 0;
+	t.ubase = (static_cast<uint64_t>(t.counthigh) << 32) | t.count;
+	t.start_ns = now;
+      }
+      else {                               /* new limit, count back to 0 */
+	t.irq = false;
+	t.limit = v & CTR_MAX_COUNT32;
+	ctr_restart(t, now);
+      }
+      break;
+    case CTR_COUNTER:
+      if(ctr_is_user(idx)) {               /* user timer LSW */
+	t.limit = CTR_MAX_COUNT64;
+	t.count = v & CTR_COUNT_MASK32;
+	t.reached = 0;
+	t.ubase = (static_cast<uint64_t>(t.counthigh) << 32) | t.count;
+	t.start_ns = now;
+      }
+      break;
+    case CTR_NORST: {
+      /* new limit, count kept.  (qemu keeps its ptimer's down-count, so its
+       * shown count jumps by the limit difference; this keeps the shown count
+       * and moves the next match.  Only the limit-0 free-run form is common.) */
+      uint64_t p = (now - t.start_ns) / CTR_PERIOD_NS;
+      t.limit = v & CTR_MAX_COUNT32;
+      uint64_t n = ctr_wrap(t);
+      t.start_ns = now - (p % n) * CTR_PERIOD_NS;
+      t.next_ns = t.start_ns + n * CTR_PERIOD_NS;
+      break;
+    }
+    case CTR_STATUS:
+      if(ctr_is_user(idx)) {               /* start/stop the user timer */
+	if((v & 1) and not t.on) {
+	  t.start_ns = now;
+	  t.on = true;
+	}
+	else if(not (v & 1) and t.on) {
+	  t.ubase = ctr_user_count(t, now);
+	  t.on = false;
+	}
+      }
+      t.run = v & 1;
+      break;
+    case CTR_MODE:
+      if(idx != 0) {
+	break;
+      }
+      for(uint32_t i = 0; i < SUN4M_NUM_CPUS; i++) {
+	uint32_t bit = 1u << i;
+	slavio_ctr_t &c = ctr[i + 1];
+	if((v & bit) == (ctr_user_mode & bit)) {
+	  continue;
+	}
+	if(v & bit) {                      /* counter -> user timer, count 0 */
+	  c.irq = false;
+	  c.on = c.run;
+	  c.limit = CTR_MAX_COUNT64;
+	  c.ubase = 0;
+	  c.count = 0;
+	  c.counthigh = 0;
+	  c.start_ns = now;
+	  ctr_user_mode |= bit;
+	}
+	else {                             /* user timer -> counter (always counting) */
+	  c.on = true;
+	  ctr_restart(c, now);
+	  ctr_user_mode &= ~bit;
+	}
+      }
+      break;
+    default:
+      break;
+    }
+  update_irqs(s);
+  ctr_schedule(s);
+}
+
+/* 0xff1300000 + n*0x1000 (CPU n, 0x10) and 0xff1310000 (system, 0x14):
+ * the timer index (0 = system, n + 1 = CPU n), or -1 */
+static int ctr_index(uint64_t pa) {
+  if(pa >= 0xff1310000ULL and pa < 0xff1310014ULL) {
+    return 0;
+  }
+  if(pa >= 0xff1300000ULL and pa < 0xff1300000ULL + 0x1000ULL * SUN4M_NTIMER_CPUS and (pa & 0xff0) == 0) {
+    return static_cast<int>((pa - 0xff1300000ULL) >> 12) + 1;
+  }
+  return -1;
+}
+
 sun4m_t::sun4m_t() {
+  reset_devices(0);
+}
+
+void sun4m_t::reset_devices(uint64_t now) {
+  intctl = intctl_t();
+  kbd_ms = escc_t(true, false);
+  serial = escc_t(false, true);
+  aux1 = aux2 = mdm = 0;     /* qemu slavio_misc_reset: config, aux1/2, modem ctl */
+  fdc = fdc_t();
+  espdma = sparc_dma_t();
+  ledma = sparc_dma_t();
+  esp = esp_t();
+  esp.rregs[ESP_CFG1] = 7;   /* qemu esp_hard_reset at realize */
   /* power-on reset values, as qemu's iommu_reset / ecc_realize+ecc_reset */
+  memset(iommu, 0, sizeof(iommu));
+  memset(ecc, 0, sizeof(ecc));
   iommu[IOMMU_CTRL] = IOMMU_VERSION;
   iommu[IOMMU_ARBEN] = IOMMU_MID;
   iommu[IOMMU_AFSR] = IOMMU_AFSR_RESV;
@@ -438,6 +1209,21 @@ sun4m_t::sun4m_t() {
   ecc[ECC_MER] = ECC_VERSION & 0xff000ffcu;
   ecc[ECC_MDR] = 0x20;
   ecc[ECC_MFAR0] = 0x07c00000;
+  /* qemu slavio_timer_reset: the system timer and each present CPU's counter
+   * free-run from the reset */
+  for(uint32_t i = 0; i <= SUN4M_NTIMER_CPUS; i++) {
+    ctr[i] = slavio_ctr_t();
+  }
+  ctr_user_mode = 0;
+  for(uint32_t i = 0; i <= SUN4M_NUM_CPUS; i++) {
+    ctr[i].on = true;
+    ctr[i].run = true;
+    ctr_restart(ctr[i], now);
+  }
+  next_event_icnt = ~0ULL;   /* free-running counters schedule nothing */
+  next_event_ns = ~0ULL;
+  cpu_halted = false;
+  reset_req = false;
 }
 
 static bool load_file(const char *fn, uint8_t *buf, size_t max, const char *what) {
@@ -453,6 +1239,28 @@ static bool load_file(const char *fn, uint8_t *buf, size_t max, const char *what
 }
 
 bool sun4m_t::load_prom(const char *fn) {
+  /* qemu's prom_init: an ELF (OpenBIOS, linked at 0xffd00000) loads its
+   * segments into the PROM at vaddr - 0xffd00000; anything else is a raw image */
+  uint32_t entry = 0;
+  uint64_t total = 0;
+  bool fits = true;
+  auto seg = [&](uint32_t vaddr, const uint8_t *data, uint32_t filesz, uint32_t memsz) {
+    uint64_t off = static_cast<uint64_t>(vaddr) - 0xffd00000ULL;
+    if(vaddr < 0xffd00000u or off + memsz > SUN4M_PROM_SIZE) {
+      fits = false;
+      return;
+    }
+    memset(&prom[off], 0, memsz);
+    memcpy(&prom[off], data, filesz);
+  };
+  if(for_each_elf_segment(fn, seg, &entry, &total)) {
+    if(not fits) {
+      fprintf(stderr, "sun4m: prom elf %s does not fit at 0xffd00000\n", fn);
+      return false;
+    }
+    fprintf(stderr, "sun4m: loaded prom elf %s (%llu bytes)\n", fn, static_cast<unsigned long long>(total));
+    return true;
+  }
   return load_file(fn, prom, SUN4M_PROM_SIZE, "prom");
 }
 
@@ -472,19 +1280,23 @@ static inline uint8_t bcd(uint32_t v) {
   return static_cast<uint8_t>(((v / 10) << 4) | (v % 10));
 }
 
-/* M48T08 clock registers at the top of the NVRAM.  The time is FIXED
- * (1995-09-11 00:00:00) so ISS runs are deterministic. */
-static uint8_t m48t08_clock(uint32_t off, const uint8_t *nvram) {
+/* M48T08 clock registers at the top of the NVRAM (qemu m48t59_read, sun4m
+ * base year 1968).  The time is rtc_base plus whole seconds of simulated time,
+ * as qemu -rtc base=...,clock=vm, so runs are deterministic. */
+static uint8_t m48t08_clock(uint32_t off, const uint8_t *nvram, int64_t t) {
+  time_t tt = static_cast<time_t>(t);
+  struct tm tm;
+  gmtime_r(&tt, &tm);
   switch(off)
     {
-    case 0x1ff8: return nvram[off];   /* control */
-    case 0x1ff9: return bcd(0);       /* seconds */
-    case 0x1ffa: return bcd(0);       /* minutes */
-    case 0x1ffb: return bcd(0);       /* hours */
-    case 0x1ffc: return bcd(1);       /* day of week */
-    case 0x1ffd: return bcd(11);      /* date */
-    case 0x1ffe: return bcd(9);       /* month */
-    case 0x1fff: return bcd(95);      /* year */
+    case 0x1ff8: return nvram[off];                                   /* control */
+    case 0x1ff9: return (nvram[off] & 0x80) | bcd(tm.tm_sec);         /* seconds, stop bit */
+    case 0x1ffa: return bcd(tm.tm_min);
+    case 0x1ffb: return bcd(tm.tm_hour);
+    case 0x1ffc: return nvram[off] | tm.tm_wday;                      /* day of week, century bits */
+    case 0x1ffd: return bcd(tm.tm_mday);
+    case 0x1ffe: return bcd(tm.tm_mon + 1);
+    case 0x1fff: return bcd((tm.tm_year + 1900 - 1968) % 100);
     default: break;
     }
   return nvram[off];
@@ -521,6 +1333,13 @@ static bool is_intctl(uint64_t pa) {
 void sun4m_t::update_irqs(state_t *s) {
   intctl.set_irq(14, kbd_ms.irq);    /* keyboard/mouse ESCC -> level 12 */
   intctl.set_irq(15, serial.irq);    /* serial ESCC -> level 12 */
+  intctl.set_irq(19, ctr[0].irq);    /* system timer -> level 10 */
+  intctl.set_irq(22, fdc.irq);       /* floppy -> level 11 */
+  intctl.set_irq(18, espdma.irq);    /* espdma (ESP) -> level 4 */
+  intctl.set_irq(16, ledma.irq);     /* ledma (Lance) -> level 6 */
+  for(uint32_t i = 0; i < SUN4M_NTIMER_CPUS; i++) {
+    intctl.set_cpu_timer_irq(i, ctr[i + 1].irq);   /* CPU counter -> level 14 */
+  }
   s->irl = intctl.irl(0);
 }
 
@@ -532,7 +1351,7 @@ uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) 
     uint32_t off = static_cast<uint32_t>(pa - 0xff1200000ULL);
     uint32_t v = 0;
     for(uint32_t i = 0; i < size; i++) {
-      v = (v << 8) | m48t08_clock(off + i, nvram);
+      v = (v << 8) | m48t08_clock(off + i, nvram, rtc_base + static_cast<int64_t>(io_now_ns(s) / 1000000000ULL));
     }
     return v;
   }
@@ -558,6 +1377,36 @@ uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) 
   }
   if(is_intctl(pa)) {
     return intctl.read(pa);
+  }
+  if(int ci = ctr_index(pa); ci >= 0) {
+    return ctr_read(s, static_cast<uint32_t>(ci), static_cast<uint32_t>(pa & 0x1f) >> 2);
+  }
+  if(pa == SUN4M_FW_CFG_BASE + 2 and size == 1) {
+    return fw_cfg.read();
+  }
+  if(pa >= 0xef0400000ULL and pa < 0xef0400024ULL and size == 4) {
+    uint32_t off = static_cast<uint32_t>(pa - 0xef0400000ULL);
+    if(off >= 0x20) {
+      return ledma.r[1];     /* qemu's ledma alias */
+    }
+    return ((off < 0x10) ? espdma : ledma).r[(off & 0xf) >> 2];
+  }
+  if(pa >= 0xef0800000ULL and pa < 0xef0800040ULL and size == 1) {
+    uint32_t v = esp_read(static_cast<uint32_t>(pa - 0xef0800000ULL) >> 2);
+    update_irqs(s);
+    return v;
+  }
+  if(pa == 0xefa000000ULL and size == 1) {
+    return 0;                /* APC (qemu: reads 0) */
+  }
+  if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
+    fprintf(stderr, "sun4m: lance register read pa 0x%llx (unmodeled)\n", static_cast<unsigned long long>(pa));
+    return 0;
+  }
+  if(pa >= 0xff1700000ULL and pa < 0xff1700008ULL) {
+    uint32_t v = fdc.read(static_cast<uint32_t>(pa & 7));
+    update_irqs(s);
+    return v;
   }
   switch(pa)
     {
@@ -652,6 +1501,46 @@ void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bu
     update_irqs(s);
     return;
   }
+  if(int ci = ctr_index(pa); ci >= 0) {
+    ctr_write(s, static_cast<uint32_t>(ci), static_cast<uint32_t>(pa & 0x1f) >> 2, v);
+    return;
+  }
+  if(pa == SUN4M_FW_CFG_BASE and size == 2) {
+    fw_cfg.select(static_cast<uint16_t>(v));
+    return;
+  }
+  if(pa >= 0xef0400000ULL and pa < 0xef0400024ULL and size == 4) {
+    uint32_t off = static_cast<uint32_t>(pa - 0xef0400000ULL);
+    if(off >= 0x20) {
+      dma_write(s, ledma, false, 1, v);
+    }
+    else if(off < 0x10) {
+      dma_write(s, espdma, true, off >> 2, v);
+    }
+    else {
+      dma_write(s, ledma, false, (off & 0xf) >> 2, v);
+    }
+    update_irqs(s);
+    return;
+  }
+  if(pa >= 0xef0800000ULL and pa < 0xef0800040ULL and size == 1) {
+    esp_write(static_cast<uint32_t>(pa - 0xef0800000ULL) >> 2, static_cast<uint8_t>(v));
+    update_irqs(s);
+    return;
+  }
+  if(pa == 0xefa000000ULL and size == 1) {
+    cpu_halted = true;       /* APC: idle the CPU until an interrupt */
+    return;
+  }
+  if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
+    fprintf(stderr, "sun4m: lance register write pa 0x%llx = 0x%x (unmodeled)\n", static_cast<unsigned long long>(pa), v);
+    return;
+  }
+  if(pa >= 0xff1700000ULL and pa < 0xff1700008ULL) {
+    fdc.write(static_cast<uint32_t>(pa & 7), static_cast<uint8_t>(v));
+    update_irqs(s);
+    return;
+  }
   switch(pa)
     {
     case 0xff1800000ULL:                  /* aux1: the floppy TC pulse bit never sticks */
@@ -679,10 +1568,11 @@ void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bu
       leds = static_cast<uint16_t>(v);
       return;
     case 0xff1f00000ULL:
-      if(v & 1) {                          /* SYS_RESET */
-	fprintf(stderr, "sun4m: system reset requested at pc 0x%x (not modeled)\n", s->pc);
+      if(v & 1) {                          /* SYS_RESET: RESETSTAT tells the PROM it was one */
+	fprintf(stderr, "sun4m: system reset at pc 0x%x icnt %llu\n", s->pc,
+		static_cast<unsigned long long>(s->icnt));
 	sysctrl = 0x2;
-	s->brk = true;
+	reset_req = true;
       }
       return;
     default:

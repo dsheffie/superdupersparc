@@ -1,8 +1,8 @@
 UNAME_S = $(shell uname -s)
 
-OBJ = top.o verilated.o verilated_vcd_c.o loadelf.o interpret.o sun4m.o disassemble.o helper.o sparse_mem.o
+OBJ = top.o verilated.o verilated_vcd_c.o loadelf.o interpret.o sun4m.o disassemble.o helper.o sparse_mem.o ckpt.o
 
-SV_SRC = core_l1d_l1i.sv core.sv exec.sv decode_sparc.sv mul.sv fpu.sv fpu_add.sv fpu_mul.sv fpu_compare.sv fpu_f2i.sv fpu_i2f.sv fpu_f2f.sv fp_regfile.sv find_first_set.sv uni_divider.sv l1d.sv l1i.sv machine.vh rob.vh uop.vh fp_compare.vh ram1r1w.sv ram2r1w.sv popcount.sv count_leading_zeros.sv fair_sched.sv ppa32.sv rf4r2w.sv reg_ram1rw.sv l2.sv predecode.sv
+SV_SRC = core_l1d_l1i.sv core.sv mmu.sv tlb.sv exec.sv decode_sparc.sv mul.sv fpu.sv fpu_add.sv fpu_mul.sv fpu_compare.sv fpu_f2i.sv fpu_i2f.sv fpu_f2f.sv fp_regfile.sv find_first_set.sv uni_divider.sv l1d.sv l1i.sv machine.vh rob.vh uop.vh fp_compare.vh ram1r1w.sv ram2r1w.sv popcount.sv count_leading_zeros.sv fair_sched.sv ppa32.sv rf4r2w.sv reg_ram1rw.sv l2.sv predecode.sv
 
 ifeq ($(UNAME_S),Linux)
 	CXX = clang++-16 -flto

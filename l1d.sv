@@ -125,7 +125,27 @@ module l1d(clk,
 	   mem_rsp_load_data,
 	   mem_rsp_bad,
 	   cache_accesses,
-	   cache_hits
+	   cache_hits,
+	   mmu_ctrl_e,
+	   mmu_ctx,
+	   page_walk_req_valid,
+	   page_walk_req_va,
+	   page_walk_req_mark,
+	   page_walk_req_probe,
+	   page_walk_rsp_valid,
+	   page_walk_rsp,
+	   page_walk_pte,
+	   tlb_busy,
+	   mmureg_wr,
+	   mmureg_fsr_clr,
+	   mmureg_sel,
+	   mmureg_wdata,
+	   mmureg_ctrl,
+	   mmureg_ctpr,
+	   mmureg_fsr,
+	   mmureg_far,
+	   asi_tlb_flush,
+	   tlb_flush
 	   );
 
    localparam L1D_NUM_SETS = 1 << `LG_L1D_NUM_SETS;
@@ -134,6 +154,32 @@ module l1d(clk,
    
    input logic clk;
    input logic reset;
+   /* SRMMU: the enable and context (mmu.sv), the dtlb's walk request (a pulse;
+    * the VA is held until the response) and response, and tlb_busy (a walk is
+    * pending: the LSU holds BLK_TLB requests until it drops) */
+   input logic mmu_ctrl_e;
+   input logic [`SRMMU_CTX_BITS-1:0] mmu_ctx;
+   output logic page_walk_req_valid;
+   output logic [31:0] page_walk_req_va;
+   output logic page_walk_req_mark;   /* set M in the PTE (a store, at the ROB head) */
+   output logic page_walk_req_probe;   /* an SRMMU probe (ASI 3 load, at the ROB head) */
+   input logic page_walk_rsp_valid;
+   input page_walk_rsp_t page_walk_rsp;
+   input logic [31:0] page_walk_pte;   /* the raw PTE (a probe's answer) */
+   output logic tlb_busy;
+   /* lda/sta to the SRMMU registers (ASI 4, register = VA[10:8]), performed here
+    * at the ROB head: a write (mmu.sv), the fault-status read-clear, and the
+    * registers to read */
+   output logic mmureg_wr;
+   output logic mmureg_fsr_clr;
+   output logic [2:0] mmureg_sel;
+   output logic [31:0] mmureg_wdata;
+   input logic [31:0] mmureg_ctrl;
+   input logic [31:0] mmureg_ctpr;
+   input logic [31:0] mmureg_fsr;
+   input logic [31:0] mmureg_far;
+   output logic asi_tlb_flush;   /* a store to ASI 3 (SRMMU flush): mmu.sv flushes both TLBs */
+   input logic tlb_flush;   /* clear the dtlb (mmu.sv: a ctrl/ctpr write or an ASI 3 flush) */
    
    output logic [3:0] state;
 
@@ -1001,7 +1047,13 @@ endfunction
       return e;
    endfunction
 
-   logic [N_LSU-1:0] t_sb_older, t_sb_match, t_sb_youngest;
+   logic [N_LSU-1:0] t_sb_older, t_sb_match, t_sb_youngest, t_sb_unres;
+   /* the slot's store has a PA in r_sb_pa: set by its address pass, cleared when
+    * the pass bounced (BLK_TLB: the store is back in the LSU without one) or
+    * faulted.  A load issued while an older store was in flight can reach port 2
+    * after that store bounced; it must not read past it. */
+   logic [N_LSU-1:0] r_sb_pa_ok;
+   logic 	     t_sb_unres_clr;
    logic [15:0] 	 t_ld_mask2;
    logic [`LG_MEM_SCHED_ENTRIES-1:0] t_sb_y;
    logic 				   t_sb_fwd, t_sb_blk;
@@ -1047,6 +1099,7 @@ endfunction
 		   (t_remapped_req2.cached ? ((|t_sb_match) & !t_sb_fwd) : (|t_sb_older));
 	t_sb_code = BLK_SB_CONFLICT;
 	t_sb_blk_st = t_remapped_req2.cached ? t_sb_match : t_sb_older;
+	t_sb_unres = t_sb_older & ~r_sb_pa_ok;
 	if(t_remapped_req2.cached && !lsu_sb.data_ok[t_sb_y] && r_sb_cached[t_sb_y] && w_sb_fwd_op &&
 	   ((t_ld_mask2 & ~r_sb_mask[t_sb_y]) == 16'd0))
 	  begin
@@ -1054,7 +1107,31 @@ endfunction
 	     t_sb_code = BLK_SB_DATA;
 	     t_sb_blk_st = t_sb_youngest;
 	  end
+	if(|t_sb_unres)
+	  begin
+	     /* an older store bounced off a dtlb miss: wait for the walk, then
+	      * the LSU reissues the store ahead of this load */
+	     t_sb_blk = r_req2.lsu_hold & !r_req2.is_store;
+	     t_sb_code = BLK_TLB;
+	     t_sb_blk_st = 'd0;
+	  end
      end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_sb_pa_ok <= 'd0;
+	  end
+	else if(t_sb_wr)
+	  begin
+	     r_sb_pa_ok[r_req2.lsu_idx] <= 1'b1;
+	  end
+	else if(t_sb_unres_clr)
+	  begin
+	     r_sb_pa_ok[r_req2.lsu_idx] <= 1'b0;
+	  end
+     end // always_ff@ (posedge clk)
 
    /* commit: the MQ entry is rebuilt from the store buffer (already physical,
     * already retired -- it fires at the MQ head with no graduation wait) */
@@ -1074,6 +1151,11 @@ endfunction
 	     t_mq_push_req.mapped = 1'b0;
 	     t_mq_push_req.is_store = 1'b1;
 	     t_mq_push_req.bad_addr = 1'b0;
+	  end
+	else if(r_req2.is_atomic)
+	  begin
+	     /* swap: its rd was captured into its store-buffer data slot */
+	     t_mq_push_req.data = r_sb_data[r_req2.lsu_idx];
 	  end
      end
 
@@ -1342,31 +1424,31 @@ endfunction
 	  begin
 	     /* a line fill: t_mem_head is the miss being serviced -> its pc is the
 	      * instruction that brought the line in (speculative if wrong-path). */
-	     l1d_fill({32'd0, r_cycle}, t_mem_head.pc, 64'(r_mem_req_addr),
+	     l1d_fill({32'd0, r_cycle}, 64'(t_mem_head.pc), 64'(r_mem_req_addr),
 		      mem_rsp_load_data[63:0], mem_rsp_load_data[127:64]);
 	  end
 	if(r_state == FLUSH_CL)
 	  begin
 	     /* CACHE-op (Index/Hit) invalidate/writeback on this line (funnel path). */
-	     l1d_cacheop({32'd0, r_cycle}, 64'd0, flush_cl_addr, flush_cl_inval ? 32'd1 : 32'd0);
+	     l1d_cacheop({32'd0, r_cycle}, 64'd0, 64'(flush_cl_addr), flush_cl_inval ? 32'd1 : 32'd0);
 	  end
 	/* mem-pipe CACHE ops (Hit-Invalidate 0x11 -> CHINV etc.) — these carry the op's pc. */
 	if(r_got_req & w_is_chop_r)
 	  begin
-	     l1d_cacheop({32'd0, r_cycle}, r_req.pc, 64'({r_req.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}}),
+	     l1d_cacheop({32'd0, r_cycle}, 64'(r_req.pc), 64'({r_req.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}}),
 			 (r_req.op == MEM_CHINV) ? 32'd1 : 32'd0);
 	  end
 	if(r_got_req2 & ~r_req2.is_store & (r_req2.pc[31:0] >= 32'h88018f2c)
 	   & (r_req2.pc[31:0] <= 32'h88018f48))
 	  begin
-	     rd_log(r_req2.pc, 64'(w_mapped_addr), t_rsp_data2, t_hit_cache2 ? 32'd1 : 32'd0);
+	     rd_log(64'(r_req2.pc), 64'(w_mapped_addr), t_rsp_data2, t_hit_cache2 ? 32'd1 : 32'd0);
 	  end
 	/* config_cache epilogue stack reloads (small-L1D derail): ld ra/s2/s1/s0,(sp)
 	 * at 0x8800f89c-a8 -- probe hit/miss + returned data to pin the stale reload. */
 	if(r_got_req2 & ~r_req2.is_store & (r_req2.pc[31:0] >= 32'h8800f89c)
 	   & (r_req2.pc[31:0] <= 32'h8800f8a8))
 	  begin
-	     rd_log(r_req2.pc, 64'(w_mapped_addr), t_rsp_data2, t_hit_cache2 ? 32'd1 : 32'd0);
+	     rd_log(64'(r_req2.pc), 64'(w_mapped_addr), t_rsp_data2, t_hit_cache2 ? 32'd1 : 32'd0);
 	  end
      end // always_ff
 `endif
@@ -2066,6 +2148,25 @@ endfunction
 	       t_array_data = merge_cl64(t_data, bswap64(r_req.data[63:0]), r_req.addr[DWORD_START]);
 	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
 	    end
+	  MEM_LDSTUB:
+	    begin
+	       /* old byte back (as ldub), 0xff into its lane (byte k of the bus word
+		* is bits [8k+7:8k]) */
+	       t_rsp_data = {56'd0, (r_req.addr[1:0] == 2'd0) ? t_w32[7:0] :
+			     (r_req.addr[1:0] == 2'd1) ? t_w32[15:8] :
+			     (r_req.addr[1:0] == 2'd2) ? t_w32[23:16] : t_w32[31:24]};
+	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
+	       t_array_data = merge_cl32(t_data, t_w32 | (32'h000000ff << {r_req.addr[1:0], 3'd0}), r_req.addr[WORD_STOP-1:WORD_START]);
+	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
+	    end
+	  MEM_SWAP:
+	    begin
+	       /* old word back (as ld), rd into the word */
+	       t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
+	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
+	       t_array_data = merge_cl32(t_data, bswap32(r_req.data[31:0]), r_req.addr[WORD_STOP-1:WORD_START]);
+	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
+	    end
 	  default:
 	    begin
 	    end
@@ -2181,14 +2282,189 @@ endfunction
 
 
    
-   /* SPARC, SRMMU not yet wired: the MMU-off translation (PA = VA), registered
-    * like a TLB's outputs (read the cycle after the request), until the SRMMU's
-    * TLB takes its place. */
+   /* SRMMU dtlb: looked up with the incoming request, its outputs line up with
+    * r_req2 (registered, like the MIPS dtlb this slot was built for).  A request
+    * through a translated ASI with the MMU on goes through the TLB; anything else
+    * gets PA = VA (the TLB's MMU-off answer), with PA[35:32] = ASI[3:0] for the
+    * bypass ASIs. */
+   wire 		w_dtlb_hit, w_dtlb_c, w_dtlb_m;
+   wire [2:0] 		w_dtlb_acc;
+   wire [1:0] 		w_dtlb_level;
+   wire [`PA_WIDTH-1:0] w_dtlb_pa;
+   logic [3:0] 		r_bypass_hi;
+   logic 		r_xlate2;
+   logic 		t_dtlb_replace;
+   wire 		w_xlate_in = mmu_ctrl_e & core_mem_req.mapped & !core_mem_req.commit;
+   logic t_mmureg_wr, t_mmureg_fsr_clr, t_asi_tlb_flush;
+   /* the ASIs that reach memory: 8/9, 0xa/0xb, 0x20-0x2f (interpret.cc asi_is_memory) */
+   wire w_asi_special2 = !((r_req2.asi == 8'h08) | (r_req2.asi == 8'h09) | (r_req2.asi == 8'h0a) |
+			   (r_req2.asi == 8'h0b) | (r_req2.asi[7:4] == 4'h2));
+   assign asi_tlb_flush = t_asi_tlb_flush;
+   assign mmureg_wr = t_mmureg_wr;
+   assign mmureg_fsr_clr = t_mmureg_fsr_clr;
+   assign mmureg_sel = r_req2.addr[10:8];
+   assign mmureg_wdata = r_sb_data[r_req2.lsu_idx][31:0];
+   wire [31:0] w_mmureg_rd = (r_req2.addr[10:8] == 3'd0) ? mmureg_ctrl :
+			     (r_req2.addr[10:8] == 3'd1) ? mmureg_ctpr :
+			     (r_req2.addr[10:8] == 3'd2) ? 32'(mmu_ctx) :
+			     (r_req2.addr[10:8] == 3'd3) ? mmureg_fsr :
+			     (r_req2.addr[10:8] == 3'd4) ? mmureg_far : 32'd0;
+
+   tlb #(.N(`N_DTLB_ENTRIES)) dtlb(
+				   .clk(clk),
+				   .reset(reset),
+				   .clear(tlb_flush),
+				   .active(w_xlate_in),
+				   .ctx(mmu_ctx),
+				   .req(1'b1),
+				   .va(core_mem_req.addr[31:0]),
+				   .pa(w_dtlb_pa),
+				   .hit(w_dtlb_hit),
+				   .acc(w_dtlb_acc),
+				   .level(w_dtlb_level),
+				   .c(w_dtlb_c),
+				   .m(w_dtlb_m),
+				   .replace(t_dtlb_replace),
+				   .replace_va(page_walk_req_va),
+				   .page_walk_rsp(page_walk_rsp),
+				   .set_m(page_walk_rsp_valid & r_walk_mark),
+				   .set_m_va(r_walk_va)
+				   );
    always_ff@(posedge clk)
      begin
-	w_tlb_c <= 3'd3;
-	w_mapped_addr <= `PA_WIDTH'(core_mem_req.addr);
+	r_bypass_hi <= (core_mem_req.asi[7:4] == 4'h2) ? core_mem_req.asi[3:0] : 4'd0;
+	r_xlate2 <= w_xlate_in;
      end
+   always_comb
+     begin
+	w_tlb_c = w_dtlb_c ? 3'd3 : 3'd2;
+	w_mapped_addr = {w_dtlb_pa[`PA_WIDTH-1:32] | r_bypass_hi, w_dtlb_pa[31:0]};
+     end
+
+   /* the port-2 request's translation verdict: a TLB miss walks (and blocks the
+    * request in the LSU); a hit is checked against ACC for the access (interpret.cc
+    * mmu_xlate perm tables: bit 0 read, 1 write, 2 execute) */
+   wire 		w_super2 = r_req2.asi[0];   /* 0x9/0xb */
+   wire [2:0] 		w_perm2 = w_super2 ?
+			((w_dtlb_acc == 3'd0) ? 3'd1 : (w_dtlb_acc == 3'd1) ? 3'd3 :
+			 (w_dtlb_acc == 3'd2) ? 3'd5 : (w_dtlb_acc == 3'd3) ? 3'd7 :
+			 (w_dtlb_acc == 3'd4) ? 3'd4 : (w_dtlb_acc == 3'd5) ? 3'd3 :
+			 (w_dtlb_acc == 3'd6) ? 3'd5 : 3'd7) :
+			((w_dtlb_acc == 3'd0) ? 3'd1 : (w_dtlb_acc == 3'd1) ? 3'd3 :
+			 (w_dtlb_acc == 3'd2) ? 3'd5 : (w_dtlb_acc == 3'd3) ? 3'd7 :
+			 (w_dtlb_acc == 3'd4) ? 3'd4 : (w_dtlb_acc == 3'd5) ? 3'd1 : 3'd0);
+   wire 		w_need_r2 = !r_req2.is_store | r_req2.is_atomic;
+   wire 		w_need_w2 = r_req2.is_store;
+   wire 		w_tlb_miss2 = r_xlate2 & !w_dtlb_hit;
+   wire 		w_perm_fault2 = r_xlate2 & w_dtlb_hit &
+			((w_need_r2 & !w_perm2[0]) | (w_need_w2 & !w_perm2[1]));
+   wire [2:0] 		w_at2 = {r_req2.is_store, 1'b0, w_super2};
+   /* a store to a page whose dtlb entry has M = 0: M must be set, and only for a
+    * store that will execute.  Speculative, it goes back to the LSU until it is at
+    * the ROB head (BLK_UNCACHEABLE's release); there, a mark walk sets PTE M (and
+    * the entry's), and the store waits it out (BLK_TLB) and replays with M = 1.
+    * While it is out of the pipe it is an unissued older store, so no younger load
+    * issues past it (and in-flight ones see its slot without a PA). */
+   wire 		w_need_m2 = r_xlate2 & w_dtlb_hit & r_req2.is_store & !w_dtlb_m;
+
+   /* the walk: one at a time.  A faulting walk leaves its verdict in a one-entry
+    * fault cache that the replayed request (the LSU re-issues it once tlb_busy
+    * drops) consumes; it is single-use, so a request after the handler fixed
+    * the PTE walks again. */
+   logic 		r_walk_busy, n_walk_busy;
+   logic 		r_walk_req, n_walk_req;
+   logic [31:0] 	r_walk_va, n_walk_va;
+   logic 		r_walk_mark, n_walk_mark;
+   /* a probe walk's answer, held until the replayed ASI 3 load takes it */
+   logic 		r_walk_probe, n_walk_probe;
+   logic 		r_prbres_valid, n_prbres_valid;
+   logic [19:0] 	r_prbres_vpn;
+   logic [31:0] 	r_prbres_pte;
+   logic 		t_walk_probe, t_prbres_use;
+   wire 		w_prbres_hit2 = r_prbres_valid & (r_prbres_vpn == r_req2.addr[31:12]);
+   logic 		r_fc_valid, n_fc_valid;
+   logic [19:0] 	r_fc_vpn;
+   logic [2:0] 		r_fc_ft;
+   logic [1:0] 		r_fc_level;
+   logic 		t_walk_start, t_walk_mark, t_fc_use;
+   wire 		w_fc_hit2 = r_fc_valid & (r_fc_vpn == r_req2.addr[31:12]);
+   assign page_walk_req_valid = r_walk_req;
+   assign page_walk_req_va = r_walk_va;
+   assign page_walk_req_mark = r_walk_mark;
+   assign page_walk_req_probe = r_walk_probe;
+   assign tlb_busy = r_walk_busy;
+
+   always_comb
+     begin
+	n_walk_busy = r_walk_busy;
+	n_walk_req = 1'b0;
+	n_walk_va = r_walk_va;
+	n_walk_mark = r_walk_mark;
+	n_walk_probe = r_walk_probe;
+	n_prbres_valid = r_prbres_valid & !t_prbres_use & !tlb_flush;
+	n_fc_valid = r_fc_valid & !t_fc_use;
+	t_dtlb_replace = 1'b0;
+	if(t_walk_start)
+	  begin
+	     n_walk_busy = 1'b1;
+	     n_walk_req = 1'b1;
+	     n_walk_va = r_req2.addr[31:0];
+	     n_walk_mark = t_walk_mark;
+	     n_walk_probe = t_walk_probe;
+	     n_fc_valid = 1'b0;
+	  end
+	if(page_walk_rsp_valid)
+	  begin
+	     n_walk_busy = 1'b0;
+	     /* a mark walk only sets the existing entry's M (set_m; even if the
+	      * PTE has since changed: the stale entry is software's to flush) */
+	     t_dtlb_replace = !page_walk_rsp.fault & !r_walk_mark & !r_walk_probe;
+	     n_fc_valid = page_walk_rsp.fault & !r_walk_mark & !r_walk_probe;
+	     n_prbres_valid = r_walk_probe;
+	  end
+     end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	r_walk_busy <= reset ? 1'b0 : n_walk_busy;
+	r_walk_req <= reset ? 1'b0 : n_walk_req;
+	r_fc_valid <= reset ? 1'b0 : n_fc_valid;
+	r_walk_va <= n_walk_va;
+	r_walk_mark <= reset ? 1'b0 : n_walk_mark;
+	r_walk_probe <= reset ? 1'b0 : n_walk_probe;
+	r_prbres_valid <= reset ? 1'b0 : n_prbres_valid;
+	if(page_walk_rsp_valid)
+	  begin
+	     r_prbres_vpn <= r_walk_va[31:12];
+	     r_prbres_pte <= page_walk_rsp.fault ? 32'd0 : page_walk_pte;
+	     r_fc_vpn <= r_walk_va[31:12];
+	     r_fc_ft <= page_walk_rsp.ft;
+	     r_fc_level <= page_walk_rsp.level;
+	  end
+     end // always_ff@ (posedge clk)
+
+`ifdef VERILATOR
+   /* BLK_TLB hands the request back to the LSU, which must still hold it: true
+    * of every op the mem pipe takes today (simple loads, plain stores); an
+    * unheld op (atomics, when they land) needs its own miss path */
+   always_ff@(negedge clk)
+     begin
+	if(!reset && r_got_req2 && w_tlb_miss2 && !r_req2.lsu_hold && !r_req2.commit)
+	  begin
+	     $display("[DTLB] cyc=%0d miss on an op the LSU does not hold: op=%0d pc=%x va=%x",
+		      r_cycle, r_req2.op, r_req2.pc, r_req2.addr);
+	     $stop();
+	  end
+	/* an atomic to an uncached page (or a bypass ASI) has no RMW path yet: the
+	 * port-1 uncached arms would write without answering */
+	if(!reset && r_got_req2 && r_req2.is_atomic && w_req2_nonspec && !drain_ds_complete &&
+	   !w_tlb_miss2 && !w_perm_fault2 && !w_need_m2 && !r_req2.bad_addr && !t_remapped_req2.cached)
+	  begin
+	     $display("[L1D] cyc=%0d uncached ldstub/swap: pc=%x va=%x", r_cycle, r_req2.pc, r_req2.addr);
+	     $stop();
+	  end
+     end
+`endif
    
 
 
@@ -2252,6 +2528,9 @@ endfunction
 	
 	t_got_miss = 1'b0;
 	t_push_miss = 1'b0;
+	t_mmureg_wr = 1'b0;
+	t_mmureg_fsr_clr = 1'b0;
+	t_asi_tlb_flush = 1'b0;
 	
 	n_req = r_req;
 	n_req_idx = r_req_idx;
@@ -2307,6 +2586,13 @@ endfunction
 	n_core_mem_rsp.lsu_hold = r_req.lsu_hold;
 	n_core_mem_rsp.lsu_idx = r_req.lsu_idx;
 	n_core_mem_rsp.blk = BLK_NONE;
+	n_core_mem_rsp.mmu = '0;
+	t_walk_start = 1'b0;
+	t_walk_mark = 1'b0;
+	t_walk_probe = 1'b0;
+	t_prbres_use = 1'b0;
+	t_fc_use = 1'b0;
+	t_sb_unres_clr = 1'b0;
 	n_core_mem_rsp.blk_st = 'd0;
 	n_core_mem_rsp.restart_id = r_req.restart_id;
 	
@@ -2366,6 +2652,7 @@ endfunction
 	 * that write) starts its fill here.  Anything else takes the MQ path. */
 	t_direct_fill = 1'b0;
 	t_direct_fill_ok = (r_state == ACTIVE) && r_got_req2 && !drain_ds_complete &&
+			   !w_tlb_miss2 && !w_perm_fault2 &&
 			   r_req2.lsu_hold && !r_req2.is_store && t_remapped_req2.cached &&
 			   !t_port2_hit_cache && !r_hit_busy_addr2 &&
 			   mem_q_empty && !r_got_req && !rr_last_wr && !r_lock_cache &&
@@ -2436,6 +2723,110 @@ endfunction
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
 			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
 			 n_core_mem_rsp_valid = 1'b1;			 
+		      end
+		    else if(w_asi_special2 && r_req2.lsu_hold && !w_req2_nonspec)
+		      begin
+			 /* a non-memory ASI, still speculative: back to the LSU */
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_UNCACHEABLE;
+		      end
+		    else if(w_asi_special2 && r_req2.lsu_hold && !r_req2.is_store && (r_req2.asi == 8'h03) && !w_prbres_hit2)
+		      begin
+			 /* an SRMMU probe at the ROB head: a read-only walk of the page
+			  * (no TLB fill), then replay and take its answer below */
+			 t_walk_start = !r_walk_busy;
+			 t_walk_probe = 1'b1;
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_TLB;
+		      end
+		    else if(w_asi_special2 && r_req2.lsu_hold)
+		      begin
+			 /* at the ROB head (interpret.cc asi_load/asi_store):
+			  *   4: the SRMMU registers (reading the fault status clears it)
+			  *   3: a store flushes (all of both TLBs); a probe load reads the
+			  *      PTE its walk found (0 on a fault)
+			  *   2: the module registers (the MBus port register; the MXCC
+			  *      stream ops only ever copy a block onto itself: no-ops)
+			  *   any other: loads read 0, stores are dropped */
+			 t_mmureg_wr = r_req2.is_store && (r_req2.asi == 8'h04);
+			 t_mmureg_fsr_clr = !r_req2.is_store && (r_req2.asi == 8'h04) && (r_req2.addr[10:8] == 3'd3);
+			 t_asi_tlb_flush = r_req2.is_store && (r_req2.asi == 8'h03);
+			 t_prbres_use = !r_req2.is_store && (r_req2.asi == 8'h03);
+			 n_core_mem_rsp.data = (r_req2.asi == 8'h04) ? `MEM_WIDTH'(w_mmureg_rd) :
+					       (r_req2.asi == 8'h03) ? `MEM_WIDTH'(r_prbres_pte) :
+					       ((r_req2.asi == 8'h02) && (r_req2.addr[31:0] == 32'h01c00f04)) ? `MEM_WIDTH'(32'h08000000) :
+					       'd0;
+			 n_core_mem_rsp.dst_valid = r_req2.dst_valid & !r_req2.is_store;
+			 n_core_mem_rsp_valid = 1'b1;
+		      end
+		    else if(w_tlb_miss2 & w_fc_hit2 & !r_walk_busy)
+		      begin
+			 /* the walk for this page faulted: answer with the fault (the
+			  * trap records it if the access retires) */
+			 t_fc_use = 1'b1;
+			 t_sb_unres_clr = r_req2.is_store;
+			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
+			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
+			 n_core_mem_rsp.mmu.fault = 1'b1;
+			 n_core_mem_rsp.mmu.ft = r_fc_ft;
+			 n_core_mem_rsp.mmu.level = r_fc_level;
+			 n_core_mem_rsp.mmu.at = w_at2;
+			 n_core_mem_rsp_valid = 1'b1;
+		      end
+		    else if(w_tlb_miss2)
+		      begin
+			 /* dtlb miss: walk (unless one is pending) and hold the request in
+			  * the LSU until the walk is done */
+			 t_pt2 = "T";
+			 t_walk_start = !r_walk_busy;
+			 t_sb_unres_clr = r_req2.is_store;
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_TLB;
+		      end
+		    else if(w_perm_fault2)
+		      begin
+			 t_sb_unres_clr = r_req2.is_store;
+			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
+			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
+			 n_core_mem_rsp.mmu.fault = 1'b1;
+			 n_core_mem_rsp.mmu.ft = (!w_super2 && (w_dtlb_acc[2:1] == 2'b11)) ? FT_PRIVILEGE : FT_PROTECTION;
+			 n_core_mem_rsp.mmu.level = w_dtlb_level;
+			 n_core_mem_rsp.mmu.at = w_at2;
+			 n_core_mem_rsp_valid = 1'b1;
+		      end
+		    else if(w_need_m2 && !w_req2_nonspec)
+		      begin
+			 /* M = 0, speculative: back to the LSU until at the ROB head */
+			 t_pt2 = "M";
+			 t_sb_unres_clr = 1'b1;
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_UNCACHEABLE;
+		      end
+		    else if(w_need_m2)
+		      begin
+			 /* M = 0 at the ROB head: the mark walk, then replay */
+			 t_pt2 = "M";
+			 t_walk_start = !r_walk_busy;
+			 t_walk_mark = 1'b1;
+			 t_sb_unres_clr = 1'b1;
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_TLB;
+		      end
+		    else if(r_req2.is_atomic && !w_req2_nonspec)
+		      begin
+			 /* ldstub/swap, still speculative: back to the LSU until it is at
+			  * the ROB head (BLK_UNCACHEABLE's release) */
+			 t_pt2 = "A";
+			 n_core_mem_blk_valid = 1'b1;
+			 n_core_mem_rsp.blk = BLK_UNCACHEABLE;
+		      end
+		    else if(r_req2.is_atomic)
+		      begin
+			 /* ldstub/swap at the ROB head (admitted only with the MQ empty, and
+			  * the LSU has no older op): queue it.  Port 1 reads the line, writes
+			  * the new value and answers the old one in one pass, filling the
+			  * line first on a miss (rv64core's AMOs) */
+			 t_push_miss = 1'b1;
 		      end
 		    else if(t_remapped_req2.cached && `IS_IO_PA(t_remapped_req2.addr[`PA_WIDTH-1:0]) && !w_is_chop2
 `ifndef ENABLE_R10000
@@ -2749,9 +3140,10 @@ endfunction
 			      /* plain store written: free its LSU slot */
 			      n_core_mem_st_done_valid = 1'b1;
 			   end
-			 else if(r_req.is_store)
+			 else if(r_req.is_store && !r_req.is_atomic)
 			   begin
-			      /* unreachable: every store but a CACHE op (own arm) is a commit */
+			      /* unreachable: every store but a CACHE op (own arm) or an atomic
+			       * (answered below; the op case writes the line) is a commit */
 			   end
 			 else
 			   begin
@@ -2857,7 +3249,7 @@ endfunction
 			     * (store-buffer and LSU state belong to the new era) */
 			    t_pop_mq = 1'b1;
 			    t_mq_stale_drop = 1'b1;
-			    t_mq_stale_owed = !t_mem_head.is_store;
+			    t_mq_stale_owed = !t_mem_head.is_store | t_mem_head.is_atomic;
 			 end
 		       else if(t_mem_head.commit)
 			 begin
@@ -2903,6 +3295,7 @@ endfunction
 			    t_addr = t_mem_head.addr;
 			    t_got_req = 1'b1;
 			    n_is_retry = 1'b1;
+			    n_last_wr = t_mem_head.is_atomic;   /* writes the line, as a commit */
 			    n_last_rd = 1'b1;
 			    t_got_rd_retry = 1'b1;
 			    
@@ -3405,17 +3798,19 @@ endfunction
    // (t_wr_array) so henry_tb can diff it against the golden ISS store stream.
    always_ff @(negedge clk)
      if(t_wr_array & ((r_req.op == MEM_SB) | (r_req.op == MEM_SH) |
-		      (r_req.op == MEM_SW) | (r_req.op == MEM_SD)))
-       wr_log(r_req.pc, 32'(r_req.rob_ptr), r_req.addr,
+		      (r_req.op == MEM_SW) | (r_req.op == MEM_SD) |
+		      (r_req.op == MEM_LDSTUB) | (r_req.op == MEM_SWAP)))
+       wr_log(64'(r_req.pc), 32'(r_req.rob_ptr), 64'(r_req.addr),
 	      (r_req.op == MEM_SB) ? {56'd0, r_req.data[7:0]}  :
 	      (r_req.op == MEM_SH) ? {48'd0, r_req.data[15:0]} :
-	      (r_req.op == MEM_SW) ? {32'd0, r_req.data[31:0]} : r_req.data,
+	      (r_req.op == MEM_LDSTUB) ? 64'hff :
+	      ((r_req.op == MEM_SW) | (r_req.op == MEM_SWAP)) ? {32'd0, r_req.data[31:0]} : r_req.data,
 	      r_req.is_atomic ? 32'd1 : 32'd0);
    // dirty-set-drop watch: a store's dirty=1 (t_wr_array) is suppressed when a dirty-clear
    // (refill w_cacheable_mem_rsp_valid, or invalidate t_mark_invalid) wins the dc_dirty port.
    always_ff @(negedge clk)
      if(t_wr_array & (t_mark_invalid | w_cacheable_mem_rsp_valid))
-       dirtydrop({32'd0, r_cycle}, r_req.pc, r_req.addr,
+       dirtydrop({32'd0, r_cycle}, 64'(r_req.pc), 64'(r_req.addr),
 		 w_cacheable_mem_rsp_valid ? 32'd1 : 32'd0);
    // L1D->L2 store/writeback watch: fire on each accepted store-type request to the L2
    // (MEM_SW carries dirty-line writebacks too; MEM_WB = explicit CACHE writeback).

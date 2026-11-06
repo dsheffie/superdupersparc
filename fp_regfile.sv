@@ -18,6 +18,8 @@
 /* checkpoint resume: seed the FP PRF from the ISS state at reset (Verilator
  * only -- stripped from synth). */
 import "DPI-C" function longint loadfpr(input int regid);
+/* the co-sim checker's copy of the FP PRF (top.cc: the FP register compare) */
+import "DPI-C" function void fp_prf_wr(input int ptr, input longint data);
 `endif
 
 module fp_regfile(clk, reset,
@@ -82,4 +84,17 @@ module fp_regfile(clk, reset,
 `endif
      end
 
+`ifdef VERILATOR
+   always_ff@(posedge clk)
+     begin
+	if(!reset && wen0)
+	  begin
+	     fp_prf_wr({{(32-LG_DEPTH){1'b0}}, 1'b0, wrptr0[LG_DEPTH-2:0]}, wr0);
+	  end
+	if(!reset && wen1)
+	  begin
+	     fp_prf_wr({{(32-LG_DEPTH){1'b0}}, 1'b1, wrptr1[LG_DEPTH-2:0]}, wr1);
+	  end
+     end // always_ff@ (posedge clk)
+`endif
 endmodule

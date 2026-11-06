@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cfloat>
 #include <cfenv>
 #include <iostream>
 #include <iomanip>
@@ -101,6 +102,9 @@ static T ld_phys(state_t *s, uint64_t pa) {
   if(pa < s->ram_size) {
     return be(s->mem.get<T>(pa));
   }
+  if(s->dev) {
+    return static_cast<T>(s->dev->read(s, pa, sizeof(T), &s->bus_error));
+  }
   if(s->sun4m) {
     return static_cast<T>(s->sun4m->read(s, pa, sizeof(T), &s->bus_error));
   }
@@ -112,6 +116,10 @@ template <typename T>
 static void st_phys(state_t *s, uint64_t pa, T v) {
   if(pa < s->ram_size) {
     s->mem.set<T>(pa, be(v));
+    return;
+  }
+  if(s->dev) {
+    s->dev->write(s, pa, sizeof(T), v, &s->bus_error);
     return;
   }
   if(s->sun4m) {
@@ -168,6 +176,43 @@ static inline uint64_t pte_pa_of(uint32_t pte, uint32_t level, uint32_t va) {
   return (base & ~static_cast<uint64_t>(off_mask[level])) | (va & off_mask[level]);
 }
 
+bool debug_walk(state_t *s, uint32_t va, uint32_t *pte, uint32_t *level, uint64_t *pa) {
+  uint64_t pte_pa = 0;
+  if(srmmu_walk(s, va, pte, &pte_pa, level) != FT_NONE) {
+    return false;
+  }
+  *pa = pte_pa_of(*pte, *level, va);
+  return true;
+}
+
+bool debug_fetch(state_t *s, uint32_t va, uint32_t *insn) {
+  uint64_t pa = va;
+  if(not (s->mmu_ctrl & MCR_E)) {
+    if(s->mmu_ctrl & MCR_BMODE) {
+      pa = SUN4M_PROM_BASE | (va & 0x7ffffu);
+    }
+  }
+  else {
+    uint32_t pte = 0, level = 0;
+    uint64_t pte_pa = 0;
+    if(srmmu_walk(s, va, &pte, &pte_pa, &level) != FT_NONE) {
+      return false;
+    }
+    pa = pte_pa_of(pte, level, va);
+  }
+  /* RAM and the PROM have no read side effects */
+  if(pa < s->ram_size) {
+    *insn = be(s->mem.get<uint32_t>(pa));
+    return true;
+  }
+  if(s->sun4m and pa >= SUN4M_PROM_BASE and pa + 4 <= SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
+    const uint8_t *p = &s->sun4m->prom[pa - SUN4M_PROM_BASE];
+    *insn = (static_cast<uint32_t>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+    return true;
+  }
+  return false;
+}
+
 /* translation/protection fault.  A fault status not yet read is replaced and
  * flagged OW (as qemu does). */
 static void mmu_record_fault(state_t *s, uint32_t ft, uint32_t level, uint32_t at, uint32_t va) {
@@ -199,15 +244,24 @@ static bool mmu_bus_error(state_t *s, uint64_t pa, bool is_write, bool is_exec, 
 
 /* Translate va for an access through a memory ASI.  Returns FT_NONE and *pa, or
  * the fault type (already recorded in the fault status/address registers). */
+/* the cacheability of mmu_xlate's last translation, as the RTL decides it (the
+ * PTE's C; MMU off = cached; the bypass ASIs uncached): the store check logs
+ * only the stores the L1D writes into its array */
+static bool g_xlate_cached = false;
+
 static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
   if(asi_is_bypass(asi)) {
     *pa = (static_cast<uint64_t>(asi & 0xf) << 32) | va;
+    g_xlate_cached = false;
     return FT_NONE;
   }
   if(not (s->mmu_ctrl & MCR_E)) {
-    /* Viking boot mode: MMU-off instruction fetches come from the PROM
-     * (offset masked to 512KB, as qemu does) */
-    if(acc == acc_t::fetch and (s->mmu_ctrl & MCR_BMODE)) {
+    g_xlate_cached = true;
+    /* Viking boot mode: MMU-off instruction-space accesses come from the PROM
+     * (offset masked to 512KB, as qemu does): fetches, and loads through the
+     * instruction ASIs 8/9 (OBP's POST reads its tables with lduba ASI 9; qemu
+     * treats those ASIs as code accesses).  Data ASIs go to RAM. */
+    if(acc != acc_t::store and (acc == acc_t::fetch or asi == 0x8 or asi == 0x9) and (s->mmu_ctrl & MCR_BMODE)) {
       *pa = SUN4M_PROM_BASE | (va & 0x7ffffu);
     }
     else {
@@ -234,6 +288,7 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
     mmu_record_fault(s, ft, level, at, va);
     return ft;
   }
+  g_xlate_cached = (pte >> 7) & 1;
   /* referenced on every access, modified on a store */
   uint32_t npte = pte | (1u << 5) | ((acc == acc_t::store) ? (1u << 6) : 0);
   if(npte != pte) {
@@ -244,13 +299,38 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
 }
 
 /* Viking cache/tag/flush ASIs: no caches are modeled, so loads read 0 (every tag
- * invalid, which ends Linux's tag-walking flush loops) and stores are dropped. */
+ * invalid, which ends Linux's tag-walking flush loops) and stores are dropped.
+ * 0xc-0xf are the SuperSPARC I/D-cache tag and data diagnostics (OpenBIOS
+ * clears the tags at startup). */
 static inline bool asi_is_viking_cache(uint32_t asi) {
-  return (asi >= 0x10 and asi <= 0x14) or asi == 0x18 or (asi >= 0x36 and asi <= 0x3f);
+  return (asi >= 0xc and asi <= 0xf) or (asi >= 0x10 and asi <= 0x14) or asi == 0x18 or
+    (asi >= 0x36 and asi <= 0x3f);
 }
 
-/* non-memory ASIs (lda/sta): SRMMU probe/flush (0x3) and registers (0x4) */
+/* the ASI 0x2 module register a word address selects (the high word of the
+ * 64-bit register at +0, the low word at +4), or -1 */
+static int mxcc_reg(uint32_t va) {
+  switch(va & ~7u)
+    {
+    case 0x01c00a00: return 3;
+    case 0x01c00c00: return 5;
+    case 0x01c00e00: return 6;
+    case 0x01c00f00: return 7;
+    default: return -1;
+    }
+}
+
+/* non-memory ASIs (lda/sta): module registers (0x2), SRMMU probe/flush (0x3)
+ * and registers (0x4) */
 static uint32_t asi_load(state_t *s, uint32_t asi, uint32_t va) {
+  if(asi == 0x2 and va >= 0x01c00000 and va < 0x01c00020) {
+    uint64_t d = s->mxccdata[(va >> 3) & 3];
+    return (va & 4) ? static_cast<uint32_t>(d) : static_cast<uint32_t>(d >> 32);
+  }
+  if(asi == 0x2 and mxcc_reg(va) >= 0) {
+    uint64_t r = s->mxcc[mxcc_reg(va)];
+    return (va & 4) ? static_cast<uint32_t>(r) : static_cast<uint32_t>(r >> 32);
+  }
   if(asi == 0x3) {          /* probe: the PTE, or 0 (only the "entire" type 4 walk is modeled) */
     uint32_t pte = 0, level = 0;
     uint64_t pte_pa = 0;
@@ -278,6 +358,44 @@ static uint32_t asi_load(state_t *s, uint32_t asi, uint32_t va) {
 }
 
 static void asi_store(state_t *s, uint32_t asi, uint32_t va, uint32_t v) {
+  if(asi == 0x2 and va >= 0x01c00000 and va < 0x01c00020) {
+    uint64_t &d = s->mxccdata[(va >> 3) & 3];
+    d = (va & 4) ? ((d & 0xffffffff00000000ULL) | v) : ((d & 0xffffffffULL) | (static_cast<uint64_t>(v) << 32));
+    return;
+  }
+  if(asi == 0x2 and (va & ~4u) == 0x01c00100) {
+    /* stream source: the register is 64 bits (the high word first); the copy
+     * runs when the low word, which holds the physical address, lands */
+    if(va & 4) {
+      for(uint32_t i = 0; i < 4; i++) {
+	uint64_t pa = v + 8 * i;
+	s->mxccdata[i] = (static_cast<uint64_t>(ld_phys<uint32_t>(s, pa)) << 32) | ld_phys<uint32_t>(s, pa + 4);
+      }
+    }
+    return;
+  }
+  if(asi == 0x2 and (va & ~4u) == 0x01c00200) {
+    if(va & 4) {
+      for(uint32_t i = 0; i < 4; i++) {
+	uint64_t pa = v + 8 * i;
+	st_phys<uint32_t>(s, pa, static_cast<uint32_t>(s->mxccdata[i] >> 32));
+	st_phys<uint32_t>(s, pa + 4, static_cast<uint32_t>(s->mxccdata[i]));
+      }
+    }
+    return;
+  }
+  if(asi == 0x2 and mxcc_reg(va) >= 0) {
+    int r = mxcc_reg(va);
+    uint64_t m = (va & 4) ? 0xffffffffULL : 0xffffffff00000000ULL;
+    uint64_t w = (va & 4) ? v : (static_cast<uint64_t>(v) << 32);
+    if(r == 6) {             /* error register: writing 1 clears the bit */
+      s->mxcc[6] &= ~(w & m);
+    }
+    else {
+      s->mxcc[r] = (s->mxcc[r] & ~m) | w;
+    }
+    return;
+  }
   if(asi == 0x3) {          /* TLB flush: there is no TLB */
     return;
   }
@@ -317,6 +435,7 @@ static void st_mem(state_t *s, uint32_t asi, uint32_t va, T v) {
 
 static void take_trap(state_t *s, uint32_t tt) {
   s->last_tt = tt;
+  s->ntraps++;
   if(s->user_emu) {
     fprintf(stderr, "ISS: unhandled trap tt 0x%x at pc 0x%x (user emulation)\n", tt, s->pc);
     s->brk = true;
@@ -534,12 +653,74 @@ static inline void set_ftt(state_t *s, uint32_t ftt) {
   s->fsr = (s->fsr & ~(7u << FSR_FTT_SHIFT)) | (ftt << FSR_FTT_SHIFT);
 }
 
+/* FP traps are precise, at the FPop, with the FP queue empty (qemu's model:
+ * Linux's do_mathemu then emulates the instruction at the trap pc and steps
+ * past it).  FSR.qne stays clear, so stdfq is never needed. */
 static uint32_t fp_unimp(state_t *s, uint32_t pc, uint32_t inst) {
+  (void)pc;
+  (void)inst;
   set_ftt(s, FTT_UNIMP);
-  s->fq_addr = pc;
-  s->fq_insn = inst;
-  s->fsr |= FSR_QNE;
   return TT_FP_EXCEPTION;
+}
+
+/* The FPU (fpu_add/fpu_mul/uni_divider/fpu_f2f) does not produce or consume
+ * denormals: it punts, unfinished_FPop, on any denormal operand or a nonzero
+ * exact result below the smallest normal (tininess before rounding), and the OS
+ * emulates the op.  The exact result comes from binary128: exact for products
+ * and for the cancellations that make a sum tiny, and a quotient of normals
+ * cannot sit within its rounding error of the boundary. */
+static inline bool den32(uint32_t x) { return (((x >> 23) & 0xff) == 0) and (x & 0x7fffff); }
+static inline bool den64(uint64_t x) { return (((x >> 52) & 0x7ff) == 0) and (x & 0xfffffffffffffULL); }
+static inline bool spec32(uint32_t x) { return ((x >> 23) & 0xff) == 0xff; }
+static inline bool spec64(uint64_t x) { return ((x >> 52) & 0x7ff) == 0x7ff; }
+
+static bool tiny_q(__float128 q, __float128 min_normal) {
+  __float128 m = (q < 0) ? -q : q;
+  return (q != 0) and (m < min_normal);
+}
+
+static bool fp_unfinished(uint32_t opf, uint32_t a32, uint32_t b32, uint64_t a64, uint64_t b64) {
+  switch(opf)
+    {
+    case 0x029:                                                       /* fsqrts */
+    case 0x0c9:                                                       /* fstod  */
+      return den32(b32);
+    case 0x02a:                                                       /* fsqrtd */
+      return den64(b64);
+    case 0x069:                                                       /* fsmuld */
+      return den32(a32) or den32(b32);
+    case 0x0c6: {                                                     /* fdtos  */
+      if(den64(b64)) {
+	return true;
+      }
+      double d = as_d(b64);
+      return not spec64(b64) and (d != 0.0) and (std::fabs(d) < static_cast<double>(FLT_MIN));
+    }
+    case 0x041: case 0x045: case 0x049: case 0x04d: {                 /* fadds fsubs fmuls fdivs */
+      if(den32(a32) or den32(b32)) {
+	return true;
+      }
+      if(spec32(a32) or spec32(b32)) {
+	return false;
+      }
+      __float128 x = as_f(a32), y = as_f(b32);
+      __float128 q = (opf == 0x041) ? x + y : (opf == 0x045) ? x - y : (opf == 0x049) ? x * y : x / y;
+      return tiny_q(q, static_cast<__float128>(FLT_MIN));
+    }
+    case 0x042: case 0x046: case 0x04a: case 0x04e: {                 /* faddd fsubd fmuld fdivd */
+      if(den64(a64) or den64(b64)) {
+	return true;
+      }
+      if(spec64(a64) or spec64(b64)) {
+	return false;
+      }
+      __float128 x = as_d(a64), y = as_d(b64);
+      __float128 q = (opf == 0x042) ? x + y : (opf == 0x046) ? x - y : (opf == 0x04a) ? x * y : x / y;
+      return tiny_q(q, static_cast<__float128>(DBL_MIN));
+    }
+    default:
+      return false;
+    }
 }
 
 /* float -> int32 (fstoi/fdtoi always round toward zero).  NaN and positive
@@ -582,6 +763,12 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
 
   uint32_t a32 = s->f[rs1], b32 = s->f[rs2];
   uint64_t a64 = get_d(s, rs1), b64 = get_d(s, rs2);
+
+  /* (user-mode emulation has no OS to emulate it: compute it, as the OS would) */
+  if(not fpop2 and not s->user_emu and fp_unfinished(opf, a32, b32, a64, b64)) {
+    set_ftt(s, FTT_UNFINISHED);
+    return TT_FP_EXCEPTION;
+  }
 
   if(fpop2) {
     bool is_e = false;
@@ -725,9 +912,6 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
   if(exc & tem) {
     /* IEEE trap: cexc updated, aexc and the destination untouched */
     set_ftt(s, FTT_IEEE);
-    s->fq_addr = pc;
-    s->fq_insn = inst;
-    s->fsr |= FSR_QNE;
     return TT_FP_EXCEPTION;
   }
   set_ftt(s, 0);
@@ -751,8 +935,12 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
 
 /* ---------------------------------------------------------------- execute */
 
+void take_interrupt(state_t *s, uint32_t level) {
+  take_trap(s, TT_INTERRUPT_BASE + level);
+}
+
 void execSparc(state_t *s) {
-  if(s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
+  if(not s->ext_irq and s->et and s->irl != 0 and (s->irl == 15 or s->irl > s->pil)) {
     take_trap(s, TT_INTERRUPT_BASE + s->irl);
     return;
   }
@@ -1198,6 +1386,23 @@ void execSparc(state_t *s) {
 	  asi_store(s, asi, addr, v);
 	}
       };
+#ifdef STORE_CHECK
+      /* the value the store writes, read before the op (swap overwrites rd) */
+      uint64_t st_data = 0;
+      switch(base_op)
+	{
+	case 0x04: case 0x0f: st_data = s->gpr(rd); break;
+	case 0x05: st_data = s->gpr(rd) & 0xffu; break;
+	case 0x06: st_data = s->gpr(rd) & 0xffffu; break;
+	case 0x07: st_data = (static_cast<uint64_t>(s->gpr(rd)) << 32) | s->gpr(rd + 1); break;
+	case 0x0d: st_data = 0xff; break;
+	case 0x24: st_data = s->f[rd]; break;
+	case 0x25: st_data = s->fsr; break;
+	case 0x26: st_data = (static_cast<uint64_t>(s->fq_addr) << 32) | s->fq_insn; break;
+	case 0x27: st_data = (static_cast<uint64_t>(s->f[rd & ~1u]) << 32) | s->f[rd | 1u]; break;
+	default: break;
+	}
+#endif
       switch(base_op)
 	{
 	case 0x00: wr(rd, ld32(0)); break;                                                 /* ld   */
@@ -1255,6 +1460,11 @@ void execSparc(state_t *s) {
 	  trap = TT_ILLEGAL;
 	  break;
 	}
+#ifdef STORE_CHECK
+      if(g_store_check and is_store and mem and (trap == NO_TRAP) and g_xlate_cached and (pa < s->ram_size)) {
+	g_iss_stores.emplace_back(static_cast<uint64_t>(s->pc), pa, st_data);
+      }
+#endif
       if(s->bus_error and mmu_bus_error(s, pa, is_store, false, is_alt)) {
 	/* NOTE: the access's register/memory side effects already happened; the
 	 * faulting part read 0 or was dropped (qemu also completes the insn on

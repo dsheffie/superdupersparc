@@ -74,10 +74,29 @@ module l1i(clk,
 	   mem_rsp_valid,
 	   mem_rsp_load_data,
 	   cache_accesses,
-	   cache_hits
+	   cache_hits,
+	   mmu_ctrl_e,
+	   mmu_ctx,
+	   tlb_flush,
+	   psr_s,
+	   page_walk_req_valid,
+	   page_walk_req_va,
+	   page_walk_rsp_valid,
+	   page_walk_rsp
 	   );
 
    input logic clk;
+   /* SRMMU: enable, context, PSR.S (the fetch ASI 0x8/0x9 for the ACC check), the
+    * itlb's walk request (a pulse; the VA is held until the response) and its
+    * response */
+   input logic mmu_ctrl_e;
+   input logic [`SRMMU_CTX_BITS-1:0] mmu_ctx;
+   input logic tlb_flush;   /* clear the itlb (mmu.sv: a ctrl/ctpr write) */
+   input logic psr_s;
+   output logic page_walk_req_valid;
+   output logic [31:0] page_walk_req_va;
+   input logic page_walk_rsp_valid;
+   input page_walk_rsp_t page_walk_rsp;
    output logic [3:0] state;
    
    input logic reset;
@@ -281,12 +300,13 @@ module l1i(clk,
    
    logic [`LG_FQ_ENTRIES:0] r_fq_tail_ptr, n_fq_tail_ptr;
    logic 		    r_resteer_bubble, n_resteer_bubble;
-   /* micro-ITLB always-miss: set for the single cycle after WAIT_FOR_TLB primes the
-    * JTLB, marking that the registered itlb outputs are valid for r_cache_pc. */
-   logic 		    r_itlb_ready, n_itlb_ready;
-   /* WAIT_FOR_TLB dwell counter: hold the (fixed-latency) JTLB lookup for the extra
-    * cycle the 2-cycle CAM split needs before pa/hit are valid for r_miss_pc. */
-   logic [1:0] 		    r_tlb_wait, n_tlb_wait;
+   /* WAIT_FOR_TLB: r_iw_mine = this wait's walk is out (a walk left over from
+    * before a restart is waited out first), r_iw_done = it answered last cycle
+    * (the itlb has the entry this cycle), r_ihold = a faulting fetch was pushed:
+    * fetch nothing more until the restart */
+   logic 		    r_iw_mine, n_iw_mine;
+   logic 		    r_iw_done;
+   logic 		    r_ihold, n_ihold;
    
    
    logic 		    fq_full, fq_next_empty, fq_empty;
@@ -380,15 +400,9 @@ endfunction
    logic [ITT_W-1:0] 	  t_ittu_ent;
 
    wire [`M_WIDTH-1:0]		  w_la_pc;
-   logic [`M_WIDTH-1:0]		  r_la_pc, r_tlb_pc;
    wire [`PA_WIDTH-1:0] w_tlb_pc;
-   wire [1:0]		  w_seg;
    
    
-   wire	       w_cached, w_mapped;
-   wire	       w_bad_perms;   /* mipsseg i-side AdEL (access-level / VA out-of-range) */
-   reg	       r_cached, r_mapped;
-   reg	       r_bad_va;      /* registered w_bad_perms, aligned with r_mapped/r_cache_pc */
    
    
    
@@ -707,45 +721,99 @@ endfunction
      end
 
 
-   /* SPARC, SRMMU not yet wired: fetch runs as with the MMU off (MCR.E = 0),
-    * PA = VA, cached.  The MIPS segment map and I-TLB are gone; the mapped paths
-    * below stay dead (r_mapped = 0) until the SRMMU's TLB takes their place. */
-   assign w_la_pc = n_cache_pc;
-   assign w_cached = 1'b1;
-   assign w_mapped = 1'b0;
-   assign w_seg = 2'd0;
-   assign w_bad_perms = 1'b0;
-
-   wire [`PA_WIDTH-1:0] w_itlb_pa = 'd0;
-   wire 		w_itlb_hit = 1'b0;
-   wire 		w_itlb_valid = 1'b0;
-   logic 		r_ufast_hit, r_ufast_valid;
-   logic [`PA_WIDTH-1:0] r_ufast_pa;
-
-   always@(posedge clk)
+   /* SRMMU itlb: looked up with the next fetch pc, so its (registered) outputs
+    * line up with r_cache_pc.  MMU off: PA = VA, cached. */
+   wire 		w_itlb_hit, w_itlb_c, w_itlb_m;
+   wire [2:0] 		w_itlb_acc;
+   wire [1:0] 		w_itlb_level;
+   wire [`PA_WIDTH-1:0] w_itlb_pa;
+   logic 		r_xlate;
+   logic 		t_itlb_replace;
+   tlb #(.N(`N_ITLB_ENTRIES)) itlb(
+				   .clk(clk),
+				   .reset(reset),
+				   .clear(tlb_flush),
+				   .active(mmu_ctrl_e),
+				   .ctx(mmu_ctx),
+				   .req(1'b1),
+				   .va(n_cache_pc[31:0]),
+				   .pa(w_itlb_pa),
+				   .hit(w_itlb_hit),
+				   .acc(w_itlb_acc),
+				   .level(w_itlb_level),
+				   .c(w_itlb_c),
+				   .m(w_itlb_m),
+				   .replace(t_itlb_replace),
+				   .replace_va(r_iwalk_va),
+				   .page_walk_rsp(page_walk_rsp),
+				   .set_m(1'b0),
+				   .set_m_va(32'd0)
+				   );
+   always_ff@(posedge clk)
      begin
-	r_tlb_pc <= reset ? 'd0 : w_la_pc;
-	r_la_pc <= reset ? 'd0 : w_la_pc;
-	r_cached <= reset ? 1'b0 : w_cached;
-	r_mapped <= reset ? 1'b0 : w_mapped;
-	r_bad_va <= reset ? 1'b0 : w_bad_perms;
+	r_xlate <= reset ? 1'b0 : mmu_ctrl_e;
      end
+   assign w_tlb_pc = w_itlb_pa;
+
+   /* the fetch's verdict: an itlb miss walks; a hit needs execute permission
+    * (interpret.cc mmu_xlate: user ACC 2-4, supervisor ACC 2-4 and 6-7) */
+   wire 		w_ix = psr_s ? ((w_itlb_acc[2:1] == 2'b01) | (w_itlb_acc == 3'd4) | (w_itlb_acc[2:1] == 2'b11)) :
+			((w_itlb_acc[2:1] == 2'b01) | (w_itlb_acc == 3'd4));
+   wire 		w_itlb_miss1 = r_xlate & !w_itlb_hit;
+   wire 		w_iperm_fault = r_xlate & w_itlb_hit & !w_ix;
+
+   /* the walk, one at a time; a faulting walk leaves its verdict in a one-entry
+    * fault cache the refetch consumes (single use, as in the l1d) */
+   logic 		r_iwalk_busy, n_iwalk_busy;
+   logic 		r_iwalk_req, n_iwalk_req;
+   logic [31:0] 	r_iwalk_va, n_iwalk_va;
+   logic 		r_ifc_valid, n_ifc_valid;
+   logic [19:0] 	r_ifc_vpn;
+   logic [2:0] 		r_ifc_ft;
+   logic [1:0] 		r_ifc_level;
+   logic 		t_iwalk_start, t_ifc_use;
+   wire 		w_ifc_hit = r_ifc_valid & (r_ifc_vpn == r_cache_pc[31:12]);
+   /* this fetch faults: a cached walk fault for its page, or no execute permission */
+   wire 		w_ifault = r_req & ((w_itlb_miss1 & w_ifc_hit) | w_iperm_fault);
+   assign page_walk_req_valid = r_iwalk_req;
+   assign page_walk_req_va = r_iwalk_va;
+
+   always_comb
+     begin
+	n_iwalk_busy = r_iwalk_busy;
+	n_iwalk_req = 1'b0;
+	n_iwalk_va = r_iwalk_va;
+	n_ifc_valid = r_ifc_valid & !t_ifc_use;
+	t_itlb_replace = 1'b0;
+	if(t_iwalk_start)
+	  begin
+	     n_iwalk_busy = 1'b1;
+	     n_iwalk_req = 1'b1;
+	     n_iwalk_va = r_miss_pc[31:0];
+	     n_ifc_valid = 1'b0;
+	  end
+	if(page_walk_rsp_valid)
+	  begin
+	     n_iwalk_busy = 1'b0;
+	     t_itlb_replace = !page_walk_rsp.fault;
+	     n_ifc_valid = page_walk_rsp.fault;
+	  end
+     end // always_comb
 
    always_ff@(posedge clk)
      begin
-	r_ufast_hit   <= 1'b0;
-	r_ufast_valid <= 1'b0;
-	r_ufast_pa    <= 'd0;
-     end
-
-   /* effective (source-agnostic) itlb result: a micro-TLB hit short-circuits the
-    * 48-way so the consume/fault logic below is oblivious to which supplied the PA. */
-   wire 		w_eff_hit   = w_itlb_hit | r_ufast_hit;
-   wire 		w_eff_valid = r_ufast_hit ? r_ufast_valid : w_itlb_valid;
-   wire [`PA_WIDTH-1:0] w_eff_pa = r_ufast_hit ? r_ufast_pa : w_itlb_pa;
-
-   /* For mapped (kuseg) addresses use TLB-translated PA; unmapped uses mipsseg output directly */
-   assign w_tlb_pc = (r_mapped && w_eff_hit) ? w_eff_pa : `PA_WIDTH'(r_la_pc);
+	r_iwalk_busy <= reset ? 1'b0 : n_iwalk_busy;
+	r_iwalk_req <= reset ? 1'b0 : n_iwalk_req;
+	r_ifc_valid <= reset ? 1'b0 : n_ifc_valid;
+	r_iwalk_va <= n_iwalk_va;
+	r_iw_done <= reset ? 1'b0 : (page_walk_rsp_valid & r_iw_mine);
+	if(page_walk_rsp_valid)
+	  begin
+	     r_ifc_vpn <= r_iwalk_va[31:12];
+	     r_ifc_ft <= page_walk_rsp.ft;
+	     r_ifc_level <= page_walk_rsp.level;
+	  end
+     end // always_ff@ (posedge clk)
    
    wire w_hit0 = r_valid_out0 & (r_tag_out0 == w_tlb_pc[(`PA_WIDTH-1):TAG_LSB]);
    wire w_hit1 = r_valid_out1 & (r_tag_out1 == w_tlb_pc[(`PA_WIDTH-1):TAG_LSB]);
@@ -790,15 +858,16 @@ endfunction
 	n_mem_req_cacheable = r_mem_req_cacheable;
 	
 	n_resteer_bubble = 1'b0;
-	n_itlb_ready = 1'b0;   /* 1 only for the cycle after WAIT_FOR_TLB primes */
-	n_tlb_wait = r_tlb_wait;
+	n_iw_mine = r_iw_mine;
+	n_ihold = r_ihold;
+	t_iwalk_start = 1'b0;
+	t_ifc_use = 1'b0;
 	t_next_spec_rs_tos = r_spec_rs_tos+'d1;
 	n_restart_req = restart_valid | r_restart_req;
 
-	/* I-TLB fault: mapped address with no TLB entry (refill) or V=0 (invalid).
-	 * In these cases suppress normal cache hit/miss — the pipeline will take
-	 * an ITLB exception instead of trying to fetch from memory. */
-	if(r_mapped && !(w_eff_hit && w_eff_valid))
+	/* an itlb miss or fault: no cache hit/miss (WAIT_FOR_TLB walks, or the
+	 * fetch is pushed as an instruction_access_exception) */
+	if(w_itlb_miss1 || w_iperm_fault)
 	  begin
 	     t_miss = 1'b0;
 	     t_hit  = 1'b0;
@@ -969,17 +1038,13 @@ endfunction
 		    n_state = ACTIVE;
 		    t_clear_fq = 1'b1;
 		 end // if (n_restart_req)
-	       else if(r_req && r_mapped && !r_itlb_ready && !r_ufast_hit)
+	       else if(w_itlb_miss1 && r_req && !w_ifc_hit)
 		 begin
-		    /* MICRO-ITLB always-miss: this mapped fetch's translation is not yet
-		     * primed.  Go prime the (2-cycle) JTLB in WAIT_FOR_TLB, holding
-		     * va = r_cache_pc's translation.  r_pc (may be a branch target for a
-		     * delay-slot fetch) is preserved so the fetch stream resumes correctly.
-		     * On return r_itlb_ready=1 and the normal consume runs with the now-
-		     * valid registered itlb outputs. */
+		    /* itlb miss: walk in WAIT_FOR_TLB, then re-present the fetch.
+		     * r_pc (may be a branch target for a delay-slot fetch) is held. */
 		    n_pc = r_pc;
 		    n_miss_pc = r_cache_pc;
-		    n_tlb_wait = 2'd0;
+		    n_iw_mine = 1'b0;
 		    n_state = WAIT_FOR_TLB;
 		 end
 	       else if(r_req && r_cache_pc[1:0] != 2'b00 && !fq_full)
@@ -993,12 +1058,18 @@ endfunction
 		    n_miss_pc = r_cache_pc;
 		    n_state = WAIT_FOR_NOT_FULL;
 		 end
-	       else if(r_req && r_mapped && !(w_eff_hit && w_eff_valid) && !fq_full)
+	       else if(w_ifault && !fq_full)
 		 begin
+		    /* instruction_access_exception: push the faulting fetch alone and
+		     * fetch nothing more until the trap restarts us */
 		    t_push_insn = 1'b1;
-		    n_pc = r_cache_pc + 'd4;
+		    t_ifc_use = w_itlb_miss1;
+		    n_pc = r_pc;
+		    n_miss_pc = r_cache_pc;
+		    n_ihold = 1'b1;
+		    n_state = WAIT_FOR_TLB;
 		 end
-	       else if(r_req && r_mapped && !(w_eff_hit && w_eff_valid) && fq_full)
+	       else if(w_ifault && fq_full)
 		 begin
 		    n_pc = r_pc;
 		    n_miss_pc = r_cache_pc;
@@ -1009,7 +1080,7 @@ endfunction
 		    n_state = INJECT_RELOAD;
 		    n_mem_req_addr = {w_tlb_pc[`PA_WIDTH-1:`LG_L1D_CL_LEN],
 				      {`LG_L1D_CL_LEN{1'b0}}};
-		    n_mem_req_cacheable = r_cached;
+		    n_mem_req_cacheable = w_itlb_c;
 		    n_mem_req_valid = 1'b1;
 		    n_miss_pc = r_cache_pc;
 		    n_pc = r_pc;
@@ -1031,10 +1102,16 @@ endfunction
 		      end
 		    else if(t_pd == 4'd10)
 		      begin
-			 /* ba,a: a jump with no delay slot -- straight to the target */
+			 /* ba,a: a jump with no delay slot -- straight to the target.
+			  * The array is already reading the next sequential insn (r_pc);
+			  * a delay-slot branch consumes that read as its slot, but here it
+			  * is the wrong path: drop it (n_req = 0), and the next cycle looks
+			  * up the target.  (Pushing it ran pc+4 after the jump: the branch
+			  * unit checks only the direction, so it retired.) */
 			 t_is_cflow = 1'b1;
 			 t_take_br = 1'b1;
 			 n_pc = r_cache_pc + t_simm;
+			 n_req = 1'b0;
 		      end
 		    else if(t_pd == 4'd8)
 		      begin
@@ -1264,22 +1341,19 @@ endfunction
 	    end
 	  WAIT_FOR_TLB:
 	    begin
-	       /* MICRO-ITLB always-miss prime: re-present r_miss_pc so the itlb holds
-	        * va = its translation for the 2 cycles the JTLB CAM needs; hold r_pc
-	        * (the post-fetch PC / branch target).  When the JTLB has settled
-	        * (!w_itlb_busy) return to ACTIVE with r_itlb_ready=1 so the normal
-	        * consume runs against the now-valid registered itlb outputs. */
-	       t_cache_idx = r_miss_pc[IDX_STOP-1:IDX_START];
-	       t_cache_tag = N_TAG_BITS'(r_miss_pc[(`M_WIDTH-1):TAG_LSB]);
-	       n_cache_pc = r_miss_pc;
+	       /* an itlb miss: walk for r_miss_pc (after any walk left over from
+		* before a restart has answered), then re-present it the cycle after
+		* the response, when the itlb holds the entry.  Or (r_ihold) a faulting
+		* fetch went out: wait for the restart. */
 	       n_pc = r_pc;
-	       n_req = 1'b1;
 	       if(n_flush_req)
 		 begin
 		    n_flush_req = 1'b0;
 		    t_clear_fq = 1'b1;
 		    n_state = FLUSH_CACHE;
 		    t_cache_idx = 0;
+		    n_iw_mine = 1'b0;
+		    n_ihold = 1'b0;
 		 end
 	       else if(n_fline_req)
 		 begin
@@ -1288,6 +1362,8 @@ endfunction
 		    n_state = FLUSH_CACHE;
 		    t_cache_idx = n_fline_idx;
 		    n_fline_one = 1'b1;
+		    n_iw_mine = 1'b0;
+		    n_ihold = 1'b0;
 		 end
 	       else if(n_restart_req)
 		 begin
@@ -1298,17 +1374,25 @@ endfunction
 		    n_req = 1'b0;
 		    n_state = ACTIVE;
 		    t_clear_fq = 1'b1;
+		    n_iw_mine = 1'b0;
+		    n_ihold = 1'b0;
 		 end
-	       else if(r_tlb_wait == 2'd2)
+	       else if(r_ihold)
 		 begin
-		    /* JTLB has had its 2 settle cycles with va held -> pa/hit valid for
-		     * r_miss_pc; hand back to ACTIVE with r_itlb_ready=1 to consume it. */
-		    n_itlb_ready = 1'b1;
+		 end
+	       else if(r_iw_done)
+		 begin
+		    t_cache_idx = r_miss_pc[IDX_STOP-1:IDX_START];
+		    t_cache_tag = N_TAG_BITS'(r_miss_pc[(`M_WIDTH-1):TAG_LSB]);
+		    n_cache_pc = r_miss_pc;
+		    n_req = 1'b1;
+		    n_iw_mine = 1'b0;
 		    n_state = ACTIVE;
 		 end
-	       else
+	       else if(!r_iw_mine && !r_iwalk_busy)
 		 begin
-		    n_tlb_wait = r_tlb_wait + 2'd1;
+		    t_iwalk_start = 1'b1;
+		    n_iw_mine = 1'b1;
 		 end
 	    end
 	  default:
@@ -1341,8 +1425,13 @@ endfunction
      begin
 	t_insn.data = t_insn_data;
 	t_insn.misaligned  = r_req & (r_cache_pc[1:0] != 2'b00);
-	t_insn.tlb_miss    = r_mapped & r_req & !w_eff_hit & (r_cache_pc[1:0] == 2'b00);
-	t_insn.bad_va      = r_req & r_bad_va;   /* AdEL; decode prioritizes over tlb_miss */
+	t_insn.tlb_miss    = w_ifault & (r_cache_pc[1:0] == 2'b00);
+	t_insn.bad_va      = 1'b0;
+	t_insn.mmu.fault   = w_ifault;
+	t_insn.mmu.ft      = w_itlb_miss1 ? r_ifc_ft :
+			     (!psr_s && (w_itlb_acc[2:1] == 2'b11)) ? FT_PRIVILEGE : FT_PROTECTION;
+	t_insn.mmu.level   = w_itlb_miss1 ? r_ifc_level : w_itlb_level;
+	t_insn.mmu.at      = {1'b0, 1'b1, psr_s};
 	t_insn.pc = r_cache_pc;
 	t_insn.pred_target = n_pc;
 	t_insn.pred = t_take_br;
@@ -1355,6 +1444,7 @@ endfunction
 	t_insn2.misaligned = 1'b0;
 	t_insn2.tlb_miss = 1'b0;
 	t_insn2.bad_va = 1'b0;
+	t_insn2.mmu = '0;
 	t_insn2.pc = r_cache_pc + 'd4;
 	t_insn2.pred_target = t_gb_take1 ? n_pc : 'd0;
 	t_insn2.pred = t_gb_take1;
@@ -2047,8 +2137,8 @@ endfunction
 	     r_cache_hits <= 'd0;
 	     r_cache_accesses <= 'd0;
 	     r_resteer_bubble <= 1'b0;
-	     r_itlb_ready <= 1'b0;
-	     r_tlb_wait <= 2'd0;
+	     r_iw_mine <= 1'b0;
+	     r_ihold <= 1'b0;
 	  end
 	else
 	  begin
@@ -2087,8 +2177,8 @@ endfunction
 	     r_cache_hits <= n_cache_hits;
 	     r_cache_accesses <= n_cache_accesses;
 	     r_resteer_bubble <= n_resteer_bubble;
-	     r_itlb_ready <= n_itlb_ready;
-	     r_tlb_wait <= n_tlb_wait;	     
+	     r_iw_mine <= n_iw_mine;
+	     r_ihold <= n_ihold;	     
 	  end
      end
    
