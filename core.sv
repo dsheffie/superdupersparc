@@ -640,7 +640,8 @@ module core(clk,
       r.in_delay_slot = e.in_delay_slot;
       r.dcti = e.dcti;
       r.valid_flags_dst = e.valid_flags_dst;
-      r.old_flags_pdst = e.old_flags_pdst;
+      r.icc_pdst = e.icc_pdst;
+      r.old_icc_pdst = e.old_icc_pdst;
       r.valid_dst2 = e.valid_dst2;
       r.pdst2 = e.pdst2;
       r.old_pdst2 = e.old_pdst2;
@@ -724,7 +725,8 @@ module core(clk,
       r.in_delay_slot = m.in_delay_slot;
       r.dcti = m.dcti;
       r.valid_flags_dst = m.valid_flags_dst;
-      r.old_flags_pdst = m.old_flags_pdst;
+      r.icc_pdst = m.icc_pdst;
+      r.old_icc_pdst = m.old_icc_pdst;
       r.valid_dst2 = m.valid_dst2;
       r.pdst2 = m.pdst2;
       r.old_pdst2 = m.old_pdst2;
@@ -852,15 +854,33 @@ module core(clk,
    logic [`LG_PRF_ENTRIES-1:0] n_retire_rat[`N_INT_ARCH_REGS-1:0];
    /* the flags RAT: the physical register of the youngest icc writer (icc is
     * stored in the integer PRF beside the value, uop.vh) */
-   logic [`LG_PRF_ENTRIES-1:0] r_flags_alloc_rat, n_flags_alloc_rat;
-   logic [`LG_PRF_ENTRIES-1:0] r_flags_retire_rat, n_flags_retire_rat;
+   /* the icc rename (machine.vh LG_ICC_PRF_ENTRIES): alloc / retire RAT, free
+    * lists; two writers can rename in one cycle (the lowest free version for
+    * the first, the highest for the second) */
+   localparam N_ICC_PRF_ENTRIES = (1<<`LG_ICC_PRF_ENTRIES);
+   logic [`LG_ICC_PRF_ENTRIES-1:0] r_icc_alloc_rat, n_icc_alloc_rat;
+   logic [`LG_ICC_PRF_ENTRIES-1:0] r_icc_retire_rat, n_icc_retire_rat;
+   logic [N_ICC_PRF_ENTRIES-1:0]   r_icc_prf_free, n_icc_prf_free;
+   logic [N_ICC_PRF_ENTRIES-1:0]   r_retire_icc_prf_free, n_retire_icc_prf_free;
+   wire [`LG_ICC_PRF_ENTRIES:0]    w_icc_ffs_lo, w_icc_ffs_hi_rev;
+   wire [`LG_ICC_PRF_ENTRIES-1:0]  w_icc_entry = w_icc_ffs_lo[`LG_ICC_PRF_ENTRIES-1:0];
+   wire [`LG_ICC_PRF_ENTRIES-1:0]  w_icc_entry2 = (N_ICC_PRF_ENTRIES - 1) - w_icc_ffs_hi_rev[`LG_ICC_PRF_ENTRIES-1:0];
+   /* at most one free version: both writers would get it */
+   wire 			   w_icc_two_free = (w_icc_entry != w_icc_entry2);
+   wire [N_ICC_PRF_ENTRIES-1:0]    w_icc_free_rev;
+   generate
+      for(genvar k = 0; k < N_ICC_PRF_ENTRIES; k = k + 1)
+	begin : icc_free_rev
+	   assign w_icc_free_rev[k] = r_icc_prf_free[N_ICC_PRF_ENTRIES - 1 - k];
+	end
+   endgenerate
+   find_lowest_set_bit#(`LG_ICC_PRF_ENTRIES) ffs_icc_lo(.in(r_icc_prf_free), .y(w_icc_ffs_lo));
+   find_lowest_set_bit#(`LG_ICC_PRF_ENTRIES) ffs_icc_hi(.in(w_icc_free_rev), .y(w_icc_ffs_hi_rev));
    /* committed reference counts: how many committed mappings (GPR RAT entries
     * plus the flags RAT) hold each integer physical register.  Changed only at
     * retire; a register is freed when its count reaches 0.  p0 (%g0, also the
     * reset flags register) is pinned and never counted. */
-   logic [`LG_PRF_REFCNT-1:0] r_prf_refcnt[N_PRF_ENTRIES-1:0];
-   logic [`LG_PRF_REFCNT-1:0] n_prf_refcnt[N_PRF_ENTRIES-1:0];
-   logic [N_PRF_ENTRIES-1:0]  t_prf_ref_free;
+   logic [N_PRF_ENTRIES-1:0]  t_prf_retire_free;   /* integer registers freed this cycle */
    
    logic [`LG_HILO_PRF_ENTRIES-1:0] r_hilo_alloc_rat;
    logic [`LG_HILO_PRF_ENTRIES-1:0] n_hilo_alloc_rat;
@@ -2277,7 +2297,8 @@ module core(clk,
 	
 	
 	/* ldd's second destination takes the second slot's allocator */
-	t_enough_iprfs = !((t_uop.dst_valid) && t_gpr_ffs_full) && !(t_uop.dst2_valid && t_gpr_ffs2_full);
+	t_enough_iprfs = !((t_uop.dst_valid) && t_gpr_ffs_full) && !(t_uop.dst2_valid && t_gpr_ffs2_full) &&
+			 !(t_uop.flags_dst_valid && (r_icc_prf_free == 'd0));
 	t_enough_hlprfs = !((t_uop.hilo_dst_valid) && (r_hilo_prf_free == 'd0));
 	t_enough_fprfs = !((t_uop.fp_dst_valid) && (t_uop.is_mem ? t_fp_b1_full : t_fp_b0_full));
 	t_enough_fcrprfs = !((t_uop.fcr_dst_valid) && (r_fcr_prf_free == 'd0));
@@ -2285,7 +2306,10 @@ module core(clk,
 
 	/* an ldd allocates alone: in slot 0 its rd+1 uses slot 1's allocator, and in
 	 * slot 1 it would need a third */
-	t_enough_next_iprfs = !((t_uop2.dst_valid) && t_gpr_ffs2_full) && !t_uop.dst2_valid && !t_uop2.dst2_valid;
+	t_enough_next_iprfs = !((t_uop2.dst_valid) && t_gpr_ffs2_full) && !t_uop.dst2_valid && !t_uop2.dst2_valid &&
+			      /* a second icc writer needs a second free version */
+			      !(t_uop2.flags_dst_valid && ((r_icc_prf_free == 'd0) ||
+							   (t_uop.flags_dst_valid && !w_icc_two_free)));
 	t_enough_next_hlprfs = !((t_uop2.hilo_dst_valid) /*&& (r_hilo_prf_free == 'd0)*/);
 	/* one FP dst alloc per cycle: slot 1 FP-dst needs a free FP reg AND slot 0 not also FP-dst */
 	t_enough_next_fprfs = !((t_uop2.fp_dst_valid) && ((t_uop2.is_mem ? t_fp_b1_full : t_fp_b0_full) || t_uop.fp_dst_valid));
@@ -3086,13 +3110,13 @@ module core(clk,
      begin
 	if(reset)
 	  begin
-	     r_flags_alloc_rat <= 'd0;
-	     r_flags_retire_rat <= 'd0;
+	     r_icc_alloc_rat <= 'd0;
+	     r_icc_retire_rat <= 'd0;
 	  end
 	else
 	  begin
-	     r_flags_alloc_rat <= t_rat_copy ? r_flags_retire_rat : n_flags_alloc_rat;
-	     r_flags_retire_rat <= n_flags_retire_rat;
+	     r_icc_alloc_rat <= t_rat_copy ? r_icc_retire_rat : n_icc_alloc_rat;
+	     r_icc_retire_rat <= n_icc_retire_rat;
 	  end
      end // always_ff@ (posedge clk)
 
@@ -3115,20 +3139,6 @@ module core(clk,
 		  end
 	     end // always_ff@ (posedge clk)
 	end // block: int_rat
-      for(genvar i = 0; i < N_PRF_ENTRIES; i = i + 1)
-	begin : prf_refcnt
-	   always_ff@(posedge clk)
-	     begin
-		if(reset)
-		  begin
-		     r_prf_refcnt[i] <= reset_mapped(i) ? 'd1 : 'd0;
-		  end
-		else
-		  begin
-		     r_prf_refcnt[i] <= n_prf_refcnt[i];
-		  end
-	     end // always_ff@ (posedge clk)
-	end // block: prf_refcnt
    endgenerate
 
    always_ff@(posedge clk)
@@ -3201,7 +3211,7 @@ module core(clk,
    always_comb
      begin
 	n_alloc_rat = r_alloc_rat;
-	n_flags_alloc_rat = r_flags_alloc_rat;
+	n_icc_alloc_rat = r_icc_alloc_rat;
 	n_hilo_alloc_rat = r_hilo_alloc_rat;
 	n_fcr_alloc_rat = r_fcr_alloc_rat;
 	n_fp_alloc_rat = r_fp_alloc_rat;
@@ -3230,10 +3240,11 @@ module core(clk,
 	  begin
 	     t_alloc_uop.srcD = r_alloc_rat[arch_idx(t_uop.srcD)];
 	  end
-	/* an icc reader's srcC is the youngest icc writer's register */
+	/* an icc reader takes the youngest icc version (srcC carries nothing) */
 	if(t_uop.flags_src_valid)
 	  begin
-	     t_alloc_uop.srcC = r_flags_alloc_rat;
+	     t_alloc_uop.icc_src = r_icc_alloc_rat;
+	     t_alloc_uop.srcC_valid = 1'b0;
 	  end
 	else if(t_uop.srcC_valid)
 	  begin
@@ -3277,7 +3288,8 @@ module core(clk,
 	  end
 	if(t_uop2.flags_src_valid)
 	  begin
-	     t_alloc_uop2.srcC = t_uop.flags_dst_valid ? n_prf_entry : r_flags_alloc_rat;
+	     t_alloc_uop2.icc_src = t_uop.flags_dst_valid ? w_icc_entry : r_icc_alloc_rat;
+	     t_alloc_uop2.srcC_valid = 1'b0;
 	  end
 	else if(t_uop2.srcC_valid)
 	  begin
@@ -3312,7 +3324,8 @@ module core(clk,
 		    end
 		  if(t_uop.flags_dst_valid)
 		    begin
-		       n_flags_alloc_rat = n_prf_entry;
+		       n_icc_alloc_rat = w_icc_entry;
+		       t_alloc_uop.icc_dst = w_icc_entry;
 		    end
 		  t_alloc_uop.dst = n_prf_entry;
 		  if(t_uop.dst2_valid)
@@ -3351,7 +3364,8 @@ module core(clk,
 		    end
 		  if(t_uop2.flags_dst_valid)
 		    begin
-		       n_flags_alloc_rat = n_prf_entry2;
+		       n_icc_alloc_rat = w_icc_entry2;
+		       t_alloc_uop2.icc_dst = w_icc_entry2;
 		    end
 		  t_alloc_uop2.dst = n_prf_entry2;
 	       end
@@ -3382,7 +3396,7 @@ module core(clk,
 	  begin
 	     n_retire_rat[w_wm_flat] = t_wm_preg;
 	  end
-	n_flags_retire_rat = r_flags_retire_rat;
+	n_icc_retire_rat = r_icc_retire_rat;
 	n_hilo_retire_rat = r_hilo_retire_rat;
 	n_fcr_retire_rat = r_fcr_retire_rat;
 	n_fp_retire_rat = r_fp_retire_rat;
@@ -3412,7 +3426,7 @@ module core(clk,
 	
 	if(t_retire)
 	  begin
-	     /* freeing is by reference count (below), not old_pdst */
+	     /* the integer and icc free lists are updated below (w_ret0 / w_ret1) */
 	     if(t_rob_head.valid_dst)
 	       begin
 		  if(t_rob_head.ldst != 'd0)
@@ -3421,7 +3435,7 @@ module core(clk,
 		    end
 		  if(t_rob_head.valid_flags_dst)
 		    begin
-		       n_flags_retire_rat = t_rob_head.pdst;
+		       n_icc_retire_rat = t_rob_head.icc_pdst;
 		    end
 		  if(t_rob_head.valid_dst2)
 		    begin
@@ -3462,7 +3476,7 @@ module core(clk,
 		    end
 		  if(t_rob_next_head.valid_flags_dst)
 		    begin
-		       n_flags_retire_rat = t_rob_next_head.pdst;
+		       n_icc_retire_rat = t_rob_next_head.icc_pdst;
 		    end
 	       end
 	     else if(t_retire_two && t_rob_next_head.valid_fp_dst)
@@ -3501,7 +3515,8 @@ module core(clk,
 	t_rob_tail.pdst  = 'd0;
 	t_rob_tail.old_pdst  = 'd0;
 	t_rob_tail.valid_flags_dst = 1'b0;
-	t_rob_tail.old_flags_pdst = 'd0;
+	t_rob_tail.icc_pdst = 'd0;
+	t_rob_tail.old_icc_pdst = 'd0;
 	t_rob_tail.valid_dst2 = 1'b0;
 	t_rob_tail.pdst2 = 'd0;
 	t_rob_tail.old_pdst2 = 'd0;
@@ -3556,7 +3571,8 @@ module core(clk,
 	t_rob_next_tail.pdst  = 'd0;
 	t_rob_next_tail.old_pdst  = 'd0;
 	t_rob_next_tail.valid_flags_dst = 1'b0;
-	t_rob_next_tail.old_flags_pdst = 'd0;
+	t_rob_next_tail.icc_pdst = 'd0;
+	t_rob_next_tail.old_icc_pdst = 'd0;
 	t_rob_next_tail.valid_dst2 = 1'b0;
 	t_rob_next_tail.pdst2 = 'd0;
 	t_rob_next_tail.old_pdst2 = 'd0;
@@ -3627,7 +3643,8 @@ module core(clk,
 		  t_rob_tail.pdst = n_prf_entry;
 		  t_rob_tail.old_pdst = r_alloc_rat[arch_idx(t_uop.dst)];
 		  t_rob_tail.valid_flags_dst = t_uop.flags_dst_valid;
-		  t_rob_tail.old_flags_pdst = r_flags_alloc_rat;
+		  t_rob_tail.icc_pdst = w_icc_entry;
+		  t_rob_tail.old_icc_pdst = r_icc_alloc_rat;
 		  t_rob_tail.valid_dst2 = t_uop.dst2_valid;
 		  t_rob_tail.pdst2 = n_prf_entry2;
 		  t_rob_tail.old_pdst2 = r_alloc_rat[arch_idx(t_uop.dst2)];
@@ -3702,7 +3719,8 @@ module core(clk,
 		  t_rob_next_tail.old_pdst = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop.dst == t_uop2.dst)) ?
 					     t_rob_tail.pdst : r_alloc_rat[arch_idx(t_uop2.dst)];
 		  t_rob_next_tail.valid_flags_dst = t_uop2.flags_dst_valid;
-		  t_rob_next_tail.old_flags_pdst = t_uop.flags_dst_valid ? t_rob_tail.pdst : r_flags_alloc_rat;
+		  t_rob_next_tail.icc_pdst = w_icc_entry2;
+		  t_rob_next_tail.old_icc_pdst = t_uop.flags_dst_valid ? w_icc_entry : r_icc_alloc_rat;
 	       end
 	     else if(t_uop2.fp_dst_valid)
 	       begin
@@ -4414,98 +4432,107 @@ module core(clk,
 	  begin
 	     n_prf_free[n_prf_entry2] = 1'b0;
 	  end
-	n_prf_free = n_prf_free | t_prf_ref_free;
+	n_prf_free = n_prf_free | t_prf_retire_free;
 	if(t_wm_fill)
 	  begin
 	     n_prf_free[t_wm_preg] = 1'b0;
 	  end
      end // always_comb
 
-   /* the committed reference counts.  A retiring writer adds one reference to
-    * its pdst per committed mapping it creates (the GPR RAT unless rd is %g0,
-    * the flags RAT if it writes icc) and removes one from each register it
-    * displaces (old_pdst, old_flags_pdst).  A register some retire touched whose
-    * count lands at 0 is free -- including a pdst no mapping kept.  Two retires a
-    * cycle touch up to six registers, so each count takes the summed change. */
+   /* integer frees at retire (r9999's scheme): a GPR writer frees the register it
+    * displaces (old_pdst; an ldd's rd+1 old_pdst2); one whose rd is %g0 (an
+    * icc-only writer such as cmp) frees its own pdst, which nothing maps.  A
+    * window spill (WMISS_SEQ) frees the group's registers, a fill takes them. */
    wire w_ret0 = t_retire & t_rob_head.valid_dst;
    wire w_ret0_gpr = w_ret0 & (t_rob_head.ldst != 'd0);
-   wire w_ret0_flags = w_ret0 & t_rob_head.valid_flags_dst;
    wire w_ret0_dst2 = w_ret0 & t_rob_head.valid_dst2;   /* ldd: always retires as the head */
    wire w_ret1 = t_retire & t_retire_two & t_rob_next_head.valid_dst;
    wire w_ret1_gpr = w_ret1 & (t_rob_next_head.ldst != 'd0);
-   wire w_ret1_flags = w_ret1 & t_rob_next_head.valid_flags_dst;
-   logic [`LG_PRF_REFCNT+1:0] t_ref_inc[N_PRF_ENTRIES-1:0];
-   logic [`LG_PRF_REFCNT+1:0] t_ref_dec[N_PRF_ENTRIES-1:0];
-   logic [N_PRF_ENTRIES-1:0]  t_ref_touch;
+   wire [`LG_PRF_ENTRIES-1:0] w_free0 = w_ret0_gpr ? t_rob_head.old_pdst : t_rob_head.pdst;
+   wire [`LG_PRF_ENTRIES-1:0] w_free1 = w_ret1_gpr ? t_rob_next_head.old_pdst : t_rob_next_head.pdst;
 
    always_comb
      begin
-	for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
+	t_prf_retire_free = 'd0;
+	n_retire_prf_free = r_retire_prf_free;
+	if(w_ret0)
 	  begin
-	     t_ref_inc[i] = 'd0;
-	     t_ref_dec[i] = 'd0;
-	     if(t_wm_spill && (t_wm_preg == i[`LG_PRF_ENTRIES-1:0]))
+	     t_prf_retire_free[w_free0] = 1'b1;
+	     if(w_ret0_gpr)
 	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     if(t_wm_fill && (t_wm_preg == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_inc[i] = t_ref_inc[i] + 'd1;
-	       end
-	     if(w_ret0 && (t_rob_head.pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_inc[i] = t_ref_inc[i] + {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret0_gpr} +
-				 {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret0_flags};
-	       end
-	     if(w_ret0_dst2 && (t_rob_head.pdst2 == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_inc[i] = t_ref_inc[i] + 'd1;
-	       end
-	     if(w_ret1 && (t_rob_next_head.pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_inc[i] = t_ref_inc[i] + {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret1_gpr} +
-				 {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret1_flags};
-	       end
-	     if(w_ret0_gpr && (t_rob_head.old_pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     if(w_ret0_flags && (t_rob_head.old_flags_pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     if(w_ret0_dst2 && (t_rob_head.old_pdst2 == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     if(w_ret1_gpr && (t_rob_next_head.old_pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     if(w_ret1_flags && (t_rob_next_head.old_flags_pdst == i[`LG_PRF_ENTRIES-1:0]))
-	       begin
-		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
-	       end
-	     t_ref_touch[i] = (w_ret0 && (t_rob_head.pdst == i[`LG_PRF_ENTRIES-1:0])) ||
-			      (w_ret0_dst2 && (t_rob_head.pdst2 == i[`LG_PRF_ENTRIES-1:0])) ||
-			      (w_ret1 && (t_rob_next_head.pdst == i[`LG_PRF_ENTRIES-1:0])) ||
-			      (t_ref_dec[i] != 'd0);
-	     if(i == 0)
-	       begin
-		  /* p0: %g0 and the reset flags register, pinned */
-		  n_prf_refcnt[i] = 'd0;
-		  t_prf_ref_free[i] = 1'b0;
-		  n_retire_prf_free[i] = 1'b0;
-	       end
-	     else
-	       begin
-		  n_prf_refcnt[i] = r_prf_refcnt[i] + t_ref_inc[i][`LG_PRF_REFCNT-1:0] -
-				    t_ref_dec[i][`LG_PRF_REFCNT-1:0];
-		  t_prf_ref_free[i] = t_ref_touch[i] && (n_prf_refcnt[i] == 'd0);
-		  n_retire_prf_free[i] = (n_prf_refcnt[i] == 'd0);
+		  n_retire_prf_free[t_rob_head.pdst] = 1'b0;
+		  n_retire_prf_free[t_rob_head.old_pdst] = 1'b1;
 	       end
 	  end
+	if(w_ret0_dst2)
+	  begin
+	     t_prf_retire_free[t_rob_head.old_pdst2] = 1'b1;
+	     n_retire_prf_free[t_rob_head.pdst2] = 1'b0;
+	     n_retire_prf_free[t_rob_head.old_pdst2] = 1'b1;
+	  end
+	if(w_ret1)
+	  begin
+	     t_prf_retire_free[w_free1] = 1'b1;
+	     if(w_ret1_gpr)
+	       begin
+		  n_retire_prf_free[t_rob_next_head.pdst] = 1'b0;
+		  n_retire_prf_free[t_rob_next_head.old_pdst] = 1'b1;
+	       end
+	  end
+	if(t_wm_spill)
+	  begin
+	     t_prf_retire_free[t_wm_preg] = 1'b1;
+	     n_retire_prf_free[t_wm_preg] = 1'b1;
+	  end
+	if(t_wm_fill)
+	  begin
+	     n_retire_prf_free[t_wm_preg] = 1'b0;
+	  end
+	/* p0: %g0 (and an absent window register's mapping), pinned */
+	t_prf_retire_free[0] = 1'b0;
+	n_retire_prf_free[0] = 1'b0;
      end // always_comb
+
+   /* the icc versions: allocated at rename, the displaced one freed at retire */
+   always_comb
+     begin
+	n_icc_prf_free = r_icc_prf_free;
+	n_retire_icc_prf_free = r_retire_icc_prf_free;
+	if(t_alloc & t_uop.flags_dst_valid)
+	  begin
+	     n_icc_prf_free[w_icc_entry] = 1'b0;
+	  end
+	if(t_alloc_two & t_uop2.flags_dst_valid)
+	  begin
+	     n_icc_prf_free[w_icc_entry2] = 1'b0;
+	  end
+	if(t_retire & t_rob_head.valid_flags_dst)
+	  begin
+	     n_icc_prf_free[t_rob_head.old_icc_pdst] = 1'b1;
+	     n_retire_icc_prf_free[t_rob_head.icc_pdst] = 1'b0;
+	     n_retire_icc_prf_free[t_rob_head.old_icc_pdst] = 1'b1;
+	  end
+	if(t_retire & t_retire_two & t_rob_next_head.valid_flags_dst)
+	  begin
+	     n_icc_prf_free[t_rob_next_head.old_icc_pdst] = 1'b1;
+	     n_retire_icc_prf_free[t_rob_next_head.icc_pdst] = 1'b0;
+	     n_retire_icc_prf_free[t_rob_next_head.old_icc_pdst] = 1'b1;
+	  end
+     end // always_comb
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     /* version 0 holds the reset (or checkpoint) icc */
+	     r_icc_prf_free <= {{(N_ICC_PRF_ENTRIES-1){1'b1}}, 1'b0};
+	     r_retire_icc_prf_free <= {{(N_ICC_PRF_ENTRIES-1){1'b1}}, 1'b0};
+	  end
+	else
+	  begin
+	     r_icc_prf_free <= t_rat_copy ? r_retire_icc_prf_free : n_icc_prf_free;
+	     r_retire_icc_prf_free <= n_retire_icc_prf_free;
+	  end
+     end // always_ff@ (posedge clk)
 
 `ifdef VERILATOR
    /* debug only: physical-register ownership invariants (silicon deadlocked on a
@@ -4514,14 +4541,14 @@ module core(clk,
      begin
 	for(integer i = 1; i < N_PRF_ENTRIES; i = i + 1)
 	  begin
-	     if(!reset && t_prf_ref_free[i] && r_prf_free[i])
+	     if(!reset && t_prf_retire_free[i] && r_prf_free[i])
 	       $display("[DBLFREE] cyc=%0d p%0d freed while already free, retiring pc=%x", r_cycle, i, t_rob_head.pc);
-	     if(!reset && ({2'b00, r_prf_refcnt[i]} + t_ref_inc[i] < t_ref_dec[i]))
-	       $display("[REFCNT] cyc=%0d p%0d count %0d underflows (+%0d -%0d), retiring pc=%x",
-			r_cycle, i, r_prf_refcnt[i], t_ref_inc[i], t_ref_dec[i], t_rob_head.pc);
 	  end
-	if(!reset && t_alloc && t_uop.dst_valid && (r_flags_retire_rat == n_prf_entry))
-	  $display("[DBLALLOC] cyc=%0d p%0d allocated to pc=%x but the retire flags RAT holds it", r_cycle, n_prf_entry, t_uop.pc);
+	for(integer i = 0; i < N_ICC_PRF_ENTRIES; i = i + 1)
+	  begin
+	     if(!reset && t_retire && t_rob_head.valid_flags_dst && (t_rob_head.old_icc_pdst == i[`LG_ICC_PRF_ENTRIES-1:0]) && r_icc_prf_free[i])
+	       $display("[DBLFREE] cyc=%0d icc%0d freed while already free, retiring pc=%x", r_cycle, i, t_rob_head.pc);
+	  end
 	for(integer i = 0; i < N_INT_ARCH; i = i + 1)
 	  begin
 	     if(!reset && t_alloc && t_uop.dst_valid && (r_retire_rat[i] == n_prf_entry) && (i != 0))

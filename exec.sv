@@ -422,6 +422,7 @@ module exec(clk,
    logic [`LG_PRF_ENTRIES-1:0] t_iwb_dst;
    logic [`M_WIDTH-1:0] t_iwb_data;
    logic [3:0] 	t_iwb_icc;
+   logic [`LG_ICC_PRF_ENTRIES-1:0] t_iwb_icc_dst;
    logic [31:0] w_s_op2;	/* SPARC operand 2 (the datapath below) */
    logic [127:0] w_div_y;	/* uni_divider: {remainder, quotient} */
    logic [(`M_WIDTH*2)-1:0] t_mul_result;
@@ -909,7 +910,9 @@ module exec(clk,
     * third ready bit that wakes on the same producers as srcA/srcB.  A consumer
     * selected on a writeback match executes the next cycle, after the flag write. */
    logic [N_INT_PRF_ENTRIES-1:0]   r_prf_zero;
-   logic [3:0] 			   r_prf_icc[N_INT_PRF_ENTRIES-1:0];   /* {N, Z, V, C} */
+   localparam N_ICC_PRF_ENTRIES = (1<<`LG_ICC_PRF_ENTRIES);
+   logic [3:0] 			   r_icc_prf[N_ICC_PRF_ENTRIES-1:0];   /* {N, Z, V, C}, by icc version */
+   logic [N_ICC_PRF_ENTRIES-1:0]   r_icc_inflight, n_icc_inflight;
 `ifdef VERILATOR
    /* checkpoint resume: icc, Y and the FSR come from the harness at reset (top.cc) */
    import "DPI-C" function int have_checkpoint();
@@ -924,6 +927,9 @@ module exec(clk,
 				   t_alu_srcB_match,
 				   t_alu_hilo_match,
 				   t_alu_fcr_match;
+   /* icc readers (flags_src_valid): the icc version they read is written */
+   logic [N_INT_SCHED_ENTRIES-1:0] r_alu_icc_rdy, t_alu_icc_match;
+   logic 			   t_alu_alloc_icc_match, t_alu_alloc2_icc_match;
 
 
 
@@ -1095,6 +1101,10 @@ module exec(clk,
 							 );
 	t_alu_alloc2_fcr_match = uq2.fcr_src_valid &&
 				 (w_fpu_fcr_valid & (w_fpu_fcr_ptr == uq2.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]));
+	t_alu_alloc_icc_match = uq.flags_src_valid &&
+				(t_iwb & t_iwb_flags & (t_iwb_icc_dst == uq.icc_src));
+	t_alu_alloc2_icc_match = uq2.flags_src_valid &&
+				 (t_iwb & t_iwb_flags & (t_iwb_icc_dst == uq2.icc_src));
 `ifdef ENABLE_INT_SRCC
 	t_alu_alloc_srcC_match = uq.srcC_valid && (
 						   (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == uq.srcC)) ||
@@ -1171,6 +1181,8 @@ module exec(clk,
 									     );
 		t_alu_fcr_match[i] = r_alu_sched_uops[i].fcr_src_valid &&
 				     (w_fpu_fcr_valid & (w_fpu_fcr_ptr == r_alu_sched_uops[i].hilo_src[`LG_FCR_PRF_ENTRIES-1:0]));
+		t_alu_icc_match[i] = r_alu_sched_uops[i].flags_src_valid &&
+				     (t_iwb & t_iwb_flags & (t_iwb_icc_dst == r_alu_sched_uops[i].icc_src));
 `ifdef ENABLE_INT_SRCC
 		t_alu_srcC_match[i] = r_alu_sched_uops[i].srcC_valid && (
 									 (w_mem_rsp_int_valid & (mem_rsp_dst_ptr == r_alu_sched_uops[i].srcC)) ||
@@ -1191,6 +1203,7 @@ module exec(clk,
 					(t_alu_srcB_match[i] |r_alu_srcB_rdy[i]) &
 					(t_alu_hilo_match[i] |r_alu_hilo_rdy[i]) &
 					(t_alu_fcr_match[i] |r_alu_fcr_rdy[i]) &
+					(t_alu_icc_match[i] |r_alu_icc_rdy[i]) &
 					t_alu_srcC_ok[i] &
 					(!r_alu_sched_uops[i].oldest_first ||
 					 (head_of_rob_ptr_valid &&
@@ -1214,6 +1227,7 @@ module exec(clk,
 		     r_alu_srcB_rdy[i] <= 1'b0;
 		     r_alu_hilo_rdy[i] <= 1'b0;
 		     r_alu_fcr_rdy[i] <= 1'b0;
+		     r_alu_icc_rdy[i] <= 1'b0;
 		  end
 		else
 		  begin
@@ -1223,6 +1237,7 @@ module exec(clk,
 			  r_alu_srcB_rdy[i] <= uq.srcB_valid ? (!r_prf_inflight[uq.srcB] | t_alu_alloc_srcB_match) : 1'b1;
 			  r_alu_hilo_rdy[i] <= uq.hilo_src_valid ? (!r_hilo_inflight[uq.hilo_src] | t_alu_alloc_hilo_match) : 1'b1;
 			  r_alu_fcr_rdy[i] <= uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] | t_alu_alloc_fcr_match) : 1'b1;
+			  r_alu_icc_rdy[i] <= uq.flags_src_valid ? (!r_icc_inflight[uq.icc_src] | t_alu_alloc_icc_match) : 1'b1;
 		       end
 		     else if(t_alu_alloc2_entry[i])
 		       begin
@@ -1230,6 +1245,7 @@ module exec(clk,
 			  r_alu_srcB_rdy[i] <= uq2.srcB_valid ? (!r_prf_inflight[uq2.srcB] | t_alu_alloc2_srcB_match) : 1'b1;
 			  r_alu_hilo_rdy[i] <= uq2.hilo_src_valid ? (!r_hilo_inflight[uq2.hilo_src] | t_alu_alloc2_hilo_match) : 1'b1;
 			  r_alu_fcr_rdy[i] <= uq2.fcr_src_valid ? (!r_fcr_prf_inflight[uq2.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] | t_alu_alloc2_fcr_match) : 1'b1;
+			  r_alu_icc_rdy[i] <= uq2.flags_src_valid ? (!r_icc_inflight[uq2.icc_src] | t_alu_alloc2_icc_match) : 1'b1;
 		       end
 		     else if(t_alu_select_entry[i])
 		       begin
@@ -1237,6 +1253,7 @@ module exec(clk,
 			  r_alu_srcB_rdy[i] <= 1'b0;
 			  r_alu_hilo_rdy[i] <= 1'b0;
 			  r_alu_fcr_rdy[i] <= 1'b0;
+			  r_alu_icc_rdy[i] <= 1'b0;
 		       end
 		     else if(r_alu_sched_valid[i])
 		       begin
@@ -1244,6 +1261,7 @@ module exec(clk,
 			  r_alu_srcB_rdy[i] <= r_alu_srcB_rdy[i] | t_alu_srcB_match[i];
 			  r_alu_hilo_rdy[i] <= r_alu_hilo_rdy[i] | t_alu_hilo_match[i];
 			  r_alu_fcr_rdy[i] <= r_alu_fcr_rdy[i] | t_alu_fcr_match[i];
+			  r_alu_icc_rdy[i] <= r_alu_icc_rdy[i] | t_alu_icc_match[i];
 		       end // else: !if(t_pop_uq&&(t_alu_sched_alloc_ptr == i))
 		     
 		  end // else: !if(reset)
@@ -1303,7 +1321,8 @@ module exec(clk,
 		      (uq.srcA_valid ? (!r_prf_inflight[uq.srcA] | t_alu_alloc_srcA_match) : 1'b1) &&
 		      (uq.srcB_valid ? (!r_prf_inflight[uq.srcB] | t_alu_alloc_srcB_match) : 1'b1) &&
 		      (uq.hilo_src_valid ? (!r_hilo_inflight[uq.hilo_src] | t_alu_alloc_hilo_match) : 1'b1) &&
-		      (uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src] | t_alu_alloc_fcr_match) : 1'b1)
+		      (uq.fcr_src_valid ? (!r_fcr_prf_inflight[uq.hilo_src] | t_alu_alloc_fcr_match) : 1'b1) &&
+		      (uq.flags_src_valid ? (!r_icc_inflight[uq.icc_src] | t_alu_alloc_icc_match) : 1'b1)
 `ifdef ENABLE_INT_SRCC
 		      && (uq.srcC_valid ? (!r_prf_inflight[uq.srcC] | t_alu_alloc_srcC_match) : 1'b1)
 `endif
@@ -1358,6 +1377,7 @@ module exec(clk,
 			 .dst_ptr_in(int_uop.dst),
 			 .dst_val_in(int_uop.dst_valid),
 			 .cc_in(int_uop.flags_dst_valid),
+			 .icc_ptr_in(int_uop.icc_dst),
 			 .y(t_mul_result),
 			 .complete(t_mul_complete),
 			 .rob_ptr_out(t_rob_ptr_out),
@@ -1365,7 +1385,8 @@ module exec(clk,
 			 .hilo_prf_ptr_out(t_hilo_prf_ptr_out),
 			 .dst_ptr_out(w_mul_dst),
 			 .dst_val_out(w_mul_dst_val),
-			 .cc_out(w_mul_cc)
+			 .cc_out(w_mul_cc),
+			 .icc_ptr_out(w_mul_icc_dst)
 	 );
 
    /* ---- SPARC multiply / divide writeback ----
@@ -1375,6 +1396,8 @@ module exec(clk,
     * One divide is in flight (uni_divider): its rd and saturation rules are held
     * here from its start. */
    logic [`LG_PRF_ENTRIES-1:0] r_div_dst;
+   logic [`LG_ICC_PRF_ENTRIES-1:0] r_div_icc_dst;
+   wire [`LG_ICC_PRF_ENTRIES-1:0] w_mul_icc_dst;
    logic 		       r_div_dst_val, r_div_cc, r_div_signed, r_div_min_m1;
    always_ff@(posedge clk)
      begin
@@ -1383,6 +1406,7 @@ module exec(clk,
 	     r_div_dst <= int_uop.dst;
 	     r_div_dst_val <= int_uop.dst_valid;
 	     r_div_cc <= int_uop.flags_dst_valid;
+	     r_div_icc_dst <= int_uop.icc_dst;
 	     r_div_signed <= t_signed_div;
 	     /* INT64_MIN / -1: the only quotient past int64 (interpret.cc) */
 	     r_div_min_m1 <= ({t_src_hilo, t_srcA[31:0]} == 64'h8000000000000000) &&
@@ -1408,6 +1432,7 @@ module exec(clk,
 	t_iwb_dst = w_mul_wb ? w_mul_dst : w_div_wb ? r_div_dst : int_uop.dst;
 	t_iwb_data = w_mul_wb ? t_mul_result[`M_WIDTH-1:0] : w_div_wb ? w_div_rd : t_result;
 	t_iwb_flags = w_mul_wb ? w_mul_cc : w_div_wb ? r_div_cc : int_uop.flags_dst_valid;
+	t_iwb_icc_dst = w_mul_wb ? w_mul_icc_dst : w_div_wb ? r_div_icc_dst : int_uop.icc_dst;
 	t_iwb_icc = w_mul_wb ? {t_mul_result[31], (t_mul_result[31:0] == 32'd0), 2'b00} :
 		    w_div_wb ? {w_div_rd[31], (w_div_rd == 32'd0), w_div_ovf, 1'b0} :
 		    t_icc_out;
@@ -2264,8 +2289,8 @@ module exec(clk,
    /* ---- SPARC integer datapath (the S_* ops, uop.vh) ---- */
    /* operand 2: rs2, or the sign-extended immediate in {jmp_imm[15:0], imm} */
    assign w_s_op2 = int_uop.srcB_valid ? t_srcB[31:0] : {int_uop.jmp_imm[15:0], int_uop.imm};
-   /* the incoming icc: srcC is the flags register (flags_src_valid) */
-   wire [3:0]  w_s_icc = r_prf_icc[int_uop.srcC];
+   /* the incoming icc: the icc version the reader renamed (flags_src_valid) */
+   wire [3:0]  w_s_icc = r_icc_prf[int_uop.icc_src];
    wire        w_s_cin = int_uop.flags_src_valid & w_s_icc[0] &
 			 ((int_uop.op == S_ADDX) | (int_uop.op == S_ADDXCC) |
 			  (int_uop.op == S_SUBX) | (int_uop.op == S_SUBXCC));
@@ -3510,28 +3535,57 @@ module exec(clk,
      end // always_ff@ (posedge clk)
 `endif
 
-   /* SPARC icc, stored beside the value in the integer PRF (uop.vh): written by
-    * the icc writers' ALU writeback, read through srcC (the flags RAT's
-    * register) by the readers.  Like r_prf_zero, a reader woken by the writer's
-    * writeback executes the next cycle, after this write -- no bypass.  Reset 0
-    * covers p0, the reset flags register. */
+   /* SPARC icc rename (core.sv): version icc_dst written by the icc writers' ALU
+    * writeback (the ALU, or a multiply or divide completing), read by icc_src.
+    * Like r_prf_zero, a reader woken by the writer's writeback executes the next
+    * cycle, after this write -- no bypass.  Version 0 is the reset icc. */
    always_ff@(posedge clk)
      begin
 	if(reset)
 	  begin
-	     r_prf_icc <= '{default:4'd0};
+	     r_icc_prf <= '{default:4'd0};
 `ifdef VERILATOR
 	     if(have_checkpoint() != 0)
 	       begin
-		  r_prf_icc[0] <= 4'(ckpt_sreg(3));   /* the reset flags register */
+		  r_icc_prf[0] <= 4'(ckpt_sreg(3));
 	       end
 `endif
 	  end
-	else if(t_iwb && t_iwb_flags && (t_iwb_dst != 'd0))
+	else if(t_iwb && t_iwb_flags)
 	  begin
-	     r_prf_icc[t_iwb_dst] <= t_iwb_icc;
+	     r_icc_prf[t_iwb_icc_dst] <= t_iwb_icc;
 	  end
      end // always_ff@ (posedge clk)
+
+   /* icc versions in flight: set when the writer enters the uop queue, cleared
+    * at its writeback (as the FCR versions) */
+   always_comb
+     begin
+	n_icc_inflight = r_icc_inflight;
+	if(uq_push && uq_uop.flags_dst_valid)
+	  begin
+	     n_icc_inflight[uq_uop.icc_dst] = 1'b1;
+	  end
+	if(uq_push_two && uq_uop_two.flags_dst_valid)
+	  begin
+	     n_icc_inflight[uq_uop_two.icc_dst] = 1'b1;
+	  end
+	if(t_iwb && t_iwb_flags)
+	  begin
+	     n_icc_inflight[t_iwb_icc_dst] = 1'b0;
+	  end
+     end
+   always_ff@(posedge clk)
+     begin
+	if(reset || t_flash_clear)
+	  begin
+	     r_icc_inflight <= 'd0;
+	  end
+	else
+	  begin
+	     r_icc_inflight <= ds_done ? 'd0 : n_icc_inflight;
+	  end
+     end
 
    /* backing RF of the non-resident window groups (core.sv WMISS_SEQ): flat arch
     * register 8 + i at entry i.  1R/1W.  A spill reads the PRF through the

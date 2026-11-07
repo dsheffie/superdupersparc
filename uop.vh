@@ -432,6 +432,9 @@ typedef struct packed {
 
    logic 			    hilo_src_valid;
    logic [`LG_HILO_PRF_ENTRIES-1:0] hilo_src;
+   /* icc rename tags (flags_src_valid / flags_dst_valid; core.sv) */
+   logic [`LG_ICC_PRF_ENTRIES-1:0] icc_src;
+   logic [`LG_ICC_PRF_ENTRIES-1:0] icc_dst;
    logic 			    fcr_src_valid;
    logic 			    flags_src_valid;   /* SPARC: srcC is the icc (flags RAT) */
    logic 			    flags_dst_valid;   /* SPARC: dst also takes icc */

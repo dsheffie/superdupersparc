@@ -27,7 +27,7 @@ typedef struct packed {
    logic       has_nullifying_delay_slot;
    logic       in_delay_slot;
    logic       dcti;   /* a CTI in another CTI's delay slot: retires as a mispredict (core.sv) */
-   logic       valid_flags_dst;   /* SPARC: pdst also holds the new icc (flags RAT) */
+   logic       valid_flags_dst;   /* SPARC: writes icc (icc_pdst, the icc rename) */
    logic       valid_dst2;        /* SPARC ldd: pdst2 is rd+1 (arch ldst+1) */
    logic [(`LG_PRF_ENTRIES-1):0] ldst;   /* int: the flat windowed arch index */
 
@@ -41,7 +41,8 @@ typedef struct packed {
    logic [(`LG_PRF_ENTRIES-1):0] srcA_arch;
    logic [(`LG_PRF_ENTRIES-1):0] pdst;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst;
-   logic [(`LG_PRF_ENTRIES-1):0] old_flags_pdst;   /* the flags RAT's previous register */
+   logic [(`LG_ICC_PRF_ENTRIES-1):0] icc_pdst;       /* the icc version written */
+   logic [(`LG_ICC_PRF_ENTRIES-1):0] old_icc_pdst;   /* the icc RAT's previous version */
    logic [(`LG_PRF_ENTRIES-1):0] pdst2;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst2;
    /* SPARC Y (the HILO rename), its own fields: a multiply writes rd AND Y */
@@ -114,7 +115,8 @@ typedef struct packed {
    logic [(`LG_PRF_ENTRIES-1):0] srcA_arch;
    logic [(`LG_PRF_ENTRIES-1):0] pdst;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst;
-   logic [(`LG_PRF_ENTRIES-1):0] old_flags_pdst;
+   logic [(`LG_ICC_PRF_ENTRIES-1):0] icc_pdst;
+   logic [(`LG_ICC_PRF_ENTRIES-1):0] old_icc_pdst;
    logic [(`LG_PRF_ENTRIES-1):0] pdst2;
    logic [(`LG_PRF_ENTRIES-1):0] old_pdst2;
    logic [(`LG_HILO_PRF_ENTRIES-1):0] hilo_pdst;

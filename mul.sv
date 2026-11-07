@@ -22,6 +22,7 @@ module mul(clk,
 	   dst_ptr_in,
 	   dst_val_in,
 	   cc_in,
+	   icc_ptr_in,
 	   y,
 	   complete,
 	   rob_ptr_out,
@@ -29,7 +30,8 @@ module mul(clk,
 	   hilo_prf_ptr_out,
 	   dst_ptr_out,
 	   dst_val_out,
-	   cc_out);
+	   cc_out,
+	   icc_ptr_out);
    
    parameter W = 32;   
    input logic clk;
@@ -46,6 +48,7 @@ module mul(clk,
    input logic [`LG_PRF_ENTRIES-1:0] dst_ptr_in;
    input logic 			     dst_val_in;
    input logic 			     cc_in;
+   input logic [`LG_ICC_PRF_ENTRIES-1:0] icc_ptr_in;   /* the icc version an *cc op writes */
    
    
    output logic [(2*W)-1:0]		  y;
@@ -56,6 +59,7 @@ module mul(clk,
    output logic [`LG_PRF_ENTRIES-1:0] 	  dst_ptr_out;
    output logic 			  dst_val_out;
    output logic 			  cc_out;
+   output logic [`LG_ICC_PRF_ENTRIES-1:0] icc_ptr_out;
    
    logic [`MUL_LAT:0] 			   r_complete;
    logic [`MUL_LAT:0] 			   r_hilo_val;
@@ -64,6 +68,7 @@ module mul(clk,
    logic [`LG_PRF_ENTRIES-1:0] 		   r_dst_ptr[`MUL_LAT:0];
    logic [`MUL_LAT:0] 			   r_dst_val;
    logic [`MUL_LAT:0] 			   r_cc;
+   logic [`LG_ICC_PRF_ENTRIES-1:0] 	   r_icc_ptr[`MUL_LAT:0];
   
 
    assign complete = r_complete[`MUL_LAT];
@@ -74,6 +79,7 @@ module mul(clk,
    assign dst_ptr_out = r_dst_ptr[`MUL_LAT];
    assign dst_val_out = r_dst_val[`MUL_LAT];
    assign cc_out = r_cc[`MUL_LAT];
+   assign icc_ptr_out = r_icc_ptr[`MUL_LAT];
 
    logic [(2*W)-1:0] 			   t_mul;
    logic [(2*W)-1:0]			   r_mul[`MUL_LAT:0];
@@ -129,6 +135,7 @@ module mul(clk,
 		  r_rob_ptr[i] <= 'd0;
 		  r_hilo_ptr[i] <= 'd0;
 		  r_dst_ptr[i] <= 'd0;
+		  r_icc_ptr[i] <= 'd0;
 	       end
 	     r_complete <= 'd0;
 	     r_dst_val <= 'd0;
@@ -146,6 +153,7 @@ module mul(clk,
 		       r_hilo_val[0] <= go;
 		       r_hilo_ptr[0] <= hilo_prf_ptr_in;
 		       r_dst_ptr[0] <= dst_ptr_in;
+		       r_icc_ptr[0] <= icc_ptr_in;
 		       r_dst_val[0] <= go & dst_val_in;
 		       r_cc[0] <= cc_in;
 		    end
@@ -156,6 +164,7 @@ module mul(clk,
 		       r_hilo_val[i] <= r_hilo_val[i-1];
 		       r_hilo_ptr[i] <= r_hilo_ptr[i-1];
 		       r_dst_ptr[i] <= r_dst_ptr[i-1];
+		       r_icc_ptr[i] <= r_icc_ptr[i-1];
 		       r_dst_val[i] <= r_dst_val[i-1];
 		       r_cc[i] <= r_cc[i-1];
 		    end

@@ -188,11 +188,12 @@
 `define NWINDOWS (1 << `LG_NWINDOWS)
 `define N_INT_ARCH_REGS (8 + 16 * `NWINDOWS)
 
-/* committed reference count per integer physical register (core.sv): a register
- * is held by its GPR mapping and/or the flags RAT (icc rides in the PRF beside
- * the value), so 2 bits.  Widen for move elimination (a register mapped by
- * several GPRs). */
-`define LG_PRF_REFCNT 2
+
+/* SPARC icc has its own rename (core.sv / exec.sv r_icc_prf), like Y on the
+ * HILO one: 16 versions of {N, Z, V, C}.  It used to ride in the integer PRF
+ * beside each icc writer's value, which made a register ownable by both a GPR
+ * mapping and the flags RAT (reference counts on every physical register). */
+`define LG_ICC_PRF_ENTRIES 4
 
 /* SPARC Y rides the MIPS HILO rename (its own register file, wakeup and
  * forwarding): every umul/smul writes it, so 16 versions, not MIPS's 4 */
