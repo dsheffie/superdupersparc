@@ -62,6 +62,44 @@ _start:
 	lda	[%g5] 3, %o4
 	or	%g5, 0x300, %g6
 	lda	[%g6] 3, %o5
+	/* ---- probes and ASI stores in delay slots of mispredicted branches ----
+	 * An xorshift low bit picks each branch's direction, so about half
+	 * mispredict and enter the faulted-delay-slot serialize funnel with an
+	 * ASI op (serializing) in the slot.  be,a: the slot runs only when taken
+	 * (Solaris vik_window_underflow has a probe there; a taken one
+	 * deadlocked).  An annulled sta to ASI 0x4c must not write, which the
+	 * read-back after each pass shows.  bne: a plain slot, always runs. */
+	set	0x12345678, %g1		/* xorshift state */
+	mov	64, %g2
+	clr	%g3			/* the checksum, compared at every retire */
+	set	0x40000400, %g5		/* an entire probe of the 4 KB page */
+1:	sll	%g1, 13, %g4
+	xor	%g1, %g4, %g1
+	srl	%g1, 17, %g4
+	xor	%g1, %g4, %g1
+	sll	%g1, 5, %g4
+	xor	%g1, %g4, %g1
+	clr	%g6
+	andcc	%g1, 1, %g0
+	be,a	2f
+	 lda	[%g5] 3, %g6		/* only when taken */
+	add	%g3, 3, %g3		/* not taken */
+2:	add	%g3, %g6, %g3
+	andcc	%g1, 2, %g0
+	be,a	3f
+	 sta	%g1, [%g0] 0x4c		/* only when taken */
+	add	%g3, 5, %g3
+3:	lda	[%g0] 0x4c, %g6
+	add	%g3, %g6, %g3
+	andcc	%g1, 4, %g0
+	bne	4f
+	 lda	[%g5] 3, %g6		/* always */
+	add	%g3, 7, %g3
+4:	add	%g3, %g6, %g3
+	subcc	%g2, 1, %g2
+	bne	1b
+	 nop
+
 	/* ---- ASI 0x4c, the breakpoint action register: 13 bits read back ---- */
 	set	0xffffffff, %g7
 	sta	%g7, [%g0] 0x4c

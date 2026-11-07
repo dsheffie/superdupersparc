@@ -163,6 +163,15 @@
  * traps).  512x32 is twice r9999's 128x64 bit count. */
 `define LG_PRF_ENTRIES 9
 
+/* FP physical registers: their own size, not the integer PRF's.  SPARC
+ * renames the 16 64-bit FP pairs (only the even arch indices, decode_sparc.sv
+ * fidx), and allocation is banked by producer (fpu arith -> low half, memory ->
+ * high half), so each half must hold all 16 arch pairs plus every in-flight FP
+ * destination (at most one per ROB entry): (1 << LG_FP_PRF_ENTRIES) / 2 >=
+ * 16 + ROB_ENTRIES.  Sizing it at the integer PRF's 512 cost ~20K LUTs (the
+ * register file and its two 512-wide free-list searches). */
+`define LG_FP_PRF_ENTRIES 6
+
 /* SPARC register windows (power of two: the flat arch index wraps mod 16*NWINDOWS) */
 `define LG_NWINDOWS 3
 `define NWINDOWS (1 << `LG_NWINDOWS)

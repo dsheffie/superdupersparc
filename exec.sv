@@ -277,6 +277,7 @@ module exec(clk,
    
    localparam N_MQ_ENTRIES = (1<<`LG_MQ_ENTRIES);
    localparam N_INT_PRF_ENTRIES = (1<<`LG_PRF_ENTRIES);
+   localparam N_FP_PRF_ENTRIES = (1<<`LG_FP_PRF_ENTRIES);
    localparam N_HILO_PRF_ENTRIES = (1<<`LG_HILO_PRF_ENTRIES);
    
    localparam N_UQ_ENTRIES = (1<<`LG_UQ_ENTRIES);
@@ -296,7 +297,7 @@ module exec(clk,
    logic [`FP_WIDTH-1:0] 	  w_fp_srcA, w_fp_srcB;     // the operands: a single's half, low-justified
    logic [`FP_WIDTH-1:0] 	  w_fp_srcC;                // the old pair of a single dst (rd4)
    logic [`FP_WIDTH-1:0] 	  r_fp_rd_srcB, r_fp_rd_dq; // mem reads (rd2/rd3)
-   logic [N_INT_PRF_ENTRIES-1:0]  r_fp_prf_inflight, n_fp_prf_inflight;
+   logic [N_FP_PRF_ENTRIES-1:0]   r_fp_prf_inflight, n_fp_prf_inflight;
 
    logic 			  t_wr_int_prf;
    logic 			  t_wr_fcsr;
@@ -1588,18 +1589,18 @@ module exec(clk,
     * mem_dq exactly as before.  read-before-write on a same-cycle collision is a
     * non-issue: inflight pop-gating never lets a source be read the cycle it is
     * written. */
-   fp_regfile #(.WIDTH(`FP_WIDTH), .LG_DEPTH(`LG_PRF_ENTRIES))
+   fp_regfile #(.WIDTH(`FP_WIDTH), .LG_DEPTH(`LG_FP_PRF_ENTRIES))
    fpprf (.clk(clk),
 	  .reset(reset),
-	  .rdptr0(fp_uq.srcA),
-	  .rdptr1(fp_uq.srcB),
-	  .rdptr2(t_picked_mem_uop.srcB),
-	  .rdptr3(t_sd_src),
-	  .rdptr4(fp_uq.srcC),
+	  .rdptr0(fp_uq.srcA[`LG_FP_PRF_ENTRIES-1:0]),
+	  .rdptr1(fp_uq.srcB[`LG_FP_PRF_ENTRIES-1:0]),
+	  .rdptr2(t_picked_mem_uop.srcB[`LG_FP_PRF_ENTRIES-1:0]),
+	  .rdptr3(t_sd_src[`LG_FP_PRF_ENTRIES-1:0]),
+	  .rdptr4(fp_uq.srcC[`LG_FP_PRF_ENTRIES-1:0]),
 	  /* bank0 write port shared by fpu-arith result and single-cycle convert
 	   * (mutually exclusive by r_fp_wb_bitvec) */
-	  .wrptr0(w_fp_wb0_ptr),
-	  .wrptr1(mem_rsp_dst_ptr),
+	  .wrptr0(w_fp_wb0_ptr[`LG_FP_PRF_ENTRIES-1:0]),
+	  .wrptr1(mem_rsp_dst_ptr[`LG_FP_PRF_ENTRIES-1:0]),
 	  .wen0(w_fdiv_complete | w_fpu_result_valid | r_cvt_valid),
 	  .wen1(mem_rsp_dst_valid & mem_rsp_fp_dst),
 	  .wr0(w_fp_wb0_data),
@@ -1636,27 +1637,27 @@ module exec(clk,
 	  end
 	/* FP dst allocation marks the FP physical reg inflight */
 	if(uq_push && uq_uop.fp_dst_valid)
-	  n_fp_prf_inflight[uq_uop.dst] = 1'b1;
+	  n_fp_prf_inflight[uq_uop.dst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
 	if(uq_push_two && uq_uop_two.fp_dst_valid)
-	  n_fp_prf_inflight[uq_uop_two.dst] = 1'b1;
+	  n_fp_prf_inflight[uq_uop_two.dst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
 
 	if(mem_rsp_dst_valid)
 	  begin
 	     if(mem_rsp_fp_dst)
-	       n_fp_prf_inflight[mem_rsp_dst_ptr] = 1'b0;
+	       n_fp_prf_inflight[mem_rsp_dst_ptr[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	     else
 	       n_prf_inflight[mem_rsp_dst_ptr] = 1'b0;
 	  end
 
 	/* the unified divider's FP result clears its FP-dst inflight bit */
 	if(w_fdiv_complete)
-	  n_fp_prf_inflight[w_fdiv_dst_ptr] = 1'b0;
+	  n_fp_prf_inflight[w_fdiv_dst_ptr[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	/* FP arithmetic result clears the FP-dst inflight bit */
 	if(w_fpu_result_valid)
-	  n_fp_prf_inflight[w_fpu_dst_ptr] = 1'b0;
+	  n_fp_prf_inflight[w_fpu_dst_ptr[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	/* single-cycle convert result clears its FP-dst inflight bit */
 	if(r_cvt_valid)
-	  n_fp_prf_inflight[r_cvt_dst] = 1'b0;
+	  n_fp_prf_inflight[r_cvt_dst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	if(t_iwb)
 	  begin
 	     n_prf_inflight[t_iwb_dst] = 1'b0;
@@ -1898,12 +1899,12 @@ module exec(clk,
    // ---- in-order issue: wake on source inflight bits, pop when ready ----
    always_comb
      begin
-	t_fpu_srcA_rdy = fp_uq.fp_srcA_valid ? !r_fp_prf_inflight[fp_uq.srcA] : 1'b1;
-	t_fpu_srcB_rdy = fp_uq.fp_srcB_valid ? !r_fp_prf_inflight[fp_uq.srcB] : 1'b1;
+	t_fpu_srcA_rdy = fp_uq.fp_srcA_valid ? !r_fp_prf_inflight[fp_uq.srcA[`LG_FP_PRF_ENTRIES-1:0]] : 1'b1;
+	t_fpu_srcB_rdy = fp_uq.fp_srcB_valid ? !r_fp_prf_inflight[fp_uq.srcB[`LG_FP_PRF_ENTRIES-1:0]] : 1'b1;
 	t_fpu_fcr_rdy  = fp_uq.fcr_src_valid ? !r_fcr_prf_inflight[fp_uq.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]] : 1'b1;
 	t_fpu_srcs_rdy = t_fpu_srcA_rdy && t_fpu_srcB_rdy && t_fpu_fcr_rdy;
 	/* a single destination's old pair (and madd's fr) */
-	if(fp_uq.fp_srcC_valid && r_fp_prf_inflight[fp_uq.srcC])
+	if(fp_uq.fp_srcC_valid && r_fp_prf_inflight[fp_uq.srcC[`LG_FP_PRF_ENTRIES-1:0]])
 	  begin
 	     t_fpu_srcs_rdy = 1'b0;
 	  end
@@ -2714,7 +2715,7 @@ module exec(clk,
 				       (w_mem_rsp_int_valid && (r_mem_sched_uops[i].srcC == mem_rsp_dst_ptr))) : 1'b1) &&
 `endif
 				     ((r_mem_sched_uops[i].fp_srcB_valid && !r_mem_sched_uops[i].is_store) ?
-				      !r_fp_prf_inflight[r_mem_sched_uops[i].srcB] : 1'b1);
+				      !r_fp_prf_inflight[r_mem_sched_uops[i].srcB[`LG_FP_PRF_ENTRIES-1:0]] : 1'b1);
 		t_mem_elig[i] = t_mem_entry_rdy[i] &
 				(r_mem_sched_mv[i] ? 1'b1 :
 				 (t_mem_strict[i] | r_mem_sched_old1[i]) ? ((|r_mem_sched_matrix[i]) == 1'b0) :
@@ -2728,7 +2729,7 @@ module exec(clk,
 		/* store data source ready (read through the store-data PRF port) */
 		t_mem_sd_rdy[i] = (t_mem_st_live[i] || (r_mem_sched_valid[i] && r_mem_sched_mg[i])) &&
 				  !r_mem_sched_sd_sel[i] && !t_flash_clear &&
-				  (r_mem_sched_uops[i].fp_srcB_valid ? !r_fp_prf_inflight[r_mem_sched_uops[i].srcB] :
+				  (r_mem_sched_uops[i].fp_srcB_valid ? !r_fp_prf_inflight[r_mem_sched_uops[i].srcB[`LG_FP_PRF_ENTRIES-1:0]] :
 				   r_mem_sched_uops[i].srcB_valid ? !r_prf_inflight[r_mem_sched_uops[i].srcB] : 1'b1) &&
 				  /* SPARC std: rd+1, read the cycle after rd through the same port */
 				  (r_mem_sched_uops[i].srcD_valid ? !r_prf_inflight[r_mem_sched_uops[i].srcD] : 1'b1);

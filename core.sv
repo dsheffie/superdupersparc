@@ -415,6 +415,7 @@ module core(clk,
    logic [`M_WIDTH-1:0]			  r_epc, n_epc;
 
    localparam N_PRF_ENTRIES = (1<<`LG_PRF_ENTRIES);
+   localparam N_FP_PRF_ENTRIES = (1<<`LG_FP_PRF_ENTRIES);   /* machine.vh: a bank holds 16 arch pairs + the ROB */
    localparam N_INT_ARCH = `N_INT_ARCH_REGS;
 
    /* the physical register holding arch register a at reset.  The PRF is two
@@ -764,17 +765,17 @@ module core(clk,
    /* ---- FP rename domain: mirrors the integer domain (32 arch FP regs). ----
     * FR=1 / N32 model (32 full 64-bit regs, no even/odd arch pairing yet).
     * One FP dst alloc per cycle (dual-FP-dst is serialized via t_enough_next_fprfs). */
-   logic [N_PRF_ENTRIES-1:0]        n_fp_prf_free, r_fp_prf_free;
-   logic [N_PRF_ENTRIES-1:0]        n_retire_fp_prf_free, r_retire_fp_prf_free;
+   logic [N_FP_PRF_ENTRIES-1:0]     n_fp_prf_free, r_fp_prf_free;
+   logic [N_FP_PRF_ENTRIES-1:0]     n_retire_fp_prf_free, r_retire_fp_prf_free;
    logic [`LG_PRF_ENTRIES-1:0]      r_fp_alloc_rat[31:0];
    logic [`LG_PRF_ENTRIES-1:0]      n_fp_alloc_rat[31:0];
    logic [`LG_PRF_ENTRIES-1:0]      r_fp_retire_rat[31:0];
    logic [`LG_PRF_ENTRIES-1:0]      n_fp_retire_rat[31:0];
    logic [`LG_PRF_ENTRIES-1:0]      n_fp_prf_entry;
-   logic [`LG_PRF_ENTRIES:0]        t_fp_ffs0, t_fp_ffs1;   // bank0 (fpu) / bank1 (mem) free ptr
+   logic [`LG_FP_PRF_ENTRIES:0]     t_fp_ffs0, t_fp_ffs1;   // bank0 (fpu) / bank1 (mem) free ptr
    logic 			   t_fp_b0_full, t_fp_b1_full;
    logic 			   w_fp_dst_is_mem;
-   wire [N_PRF_ENTRIES-1:0] 	   w_fp_free_b0, w_fp_free_b1;
+   wire [N_FP_PRF_ENTRIES-1:0] 	   w_fp_free_b0, w_fp_free_b1;
    logic 			   t_enough_fprfs, t_enough_next_fprfs;
    logic 			   t_free_fp_reg, t_free_fp_reg_two;
    logic [`LG_PRF_ENTRIES-1:0]      t_free_fp_reg_ptr, t_free_fp_reg_two_ptr;
@@ -1121,10 +1122,15 @@ module core(clk,
     * gate (waits for at-head/drain) deadlock.  next_head_of_rob_ptr IS the delay
     * slot (the ROB entry right after the head). */
    assign next_head_of_rob_ptr = r_rob_next_head_ptr[`LG_ROB_ENTRIES-1:0];
+   /* SPARC: an annulling branch's slot (has_nullifying_delay_slot) executes,
+    * and so commits, exactly when the branch is taken.  Solaris's
+    * vik_window_underflow has an SRMMU probe in a be,a slot: without the taken
+    * case the probe (issued only when non-speculative) and the faulted-delay-slot
+    * funnel waiting for it deadlocked. */
    assign head_of_rob_ds_committable = w_rob_head_complete
 					 & t_rob_head.faulted
 					 & t_rob_head.has_delay_slot
-					 & ~t_rob_head.has_nullifying_delay_slot;
+					 & (~t_rob_head.has_nullifying_delay_slot | t_rob_head.take_br);
 
 				      
    assign flush_req_l1d = r_flush_req_l1d;
@@ -2842,7 +2848,14 @@ module core(clk,
 	    end
 	 WAIT_FOR_SERIALIZE_IN_FAULTED_DELAY_SLOT:
 	   begin
-	      if(t_rob_next_head_complete)
+	      if(t_rob_head.has_nullifying_delay_slot && !t_rob_head.take_br)
+		begin
+		   /* an annulled slot never commits and (never non-speculative) never
+		    * issues: don't wait for it -- the branch retires and DRAIN drops it */
+		   n_pending_fault = 1'b0;
+		   n_state = ACTIVE;
+		end
+	      else if(t_rob_next_head_complete)
 		begin
 		   if(t_rob_next_head.faulted)
 		     begin //todo - is this correct?
@@ -2993,8 +3006,10 @@ module core(clk,
 	  begin
 	     for(logic [`LG_PRF_ENTRIES-1:0] i_rat = 'd0; i_rat < 'd32; i_rat = i_rat + 'd1)
 	       begin
-		  r_fp_alloc_rat[i_rat[4:0]] <= i_rat;
-		  r_fp_retire_rat[i_rat[4:0]] <= i_rat;
+		  /* only the even arch indices are used (decode_sparc.sv fidx): an
+		   * odd slot aliases its even neighbour and takes no register */
+		  r_fp_alloc_rat[i_rat[4:0]] <= {i_rat[`LG_PRF_ENTRIES-1:1], 1'b0};
+		  r_fp_retire_rat[i_rat[4:0]] <= {i_rat[`LG_PRF_ENTRIES-1:1], 1'b0};
 	       end
 	  end
 	else
@@ -3287,8 +3302,8 @@ module core(clk,
 		  t_free_fp_reg = 1'b1;
 		  t_free_fp_reg_ptr = t_rob_head.old_pdst;
 		  n_fp_retire_rat[t_rob_head.ldst[4:0]] = t_rob_head.pdst;
-		  n_retire_fp_prf_free[t_rob_head.pdst] = 1'b0;
-		  n_retire_fp_prf_free[t_rob_head.old_pdst] = 1'b1;
+		  n_retire_fp_prf_free[t_rob_head.pdst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
+		  n_retire_fp_prf_free[t_rob_head.old_pdst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
 	       end
 	     /* Y beside rd (only the head: t_retire_two excludes a Y writer second) */
 	     if(t_rob_head.valid_hilo_dst)
@@ -3316,8 +3331,8 @@ module core(clk,
 		  t_free_fp_reg_two = 1'b1;
 		  t_free_fp_reg_two_ptr = t_rob_next_head.old_pdst;
 		  n_fp_retire_rat[t_rob_next_head.ldst[4:0]] = t_rob_next_head.pdst;
-		  n_retire_fp_prf_free[t_rob_next_head.pdst] = 1'b0;
-		  n_retire_fp_prf_free[t_rob_next_head.old_pdst] = 1'b1;
+		  n_retire_fp_prf_free[t_rob_next_head.pdst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
+		  n_retire_fp_prf_free[t_rob_next_head.old_pdst[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
 	       end
 
 	     /* train on whichever retiring slot holds the branch: with a branch and its
@@ -4077,10 +4092,12 @@ module core(clk,
      begin
 	if(reset)
 	  begin
-	     for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
+	     /* the initial RAT maps the 16 used (even) arch pairs to physical 0, 2,
+	      * .. 30 (the odd slots alias them): only those are taken */
+	     for(integer i = 0; i < N_FP_PRF_ENTRIES; i = i + 1)
 	       begin
-		  r_fp_prf_free[i] <= (i < 32) ? 1'b0 : 1'b1;
-		  r_retire_fp_prf_free[i] <= (i < 32) ? 1'b0 : 1'b1;
+		  r_fp_prf_free[i] <= ((i < 32) && ((i % 2) == 0)) ? 1'b0 : 1'b1;
+		  r_retire_fp_prf_free[i] <= ((i < 32) && ((i % 2) == 0)) ? 1'b0 : 1'b1;
 	       end
 	  end
 	else
@@ -4119,31 +4136,32 @@ module core(clk,
     * -- is_mem (load/mtc1) -> bank1, else (fpu arith) -> bank0 -- so the ptr MSB the
     * regfile reads by is meaningful.  Free/retire stay on the flat r_fp_prf_free vector. */
    generate
-      for(genvar fpgi = 0; fpgi < N_PRF_ENTRIES; fpgi = fpgi + 1)
+      for(genvar fpgi = 0; fpgi < N_FP_PRF_ENTRIES; fpgi = fpgi + 1)
 	begin : fp_free_bank_split
-	   assign w_fp_free_b0[fpgi] = (fpgi <  N_PRF_ENTRIES/2) ? r_fp_prf_free[fpgi] : 1'b0;
-	   assign w_fp_free_b1[fpgi] = (fpgi >= N_PRF_ENTRIES/2) ? r_fp_prf_free[fpgi] : 1'b0;
+	   assign w_fp_free_b0[fpgi] = (fpgi <  N_FP_PRF_ENTRIES/2) ? r_fp_prf_free[fpgi] : 1'b0;
+	   assign w_fp_free_b1[fpgi] = (fpgi >= N_FP_PRF_ENTRIES/2) ? r_fp_prf_free[fpgi] : 1'b0;
 	end
    endgenerate
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_fp0(.in(w_fp_free_b0), .y(t_fp_ffs0));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_fp1(.in(w_fp_free_b1), .y(t_fp_ffs1));
+   find_lowest_set_bit#(`LG_FP_PRF_ENTRIES) ffs_fp0(.in(w_fp_free_b0), .y(t_fp_ffs0));
+   find_lowest_set_bit#(`LG_FP_PRF_ENTRIES) ffs_fp1(.in(w_fp_free_b1), .y(t_fp_ffs1));
    always_comb
      begin
 	n_fp_prf_free = r_fp_prf_free;
-	t_fp_b0_full = t_fp_ffs0[`LG_PRF_ENTRIES];
-	t_fp_b1_full = t_fp_ffs1[`LG_PRF_ENTRIES];
+	t_fp_b0_full = t_fp_ffs0[`LG_FP_PRF_ENTRIES];
+	t_fp_b1_full = t_fp_ffs1[`LG_FP_PRF_ENTRIES];
 	w_fp_dst_is_mem = (t_alloc & t_uop.fp_dst_valid) ? t_uop.is_mem :
 			  (t_alloc_two & t_uop2.fp_dst_valid) ? t_uop2.is_mem : 1'b0;
-	n_fp_prf_entry = w_fp_dst_is_mem ? t_fp_ffs1[`LG_PRF_ENTRIES-1:0]
-					 : t_fp_ffs0[`LG_PRF_ENTRIES-1:0];
+	/* zero-extended into the integer-width uop/ROB register fields */
+	n_fp_prf_entry = {{(`LG_PRF_ENTRIES-`LG_FP_PRF_ENTRIES){1'b0}},
+			  (w_fp_dst_is_mem ? t_fp_ffs1[`LG_FP_PRF_ENTRIES-1:0] : t_fp_ffs0[`LG_FP_PRF_ENTRIES-1:0])};
 	if(t_alloc & t_uop.fp_dst_valid)
-	  n_fp_prf_free[n_fp_prf_entry] = 1'b0;
+	  n_fp_prf_free[n_fp_prf_entry[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	if(t_alloc_two & t_uop2.fp_dst_valid)
-	  n_fp_prf_free[n_fp_prf_entry] = 1'b0;
+	  n_fp_prf_free[n_fp_prf_entry[`LG_FP_PRF_ENTRIES-1:0]] = 1'b0;
 	if(t_free_fp_reg)
-	  n_fp_prf_free[t_free_fp_reg_ptr] = 1'b1;
+	  n_fp_prf_free[t_free_fp_reg_ptr[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
 	if(t_free_fp_reg_two)
-	  n_fp_prf_free[t_free_fp_reg_two_ptr] = 1'b1;
+	  n_fp_prf_free[t_free_fp_reg_two_ptr[`LG_FP_PRF_ENTRIES-1:0]] = 1'b1;
      end
 
    always_comb

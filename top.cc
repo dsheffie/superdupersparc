@@ -979,6 +979,7 @@ int main(int argc, char **argv) {
   std::string ckpt_file, tcx_rom;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   bool cg14 = false;
+  bool no_kbd = false;
   std::map<uint32_t, uint64_t> pushout_histo;
   std::map<uint64_t, double> tip_map;          /* full per-cycle attribution (TIP, ported from rv64core) */
   int64_t mem_reply_cycle = -1L;
@@ -996,6 +997,7 @@ int main(int argc, char **argv) {
       ("tcx", po::value<std::string>(&tcx_rom)->implicit_value("/usr/share/qemu/QEMU,tcx.bin"),
        "with --checkpoint: the checkpoint has a TCX (its FCode PROM)")
       ("cg14", po::bool_switch(&cg14), "with --checkpoint: the checkpoint has a CG14")
+      ("no-kbd", po::bool_switch(&no_kbd), "with --tcx/--cg14: no keyboard (as ss10sim --no-kbd; Solaris runs)")
       ("user,u", po::bool_switch(&user), "checker ISS: linux user-mode emulation (syscalls + window spill/fill)")
       ("heartbeat,h", po::value<uint64_t>(&heartbeat)->default_value(1<<24), "heartbeat for stats")
       ("log,l", po::value<std::string>(&log_name), "stats log filename")
@@ -1062,7 +1064,7 @@ int main(int argc, char **argv) {
       if(cg14) {
 	st->sun4m->cg14 = new cg14_t();
       }
-      st->sun4m->have_kbd = (st->sun4m->tcx != nullptr or st->sun4m->cg14 != nullptr);
+      st->sun4m->have_kbd = (st->sun4m->tcx != nullptr or st->sun4m->cg14 != nullptr) and not no_kbd;
     }
     if(not attach_scsi(ss->sun4m, scsi_disks, scsi_dev_t::type_t::disk, 0) or
        not attach_scsi(ss->sun4m, scsi_cdroms, scsi_dev_t::type_t::cdrom, 6)) {
