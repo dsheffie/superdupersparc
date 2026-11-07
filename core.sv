@@ -683,7 +683,7 @@ module core(clk,
       r.is_bus_err = e.is_bus_err;
       r.target_pc = e.target_pc;
       r.take_br = e.take_br;
-      r.data = e.data;
+      r.data = e.data[`ROB_DATA_WIDTH-1:0];
       r.exec_cycle = e.exec_cycle;
       r.fwd_sel = e.fwd_sel;
       r.fwd_selB = e.fwd_selB;
@@ -744,7 +744,7 @@ module core(clk,
       r.take_br = c.take_br;
       r.is_cache = m.is_cache;
       r.cache_act = m.cache_act;
-      r.data = c.data;
+      r.data = `MEM_WIDTH'(c.data);
       r.opcode = m.opcode;
       r.bpu_idx = m.bpu_idx;
       r.br_pred = m.br_pred;
@@ -3955,7 +3955,7 @@ module core(clk,
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].target_pc <= t_complete_bundle_1.restart_pc;
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_ii <= t_complete_bundle_1.is_ii;
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].take_br <= t_complete_bundle_1.take_br;
-		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_1.data;
+		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_1.data[`ROB_DATA_WIDTH-1:0];
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].overflow <= t_complete_bundle_1.overflow;
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].trap <= t_complete_bundle_1.trap;
 		     r_rob_odd[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -3974,7 +3974,7 @@ module core(clk,
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].target_pc <= t_complete_bundle_1.restart_pc;
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_ii <= t_complete_bundle_1.is_ii;
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].take_br <= t_complete_bundle_1.take_br;
-		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_1.data;
+		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_1.data[`ROB_DATA_WIDTH-1:0];
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].overflow <= t_complete_bundle_1.overflow;
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].trap <= t_complete_bundle_1.trap;
 		     r_rob_even[t_complete_bundle_1.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -3998,7 +3998,10 @@ module core(clk,
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].target_pc <= t_complete_bundle_2.restart_pc;
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_ii <= t_complete_bundle_2.is_ii;
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].take_br <= t_complete_bundle_2.take_br;
+`ifdef VERILATOR
+		     /* FP results reach the ROB only for the checker (machine.vh ROB_DATA_WIDTH) */
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_2.data;
+`endif
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].overflow <= t_complete_bundle_2.overflow;
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].trap <= t_complete_bundle_2.trap;
 		     r_rob_odd[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -4015,7 +4018,10 @@ module core(clk,
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].target_pc <= t_complete_bundle_2.restart_pc;
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_ii <= t_complete_bundle_2.is_ii;
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].take_br <= t_complete_bundle_2.take_br;
+`ifdef VERILATOR
+		     /* FP results reach the ROB only for the checker (machine.vh ROB_DATA_WIDTH) */
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= t_complete_bundle_2.data;
+`endif
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].overflow <= t_complete_bundle_2.overflow;
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].trap <= t_complete_bundle_2.trap;
 		     r_rob_even[t_complete_bundle_2.rob_ptr[`LG_ROB_ENTRIES-1:1]].exec_cycle <= r_cycle[7:0];
@@ -4031,7 +4037,7 @@ module core(clk,
 	     if(core_mem_rsp_valid)
 	       begin
 		  if(core_mem_rsp.rob_ptr[0]) begin
-		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
+		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data[`ROB_DATA_WIDTH-1:0];
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.mmu.fault;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].mmu <= core_mem_rsp.mmu;
 		     r_rob_odd[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;
@@ -4043,7 +4049,7 @@ module core(clk,
 `endif
 		  end
 		  else begin
-		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data;
+		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].data <= core_mem_rsp.data[`ROB_DATA_WIDTH-1:0];
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].faulted <= core_mem_rsp.bad_addr | core_mem_rsp.bus_err | core_mem_rsp.mmu.fault;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].mmu <= core_mem_rsp.mmu;
 		     r_rob_even[core_mem_rsp.rob_ptr[`LG_ROB_ENTRIES-1:1]].is_bad_addr <= core_mem_rsp.bad_addr;

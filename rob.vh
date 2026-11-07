@@ -150,7 +150,7 @@ typedef struct packed {
    logic is_bus_err;
    logic [(`M_WIDTH-1):0] target_pc;
    logic take_br;
-   logic [(`MEM_WIDTH-1):0] data;
+   logic [(`ROB_DATA_WIDTH-1):0] data;   /* machine.vh: M_WIDTH outside sim */
    logic [7:0] exec_cycle;
    logic [1:0] fwd_sel;
    logic [1:0] fwd_selB;

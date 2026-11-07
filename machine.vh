@@ -359,6 +359,17 @@
 `define ENABLE_INT_SRCC 1
 `define MEM_WIDTH 64
 
+/* the ROB's data field.  Retire and the trap logic read only its low M_WIDTH
+ * bits: trap types, WMISS info, wrpsr/wrwim/wrtbr values, the fault VA, the
+ * flush address.  The upper half (an ldd's high word, Y) and FP results (FP and
+ * FCR state are renamed in their own PRFs) feed only the co-sim checker's retire
+ * ports, so a synthesis build stores M_WIDTH and drops the FP completion write. */
+`ifdef VERILATOR
+ `define ROB_DATA_WIDTH `MEM_WIDTH
+`else
+ `define ROB_DATA_WIDTH `M_WIDTH
+`endif
+
 /* Physical address width: cache tags, the memory bus, the L2.  sun4m (SRMMU)
  * physical addresses are 36 bits, wider than a VA (M_WIDTH), so a memory request's
  * address field, which carries the VA and then the PA, is REQ_ADDR_WIDTH. */
