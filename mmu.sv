@@ -30,6 +30,8 @@ import "DPI-C" function void mmu_set_ref(input longint pte_pa, input int pte);
 module mmu(clk,
 	   reset,
 	   ctrl_e,
+	   ctrl_nf,
+	   ctrl_bm,
 	   ctx,
 	   l1i_req,
 	   l1i_va,
@@ -69,6 +71,8 @@ module mmu(clk,
    input logic clk;
    input logic reset;
    output logic ctrl_e;
+   output logic ctrl_nf;   /* MCR.NF: data-access faults are recorded, not trapped (core.sv) */
+   output logic ctrl_bm;   /* MCR.BM: Viking boot mode (the L1I/L1D redirect to the PROM) */
    output logic [`SRMMU_CTX_BITS-1:0] ctx;
 
    input logic l1i_req;
@@ -133,6 +137,8 @@ module mmu(clk,
    logic [31:0] n_fsr, n_far;
 
    assign ctrl_e = r_ctrl[0];
+   assign ctrl_nf = r_ctrl[1];
+   assign ctrl_bm = r_ctrl[13];
    assign ctx = r_ctx;
 
    /* a fault status not yet read is replaced and flagged OW (interpret.cc
@@ -166,7 +172,22 @@ module mmu(clk,
 	  begin
 	     n_fsr = 32'd0;
 	  end
-	if(fault_valid)
+	if(fault_valid && (fault_ft == FT_BUS_ERROR))
+	  begin
+	     /* interpret.cc mmu_bus_error: a pending translation fault (FT 1-4)
+	      * keeps priority (only OW is set); otherwise the bus error replaces
+	      * the status (OW if it was a bus error too) */
+	     if((r_fsr[4:2] == 3'd0) || (r_fsr[4:2] > 3'd4))
+	       begin
+		  n_fsr = {22'd0, fault_level, fault_at, fault_ft, 1'b1, (r_fsr[4:2] == FT_BUS_ERROR)};
+		  n_far = fault_va;
+	       end
+	     else
+	       begin
+		  n_fsr = r_fsr | 32'd1;
+	       end
+	  end
+	else if(fault_valid)
 	  begin
 	     n_fsr = {22'd0, fault_level, fault_at, fault_ft, 1'b1, (r_fsr != 32'd0)};
 	     n_far = fault_va;
@@ -252,6 +273,13 @@ module mmu(clk,
    wire [7:0] w_idx = (r_level == 2'd0) ? r_va[31:24] :
 		      (r_level == 2'd1) ? {2'd0, r_va[23:18]} :
 		      {2'd0, r_va[17:12]};
+   /* SRMMU probe type va[11:8] -> the walk level it stops at: context 0,
+    * region 1, segment 2, page/entire 3 (the leaf) */
+   wire [3:0] w_probe_type = r_va[11:8];
+   wire [1:0] w_probe_stop = (w_probe_type == 4'd3) ? 2'd0 :
+			     (w_probe_type == 4'd2) ? 2'd1 :
+			     (w_probe_type == 4'd1) ? 2'd2 :
+			     2'd3;
    wire [`PA_WIDTH-1:0] w_next_ea = {w_entry[31:2], 6'd0} + {26'd0, w_idx, 2'd0};
 
    assign mem_req_valid = r_mem_req;
@@ -343,6 +371,12 @@ module mmu(clk,
 			  * asi_load) */
 			 n_pte = r_do_probe ? w_entry : (w_entry | 32'h20 | (r_do_mark ? 32'h40 : 32'h0));
 			 n_state = (n_pte != w_entry) ? WR : DONE;
+		      end
+		    else if((w_entry[1:0] == 2'd1) && r_do_probe && (r_level == w_probe_stop) && (r_level != 2'd3))
+		      begin
+			 /* a probe stops at its type's level and answers with the
+			  * PTD there (interpret.cc srmmu_probe) */
+			 n_state = DONE;
 		      end
 		    else if((w_entry[1:0] == 2'd1) && (r_level != 2'd3))
 		      begin

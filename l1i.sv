@@ -76,6 +76,7 @@ module l1i(clk,
 	   cache_accesses,
 	   cache_hits,
 	   mmu_ctrl_e,
+	   mmu_ctrl_bm,
 	   mmu_ctx,
 	   tlb_flush,
 	   psr_s,
@@ -90,6 +91,7 @@ module l1i(clk,
     * itlb's walk request (a pulse; the VA is held until the response) and its
     * response */
    input logic mmu_ctrl_e;
+   input logic mmu_ctrl_bm;   /* Viking boot mode: MMU-off fetches come from the PROM */
    input logic [`SRMMU_CTX_BITS-1:0] mmu_ctx;
    input logic tlb_flush;   /* clear the itlb (mmu.sv: a ctrl/ctpr write) */
    input logic psr_s;
@@ -728,8 +730,9 @@ endfunction
    wire [1:0] 		w_itlb_level;
    wire [`PA_WIDTH-1:0] w_itlb_pa;
    logic 		r_xlate;
+   logic 		r_bmode;
    logic 		t_itlb_replace;
-   tlb #(.N(`N_ITLB_ENTRIES)) itlb(
+   tlb #(.N(`N_ITLB_ENTRIES), .ID(1)) itlb(
 				   .clk(clk),
 				   .reset(reset),
 				   .clear(tlb_flush),
@@ -752,8 +755,11 @@ endfunction
    always_ff@(posedge clk)
      begin
 	r_xlate <= reset ? 1'b0 : mmu_ctrl_e;
+	r_bmode <= reset ? 1'b0 : (!mmu_ctrl_e & mmu_ctrl_bm);
      end
-   assign w_tlb_pc = w_itlb_pa;
+   /* boot mode (MCR.E = 0, BM = 1): the fetch reads the PROM, PROM_PA |
+    * va[18:0] (the untranslated itlb pa is the va) */
+   assign w_tlb_pc = r_bmode ? (`SUN4M_PROM_PA | `PA_WIDTH'(w_itlb_pa[18:0])) : w_itlb_pa;
 
    /* the fetch's verdict: an itlb miss walks; a hit needs execute permission
     * (interpret.cc mmu_xlate: user ACC 2-4, supervisor ACC 2-4 and 6-7) */

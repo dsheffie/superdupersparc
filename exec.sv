@@ -898,6 +898,11 @@ module exec(clk,
     * selected on a writeback match executes the next cycle, after the flag write. */
    logic [N_INT_PRF_ENTRIES-1:0]   r_prf_zero;
    logic [3:0] 			   r_prf_icc[N_INT_PRF_ENTRIES-1:0];   /* {N, Z, V, C} */
+`ifdef VERILATOR
+   /* checkpoint resume: icc, Y and the FSR come from the harness at reset (top.cc) */
+   import "DPI-C" function int have_checkpoint();
+   import "DPI-C" function int ckpt_sreg(input int id);
+`endif
    logic [3:0] 			   t_icc_out;
    logic [N_INT_SCHED_ENTRIES-1:0] r_alu_srcC_rdy, t_alu_srcC_match;
    logic 			   t_alu_alloc_srcC_match, t_alu_alloc2_srcC_match;
@@ -2137,7 +2142,15 @@ module exec(clk,
 	if(reset)
 	  begin
 	     for(integer i = 0; i < N_FCR_PRF_ENTRIES; i = i + 1)
-	       r_fcr_prf[i] <= 8'd0;
+	       begin
+		  r_fcr_prf[i] <= 8'd0;
+	       end
+`ifdef VERILATOR
+	     if(have_checkpoint() != 0)
+	       begin
+		  r_fcr_prf[0] <= {6'd0, 2'((ckpt_sreg(5) >> 10) & 3)};   /* fcc, at the reset FCR mapping */
+	       end
+`endif
 	  end
 	else if(w_fpu_fcr_valid)
 	  r_fcr_prf[w_fpu_fcr_ptr] <= w_fpu_result[7:0];
@@ -3486,6 +3499,12 @@ module exec(clk,
 	if(reset)
 	  begin
 	     r_prf_icc <= '{default:4'd0};
+`ifdef VERILATOR
+	     if(have_checkpoint() != 0)
+	       begin
+		  r_prf_icc[0] <= 4'(ckpt_sreg(3));   /* the reset flags register */
+	       end
+`endif
 	  end
 	else if(t_iwb && t_iwb_flags && (t_iwb_dst != 'd0))
 	  begin
@@ -3524,7 +3543,13 @@ module exec(clk,
    always_ff@(posedge clk)
      begin
 	r_src_hilo <= r_hilo_prf[t_picked_uop.hilo_src];
-	
+`ifdef VERILATOR
+	if(reset && (have_checkpoint() != 0))
+	  begin
+	     r_hilo_prf[0] <= 32'(ckpt_sreg(4));      /* Y, at the reset HILO mapping */
+	  end
+	else
+`endif
 	if(r_start_int && t_wr_hilo)
 	  begin
 	     r_hilo_prf[int_uop.hilo_dst] <= t_hilo_result;
@@ -3571,7 +3596,11 @@ module exec(clk,
 
    always_ff@(posedge clk)
      begin
+`ifdef VERILATOR
+	r_fcsr <= reset ? ((have_checkpoint() != 0) ? (32'(ckpt_sreg(5)) & ~32'h00000c00) : 32'd0) : n_fcsr;
+`else
 	r_fcsr <= reset ? 32'd0 : n_fcsr;
+`endif
      end // always_ff
 
    /* ldfsr (serializing, so alone in the machine): its load response, unless it

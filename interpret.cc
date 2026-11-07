@@ -170,6 +170,40 @@ static uint32_t srmmu_walk(state_t *s, uint32_t va, uint32_t *pte, uint64_t *pte
   }
 }
 
+/* SRMMU probe (lda ASI 3, V8 appendix H): va[11:8] is the probe type -- 0 page,
+ * 1 segment, 2 region, 3 context, 4 entire.  The walk stops at the type's level
+ * and returns the entry there (a PTD as well as a PTE); a PTE met earlier is
+ * returned, an invalid or reserved entry gives 0.  Matches qemu's mmu_probe.
+ * Solaris's vik_mmu_probe relies on it: a region probe that returned the
+ * 4K leaf PTE looked like a 16MB region mapping and gave a bogus PA (the
+ * "munged phys_avail list" panic). */
+static uint32_t srmmu_probe(state_t *s, uint32_t va) {
+  const uint32_t type = (va >> 8) & 0xf;
+  if(type > 4) {
+    return 0;
+  }
+  /* walk level of each type: page/entire = the leaf (3), segment 2, region 1, context 0 */
+  static const uint32_t stop_level[5] = {3, 2, 1, 0, 3};
+  uint64_t ea = (static_cast<uint64_t>(s->mmu_ctpr & ~3u) << 4) + 4*static_cast<uint64_t>(s->mmu_ctx);
+  for(uint32_t l = 0; ; l++) {
+    uint32_t e = ld_phys<uint32_t>(s, ea);
+    if((e & 3) == 2) {
+      return e;
+    }
+    if((e & 3) != 1) {
+      return 0;
+    }
+    if(l == 3) {              /* a PTD at level 3 */
+      return 0;
+    }
+    if(l == stop_level[type]) {
+      return e;
+    }
+    uint32_t idx = (l == 0) ? ((va >> 24) & 0xff) : (l == 1) ? ((va >> 18) & 0x3f) : ((va >> 12) & 0x3f);
+    ea = (static_cast<uint64_t>(e & ~3u) << 4) + 4*idx;
+  }
+}
+
 static inline uint64_t pte_pa_of(uint32_t pte, uint32_t level, uint32_t va) {
   static const uint32_t off_mask[4] = {0xffffffffu, 0x00ffffffu, 0x0003ffffu, 0x00000fffu};
   uint64_t base = static_cast<uint64_t>(pte >> 8) << 12;
@@ -331,10 +365,11 @@ static uint32_t asi_load(state_t *s, uint32_t asi, uint32_t va) {
     uint64_t r = s->mxcc[mxcc_reg(va)];
     return (va & 4) ? static_cast<uint32_t>(r) : static_cast<uint32_t>(r >> 32);
   }
-  if(asi == 0x3) {          /* probe: the PTE, or 0 (only the "entire" type 4 walk is modeled) */
-    uint32_t pte = 0, level = 0;
-    uint64_t pte_pa = 0;
-    return (srmmu_walk(s, va & ~0xfffu, &pte, &pte_pa, &level) == FT_NONE) ? pte : 0;
+  if(asi == 0x3) {
+    return srmmu_probe(s, va);
+  }
+  if(asi == 0x4c) {
+    return s->mmu_bpaction;
   }
   if(asi == 0x4) {
     switch(va & 0xf00)
@@ -397,6 +432,10 @@ static void asi_store(state_t *s, uint32_t asi, uint32_t va, uint32_t v) {
     return;
   }
   if(asi == 0x3) {          /* TLB flush: there is no TLB */
+    return;
+  }
+  if(asi == 0x4c) {
+    s->mmu_bpaction = v & 0x1fffu;
     return;
   }
   if(asi == 0x4) {
@@ -1352,6 +1391,9 @@ void execSparc(state_t *s) {
 	}
 	break;
       }
+      /* what a load may write, for a bus error's precise trap (below) */
+      const uint32_t sv_r0 = s->gpr(rd), sv_r1 = s->gpr(rd ^ 1u);
+      const uint32_t sv_f0 = s->f[rd], sv_f1 = s->f[rd ^ 1u], sv_fsr = s->fsr;
       /* off = byte offset within the (single-page, naturally aligned) access */
       auto ld32 = [&](uint32_t off) -> uint32_t {
 	return mem ? ld_phys<uint32_t>(s, pa + off) : asi_load(s, asi, addr + off);
@@ -1466,9 +1508,19 @@ void execSparc(state_t *s) {
       }
 #endif
       if(s->bus_error and mmu_bus_error(s, pa, is_store, false, is_alt)) {
-	/* NOTE: the access's register/memory side effects already happened; the
-	 * faulting part read 0 or was dropped (qemu also completes the insn on
-	 * the no-trap path) */
+	/* data_access_error is precise: the trapping load writes no register
+	 * (qemu raises it before the write-back; the RTL never retires it).  The
+	 * op ran with the faulting part reading 0, so put back what it wrote; a
+	 * device store that bus-errors was dropped by the device */
+	if(rd != 0) {
+	  s->gpr(rd) = sv_r0;
+	}
+	if((rd ^ 1u) != 0) {
+	  s->gpr(rd ^ 1u) = sv_r1;
+	}
+	s->f[rd] = sv_f0;
+	s->f[rd ^ 1u] = sv_f1;
+	s->fsr = sv_fsr;
 	trap = TT_DACCESS_ERROR;
       }
       break;

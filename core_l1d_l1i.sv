@@ -968,6 +968,8 @@ module core_l1d_l1i(clk,
    mmu_fault_t 			  w_mmu_fault;
    wire [31:0] 			  w_mmu_fault_va;
    wire 			  w_mmu_ctrl_e;
+   wire 			  w_mmu_ctrl_nf;
+   wire 			  w_mmu_ctrl_bm;
    wire [`SRMMU_CTX_BITS-1:0] 	  w_mmu_ctx;
    page_walk_rsp_t 		  w_page_walk_rsp;
    wire 			  w_dtlb_walk_probe;
@@ -980,6 +982,8 @@ module core_l1d_l1i(clk,
 	    .clk(clk),
 	    .reset(reset),
 	    .ctrl_e(w_mmu_ctrl_e),
+	    .ctrl_nf(w_mmu_ctrl_nf),
+	    .ctrl_bm(w_mmu_ctrl_bm),
 	    .ctx(w_mmu_ctx),
 	    .l1i_req(w_itlb_walk_req),
 	    .l1i_va(w_itlb_walk_va),
@@ -1093,6 +1097,7 @@ module core_l1d_l1i(clk,
 	       .cache_accesses(l1d_cache_accesses),
 	       .cache_hits(l1d_cache_hits),
 	       .mmu_ctrl_e(w_mmu_ctrl_e),
+	       .mmu_ctrl_bm(w_mmu_ctrl_bm),
 	       .mmu_ctx(w_mmu_ctx),
 	       .page_walk_req_valid(w_dtlb_walk_req),
 	       .page_walk_req_va(w_dtlb_walk_va),
@@ -1163,6 +1168,7 @@ module core_l1d_l1i(clk,
 	      .cache_accesses(l1i_cache_accesses),
 	      .cache_hits(l1i_cache_hits),
 	      .mmu_ctrl_e(w_mmu_ctrl_e),
+	       .mmu_ctrl_bm(w_mmu_ctrl_bm),
 	      .mmu_ctx(w_mmu_ctx),
 	      .tlb_flush(w_tlb_flush),
 	      .psr_s(w_psr_s),
@@ -1312,6 +1318,7 @@ module core_l1d_l1i(clk,
 	     .dbg_trace_index(dbg_trace_index),
 	     .dbg_trace_data(w_core_trace_data),
 	     .dbg_trace_wptr(w_core_trace_wptr),
+	     .mmu_ctrl_nf(w_mmu_ctrl_nf),
 	     .mmu_fault_valid(w_mmu_fault_valid),
 	     .mmu_fault(w_mmu_fault),
 	     .mmu_fault_va(w_mmu_fault_va),

@@ -127,6 +127,7 @@ module l1d(clk,
 	   cache_accesses,
 	   cache_hits,
 	   mmu_ctrl_e,
+	   mmu_ctrl_bm,
 	   mmu_ctx,
 	   page_walk_req_valid,
 	   page_walk_req_va,
@@ -158,6 +159,7 @@ module l1d(clk,
     * the VA is held until the response) and response, and tlb_busy (a walk is
     * pending: the LSU holds BLK_TLB requests until it drops) */
    input logic mmu_ctrl_e;
+   input logic mmu_ctrl_bm;   /* Viking boot mode: MMU-off ASI 8/9 loads read the PROM */
    input logic [`SRMMU_CTX_BITS-1:0] mmu_ctx;
    output logic page_walk_req_valid;
    output logic [31:0] page_walk_req_va;
@@ -336,15 +338,21 @@ module l1d(clk,
   
    localparam N_MQ_ENTRIES = (1<<`LG_MRQ_ENTRIES);
 
+   /* the SuperSPARC module registers (ASI 2) a load can see: the MBus port
+    * register (interpret.cc asi_load) */
+   function automatic logic [31:0] module_reg(input logic [31:0] a);
+      module_reg = (a == 32'h01c00f04) ? 32'h08000000 : 32'd0;
+   endfunction
+
    function logic [15:0] make_mask(mem_req_t r);
       logic [15:0]		  t_m;
       logic			  b,s,w;
       if(r.op == MEM_LD || r.op == MEM_SD)
 	return 16'hff << {r.addr[DWORD_START], 3'b0};
 
-      b = 	(r.op == MEM_SB | r.op == MEM_LB | r.op == MEM_LBU);
+      b = 	(r.op == MEM_SB | r.op == MEM_LB | r.op == MEM_LBU | r.op == MEM_LDSTUB);
       s = 	(r.op == MEM_SH | r.op == MEM_LH | r.op == MEM_LHU);
-      w = 	(r.op == MEM_SW | r.op == MEM_LW);
+      w = 	(r.op == MEM_SW | r.op == MEM_LW | r.op == MEM_SWAP);
       
       t_m = b ? 16'h0001 :
 	    s ? 16'h0003 :
@@ -2292,10 +2300,15 @@ endfunction
    wire [1:0] 		w_dtlb_level;
    wire [`PA_WIDTH-1:0] w_dtlb_pa;
    logic [3:0] 		r_bypass_hi;
+   logic 		r_bmode2;
    logic 		r_xlate2;
    logic 		t_dtlb_replace;
    wire 		w_xlate_in = mmu_ctrl_e & core_mem_req.mapped & !core_mem_req.commit;
    logic t_mmureg_wr, t_mmureg_fsr_clr, t_asi_tlb_flush;
+   /* ASI 0x4c: the SuperSPARC MMU breakpoint action register (13 bits, as qemu's;
+    * interpret.cc asi_load).  Solaris's bpt_reg writes it and spins until it
+    * reads back. */
+   logic [12:0] r_bpaction, n_bpaction;
    /* the ASIs that reach memory: 8/9, 0xa/0xb, 0x20-0x2f (interpret.cc asi_is_memory) */
    wire w_asi_special2 = !((r_req2.asi == 8'h08) | (r_req2.asi == 8'h09) | (r_req2.asi == 8'h0a) |
 			   (r_req2.asi == 8'h0b) | (r_req2.asi[7:4] == 4'h2));
@@ -2310,7 +2323,7 @@ endfunction
 			     (r_req2.addr[10:8] == 3'd3) ? mmureg_fsr :
 			     (r_req2.addr[10:8] == 3'd4) ? mmureg_far : 32'd0;
 
-   tlb #(.N(`N_DTLB_ENTRIES)) dtlb(
+   tlb #(.N(`N_DTLB_ENTRIES), .ID(0)) dtlb(
 				   .clk(clk),
 				   .reset(reset),
 				   .clear(tlb_flush),
@@ -2334,11 +2347,16 @@ endfunction
      begin
 	r_bypass_hi <= (core_mem_req.asi[7:4] == 4'h2) ? core_mem_req.asi[3:0] : 4'd0;
 	r_xlate2 <= w_xlate_in;
+	/* boot mode: an instruction-space (ASI 8/9) load with the MMU off reads
+	 * the PROM (interpret.cc mmu_xlate) */
+	r_bmode2 <= !mmu_ctrl_e & mmu_ctrl_bm & !core_mem_req.is_store &
+		    ((core_mem_req.asi == 8'h08) | (core_mem_req.asi == 8'h09));
      end
    always_comb
      begin
 	w_tlb_c = w_dtlb_c ? 3'd3 : 3'd2;
-	w_mapped_addr = {w_dtlb_pa[`PA_WIDTH-1:32] | r_bypass_hi, w_dtlb_pa[31:0]};
+	w_mapped_addr = r_bmode2 ? (`SUN4M_PROM_PA | `PA_WIDTH'(w_dtlb_pa[18:0])) :
+			{w_dtlb_pa[`PA_WIDTH-1:32] | r_bypass_hi, w_dtlb_pa[31:0]};
      end
 
    /* the port-2 request's translation verdict: a TLB miss walks (and blocks the
@@ -2378,10 +2396,10 @@ endfunction
    /* a probe walk's answer, held until the replayed ASI 3 load takes it */
    logic 		r_walk_probe, n_walk_probe;
    logic 		r_prbres_valid, n_prbres_valid;
-   logic [19:0] 	r_prbres_vpn;
+   logic [23:0] 	r_prbres_vpn;   /* va[31:8]: the page and the probe type */
    logic [31:0] 	r_prbres_pte;
    logic 		t_walk_probe, t_prbres_use;
-   wire 		w_prbres_hit2 = r_prbres_valid & (r_prbres_vpn == r_req2.addr[31:12]);
+   wire 		w_prbres_hit2 = r_prbres_valid & (r_prbres_vpn == r_req2.addr[31:8]);
    logic 		r_fc_valid, n_fc_valid;
    logic [19:0] 	r_fc_vpn;
    logic [2:0] 		r_fc_ft;
@@ -2433,10 +2451,11 @@ endfunction
 	r_walk_mark <= reset ? 1'b0 : n_walk_mark;
 	r_walk_probe <= reset ? 1'b0 : n_walk_probe;
 	r_prbres_valid <= reset ? 1'b0 : n_prbres_valid;
+	r_bpaction <= reset ? 13'd0 : n_bpaction;
 	if(page_walk_rsp_valid)
 	  begin
-	     r_prbres_vpn <= r_walk_va[31:12];
-	     r_prbres_pte <= page_walk_rsp.fault ? 32'd0 : page_walk_pte;
+	     r_prbres_vpn <= r_walk_va[31:8];
+	     r_prbres_pte <= (page_walk_rsp.fault | (r_walk_va[11:8] > 4'd4)) ? 32'd0 : page_walk_pte;   /* types 5-15 answer 0 */
 	     r_fc_vpn <= r_walk_va[31:12];
 	     r_fc_ft <= page_walk_rsp.ft;
 	     r_fc_level <= page_walk_rsp.level;
@@ -2453,14 +2472,6 @@ endfunction
 	  begin
 	     $display("[DTLB] cyc=%0d miss on an op the LSU does not hold: op=%0d pc=%x va=%x",
 		      r_cycle, r_req2.op, r_req2.pc, r_req2.addr);
-	     $stop();
-	  end
-	/* an atomic to an uncached page (or a bypass ASI) has no RMW path yet: the
-	 * port-1 uncached arms would write without answering */
-	if(!reset && r_got_req2 && r_req2.is_atomic && w_req2_nonspec && !drain_ds_complete &&
-	   !w_tlb_miss2 && !w_perm_fault2 && !w_need_m2 && !r_req2.bad_addr && !t_remapped_req2.cached)
-	  begin
-	     $display("[L1D] cyc=%0d uncached ldstub/swap: pc=%x va=%x", r_cycle, r_req2.pc, r_req2.addr);
 	     $stop();
 	  end
      end
@@ -2531,6 +2542,7 @@ endfunction
 	t_mmureg_wr = 1'b0;
 	t_mmureg_fsr_clr = 1'b0;
 	t_asi_tlb_flush = 1'b0;
+	n_bpaction = r_bpaction;
 	
 	n_req = r_req;
 	n_req_idx = r_req_idx;
@@ -2747,14 +2759,25 @@ endfunction
 			  *      PTE its walk found (0 on a fault)
 			  *   2: the module registers (the MBus port register; the MXCC
 			  *      stream ops only ever copy a block onto itself: no-ops)
+			  *   0x4c: the breakpoint action register
 			  *   any other: loads read 0, stores are dropped */
 			 t_mmureg_wr = r_req2.is_store && (r_req2.asi == 8'h04);
 			 t_mmureg_fsr_clr = !r_req2.is_store && (r_req2.asi == 8'h04) && (r_req2.addr[10:8] == 3'd3);
 			 t_asi_tlb_flush = r_req2.is_store && (r_req2.asi == 8'h03);
+			 if(r_req2.is_store && (r_req2.asi == 8'h4c))
+			   begin
+			      n_bpaction = mmureg_wdata[12:0];
+			   end
 			 t_prbres_use = !r_req2.is_store && (r_req2.asi == 8'h03);
+			 /* ASI 2: the MBus port register (0x01c00f04) reads 0x08000000, the
+			  * rest 0; an ldda takes the word at addr into rd (the high half,
+			  * as a memory ldd's) and addr + 4 into rd + 1 */
 			 n_core_mem_rsp.data = (r_req2.asi == 8'h04) ? `MEM_WIDTH'(w_mmureg_rd) :
 					       (r_req2.asi == 8'h03) ? `MEM_WIDTH'(r_prbres_pte) :
-					       ((r_req2.asi == 8'h02) && (r_req2.addr[31:0] == 32'h01c00f04)) ? `MEM_WIDTH'(32'h08000000) :
+					       (r_req2.asi == 8'h4c) ? `MEM_WIDTH'(r_bpaction) :
+					       ((r_req2.asi == 8'h02) && (r_req2.op == MEM_LD)) ?
+					       `MEM_WIDTH'({module_reg(r_req2.addr[31:0]), module_reg(r_req2.addr[31:0] + 32'd4)}) :
+					       (r_req2.asi == 8'h02) ? `MEM_WIDTH'(module_reg(r_req2.addr[31:0])) :
 					       'd0;
 			 n_core_mem_rsp.dst_valid = r_req2.dst_valid & !r_req2.is_store;
 			 n_core_mem_rsp_valid = 1'b1;
@@ -3119,9 +3142,14 @@ endfunction
 			   begin
 			      n_mem_req_cacheable = 1'b0;
 			      n_mem_req_mask = t_mem_req_mask;
-			 n_state = r_req.is_store ? INJECT_UNCACHE_STORE : INJECT_UNCACHE_LOAD;
+			 /* an uncached ldstub/swap is one atomic request the memory side
+			  * performs (write the masked lane, answer the old line): it waits
+			  * in INJECT_UNCACHE_LOAD, where the op case picks the old byte or
+			  * word out of the response.  The store data is the op case's
+			  * t_array_data (0xff in the byte lane, or rd in the word). */
+			 n_state = (r_req.is_store && !r_req.is_atomic) ? INJECT_UNCACHE_STORE : INJECT_UNCACHE_LOAD;
 			 n_mem_req_valid = 1'b1;
-			 n_mem_req_opcode = r_req.is_store ? MEM_SW : MEM_LW;
+			 n_mem_req_opcode = r_req.is_atomic ? r_req.op : (r_req.is_store ? MEM_SW : MEM_LW);
 			 n_mem_req_addr = {r_req.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
 			 n_mem_req_idx = r_req_idx;
 			 n_mem_req_store_data = t_array_data;
@@ -3459,7 +3487,9 @@ endfunction
 		 begin
 		    //$display("data returns for uncached load");
 		    t_pt1 = "P";
-		    n_core_mem_rsp.data = t_rsp_data[`MEM_WIDTH-1:0];
+		    /* a bus error's data is its physical address: the trap records it
+		     * in the SRMMU fault address register (core.sv mmu_fault_va) */
+		    n_core_mem_rsp.data = mem_rsp_bad ? `MEM_WIDTH'(r_req.addr[31:0]) : t_rsp_data[`MEM_WIDTH-1:0];
                     n_core_mem_rsp.dst_valid = r_req.dst_valid & !mem_rsp_bad;
 		    n_core_mem_rsp.bad_addr = r_req.bad_addr;		    
 		    n_core_mem_rsp.bus_err = mem_rsp_bad;   /* DBE at retirement */

@@ -192,6 +192,7 @@ module core(clk,
 	    dbg_trace_index,
 	    dbg_trace_data,
 	    dbg_trace_wptr,
+	    mmu_ctrl_nf,
 	    mmu_fault_valid,
 	    mmu_fault,
 	    mmu_fault_va,
@@ -396,6 +397,9 @@ module core(clk,
    input logic [19:0] dbg_trace_index;
    output logic [31:0] 			  dbg_trace_data;
    output logic [15:0] 			  dbg_trace_wptr;
+   /* MCR.NF (mmu.sv): a data-access fault is recorded but not trapped -- the
+    * faulting instruction is skipped (w_nf_skip) */
+   input logic 				  mmu_ctrl_nf;
    /* a trap on an SRMMU fault: the walker records it in its fault status and
     * address registers */
    output logic 			  mmu_fault_valid;
@@ -530,6 +534,7 @@ module core(clk,
       r.has_delay_slot = e.has_delay_slot;
       r.has_nullifying_delay_slot = e.has_nullifying_delay_slot;
       r.in_delay_slot = e.in_delay_slot;
+      r.dcti = e.dcti;
       r.valid_flags_dst = e.valid_flags_dst;
       r.old_flags_pdst = e.old_flags_pdst;
       r.valid_dst2 = e.valid_dst2;
@@ -588,7 +593,10 @@ module core(clk,
 
    function automatic rob_entry_t rob_merge(input mrob_entry_t m, input crob_entry_t c);
       rob_entry_t r;
-      r.faulted = c.faulted;
+      /* a DCTI couple's second CTI retires as a mispredict, always: the front
+       * end does not follow a couple (after the CTI's slot it falls through),
+       * so a restart from the CTI's own outcome is the only safe way on */
+      r.faulted = c.faulted | m.dcti;
       r.is_ii = c.is_ii;
       r.is_fpe = c.is_fpe;
       r.fp_set_flags = c.fp_set_flags;
@@ -608,6 +616,7 @@ module core(clk,
       r.has_delay_slot = m.has_delay_slot;
       r.has_nullifying_delay_slot = m.has_nullifying_delay_slot;
       r.in_delay_slot = m.in_delay_slot;
+      r.dcti = m.dcti;
       r.valid_flags_dst = m.valid_flags_dst;
       r.old_flags_pdst = m.old_flags_pdst;
       r.valid_dst2 = m.valid_dst2;
@@ -2292,7 +2301,15 @@ module core(clk,
 			      t_bump_rob_head = 1'b1;			      
 			   end // else: !if(t_rob_head.is_ii)
 			 n_machine_clr = 1'b1;
-			 n_restart_pc = t_rob_head.in_delay_slot ? r_last_branch_target : t_rob_head.target_pc;
+			 /* a delay slot's own nPC is its branch's resolved next pc
+			  * (r_last_branch_target: that branch retired just before).  A CTI
+			  * in a delay slot (a DCTI couple, w_head_dcti) is a branch with
+			  * that nPC: taken, it goes on at its target after its slot (the
+			  * next ROB entry, T1 = that nPC); not taken, at T1 + 4 -- its own
+			  * pc + 8 means nothing here */
+			 n_restart_pc = !t_rob_head.in_delay_slot ? t_rob_head.target_pc :
+					!w_head_dcti ? r_last_branch_target :
+					t_rob_head.take_br ? t_rob_head.target_pc : (r_last_branch_target + 'd4);
 			 n_restart_src_pc = t_rob_head.pc;
 			 n_restart_src_is_indirect = t_rob_head.is_indirect && !t_rob_head.is_ret;
 			 
@@ -2493,6 +2510,34 @@ module core(clk,
 			 n_restart_npc = t_rob_head.target_pc;
 			 n_restart_npc_valid = 1'b1;
 			 n_restart_valid = 1'b1;
+		      end
+		    else if(!t_arch_fault & w_head_dcti & (t_rob_head.opcode != S_RETT))
+		      begin
+			 /* the mispredicted branch's slot is itself a CTI (a DCTI couple):
+			  * the front end restarted at the first branch's next pc T1
+			  * (r_restart_pc), which is this CTI's slot; restart it again
+			  * with this CTI's own outcome (V8: PC = this, nPC = T1) */
+			 if(!t_rob_head.has_delay_slot & !t_rob_head.has_nullifying_delay_slot)
+			   begin
+			      /* ba,a: T1 annulled, straight to the target */
+			      n_restart_pc = t_rob_head.target_pc;
+			      n_restart_npc_valid = 1'b0;
+			      n_restart_valid = 1'b1;
+			   end
+			 else if(t_rob_head.has_nullifying_delay_slot & !t_rob_head.take_br)
+			   begin
+			      /* not taken, a = 1: T1 annulled */
+			      n_restart_pc = r_restart_pc + 'd4;
+			      n_restart_npc_valid = 1'b0;
+			      n_restart_valid = 1'b1;
+			   end
+			 else if(t_rob_head.take_br & (t_rob_head.target_pc != (r_restart_pc + 'd4)))
+			   begin
+			      /* taken: T1, then the target */
+			      n_restart_npc = t_rob_head.target_pc;
+			      n_restart_npc_valid = 1'b1;
+			      n_restart_valid = 1'b1;
+			   end
 		      end
 		    if(t_arch_fault)
 		      begin
@@ -2746,7 +2791,7 @@ module core(clk,
 		* TRAP_L1/L2 write %l1/%l2).  ET=0: error mode, which halts. */
 	       n_epc = t_rob_head.pc;
 	       t_bump_rob_head = 1'b1;
-	       if(r_psr_et)
+	       if(r_psr_et | w_nf_skip)
 		 begin
 		    n_state = WRITE_EPC;
 		 end
@@ -2766,7 +2811,8 @@ module core(clk,
 	       
 	       n_machine_clr = 1'b1;
 	       
-	       n_restart_pc = {r_tbr_tba, r_tbr_tt, 4'd0};   /* TBR, tt just written */
+	       /* a trap: TBR, tt just written; an NF skip: the skipped instruction's npc */
+	       n_restart_pc = r_nf_inj ? r_trap_npc : {r_tbr_tba, r_tbr_tt, 4'd0};
 	       n_restart_src_pc = 'd0;
 	       n_restart_why = RST_WHY_EXCEPTION;
 	       n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
@@ -3338,6 +3384,8 @@ module core(clk,
 
 	
 	t_rob_tail.in_delay_slot = r_in_delay_slot;
+	t_rob_tail.dcti = r_in_delay_slot & (t_alloc_uop.is_br | t_alloc_uop.is_call | (t_alloc_uop.op == S_JMPL)) &
+			  (t_alloc_uop.op != S_RETT);   /* jmpl;rett has its own restart */
 	t_rob_tail.data = 'd0;
 	t_rob_tail.opcode = t_alloc_uop.op;
 	t_rob_tail.bpu_idx = t_alloc_uop.bpu_idx;
@@ -3386,6 +3434,8 @@ module core(clk,
 	t_rob_next_tail.is_store = is_store(t_alloc_uop2.op);
 	
 	t_rob_next_tail.in_delay_slot = r_in_delay_slot;
+	t_rob_next_tail.dcti = r_in_delay_slot & (t_alloc_uop2.is_br | t_alloc_uop2.is_call | (t_alloc_uop2.op == S_JMPL)) &
+			       (t_alloc_uop2.op != S_RETT);
 	t_rob_next_tail.data = 'd0;
 	t_rob_next_tail.bpu_idx = t_alloc_uop2.bpu_idx;
 	t_rob_next_tail.br_pred = t_alloc_uop2.br_pred;
@@ -3478,6 +3528,8 @@ module core(clk,
 `endif
 	     //t_uop.has_delay_slot
 	     t_rob_next_tail.in_delay_slot = t_uop.has_delay_slot;
+	     t_rob_next_tail.dcti = t_uop.has_delay_slot & (t_uop2.is_br | t_uop2.is_call | (t_uop2.op == S_JMPL)) &
+				    (t_uop2.op != S_RETT);
 
 	     if(t_uop2.dst_valid)
 	       begin
@@ -4408,6 +4460,20 @@ module core(clk,
      end
 `endif
 
+`ifdef VERILATOR
+   /* the committed PSR fields, CWP and WIM after each retire cycle, for the
+    * checker (top.cc compares them with the ISS's: hidden window state otherwise
+    * shows only at the next window trap that goes differently) */
+   import "DPI-C" function void rtl_sregs(input int psr, input int wim);
+   always_ff@(posedge clk)
+     begin
+	if(!reset && t_retire)
+	  begin
+	     rtl_sregs(int'({n_psr_ef, n_psr_pil, n_psr_s, n_psr_ps, n_psr_et, 5'(n_arch_cwp)}), int'(n_wim));
+	  end
+     end
+`endif
+
    /* ---- SPARC traps ---- */
    /* the trap type of the faulting ROB head: decode traps (II) and exec traps
     * carry it in data[7:0]; an exec op that is not implemented is
@@ -4419,9 +4485,16 @@ module core(clk,
 			  t_rob_head.is_bus_err ? 8'h29 :
 			  t_rob_head.is_fpe ? 8'h08 :   /* fp_exception */
 			  8'h02;
+   /* the ROB head is a CTI in another CTI's delay slot (a DCTI couple) */
+   wire w_head_dcti = t_rob_head.dcti;
    /* nPC of the trapped instruction: a delay slot's is its branch's target */
    wire [`M_WIDTH-1:0] w_trap_npc = t_rob_head.in_delay_slot ? r_last_branch_target : (t_rob_head.pc + 'd4);
-   wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et;
+   /* MCR.NF: a data-access fault at the ROB head is recorded (mmu_fault_valid)
+    * but not trapped, whatever ET is: the instruction is skipped -- its access
+    * was never made, a load's rd keeps its value -- and execution goes on at its
+    * npc (interpret.cc: "the access is dropped") */
+   wire w_nf_skip = (r_state == ARCH_FAULT) & t_rob_head.mmu.fault & mmu_ctrl_nf;
+   wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et & !w_nf_skip;
    /* an fp_exception's ftt: an FPop the FPU punted (a denormal operand or a tiny
     * result: unfinished_FPop) or one with an enabled IEEE exception (exec.sv
     * w_fp_fault), or an unimplemented FPop (decode: II with tt 8) */
@@ -4438,8 +4511,12 @@ module core(clk,
    wire w_irq = r_psr_et & (irl != 4'd0) & ((irl == 4'd15) | (irl > r_psr_pil));
    /* the fault status/address are recorded with the trap, never for a wrong-path
     * access (the ISS records them at the access, which is the same instruction) */
-   assign mmu_fault_valid = (r_state == ARCH_FAULT) & t_rob_head.mmu.fault;
-   assign mmu_fault = t_rob_head.mmu;
+   /* a data bus error is recorded too (interpret.cc mmu_bus_error): FT = access
+    * bus error, level 0, AT = {store, 0, S}, FAR = its physical address */
+   wire mmu_fault_t w_bus_err_fault = '{fault: 1'b1, ft: FT_BUS_ERROR, level: 2'd0,
+					at: {t_rob_head.is_store, 1'b0, r_psr_s}};
+   assign mmu_fault_valid = (r_state == ARCH_FAULT) & (t_rob_head.mmu.fault | t_rob_head.is_bus_err);
+   assign mmu_fault = t_rob_head.mmu.fault ? t_rob_head.mmu : w_bus_err_fault;
    /* FAR: a data fault's VA (the ROB data), an instruction fault's pc (an II's
     * data is its trap type) */
    assign mmu_fault_va = t_rob_head.is_ii ? t_rob_head.pc[31:0] : t_rob_head.data[31:0];
@@ -4454,11 +4531,14 @@ module core(clk,
      end
 `endif
    logic r_trap_inj, n_trap_inj;
+   /* the injection is an NF skip's single NOP (w_nf_uop), not a trap's TRAP_L1/L2 */
+   logic r_nf_inj, n_nf_inj;
    logic [`M_WIDTH-1:0] r_trap_pc, r_trap_npc;
    always_ff@(posedge clk)
      begin
 	r_trap_inj <= reset ? 1'b0 : n_trap_inj;
-	if(w_take_trap)
+	r_nf_inj <= reset ? 1'b0 : n_nf_inj;
+	if(w_take_trap | w_nf_skip)
 	  begin
 	     r_trap_pc <= t_rob_head.pc;
 	     r_trap_npc <= w_trap_npc;
@@ -4493,6 +4573,18 @@ module core(clk,
    endfunction // trap_uop
    wire uop_t w_trap_uop1 = trap_uop(TRAP_L1, arch_widx(r_arch_cwp, 5'd17), r_trap_pc, r_trap_pc);
    wire uop_t w_trap_uop2 = trap_uop(TRAP_L2, arch_widx(r_arch_cwp, 5'd18), r_trap_npc, r_trap_pc);
+   /* an NF skip's stand-in for the skipped instruction: a NOP at its pc, which
+    * retires in its place (so the checker steps it) with no architectural effect */
+   function automatic uop_t nf_uop(input logic [`M_WIDTH-1:0] pc);
+      uop_t u;
+      begin
+	 u = '0;
+	 u.op = NOP;
+	 u.pc = pc;
+	 nf_uop = u;
+      end
+   endfunction // nf_uop
+   wire uop_t w_nf_uop = nf_uop(r_trap_pc);
    wire w_trap_push = r_trap_inj & (r_state == ACTIVE) & !t_clr_dq;
    /* decode waits out a serializing CWP/PSR/WIM writer at the ROB head */
    wire w_dec_hold = !t_rob_empty & retire_writes_cwp(t_rob_head.opcode);
@@ -4561,6 +4653,12 @@ module core(clk,
 	  end // if (t_retire)
 	/* trap entry (ARCH_FAULT, ET=1) */
 	n_trap_inj = r_trap_inj & !w_trap_push;
+	n_nf_inj = r_nf_inj & !w_trap_push;
+	if(w_nf_skip)
+	  begin
+	     n_trap_inj = 1'b1;
+	     n_nf_inj = 1'b1;
+	  end
 	if(w_take_trap)
 	  begin
 	     n_psr_ps = r_psr_s;
@@ -4864,7 +4962,16 @@ module core(clk,
 	  end
 	else
 	  begin
-	     if(w_trap_push)
+	     if(w_trap_push & r_nf_inj)
+	       begin
+		  /* the queue is empty right after the NF skip's restart */
+		  t_push_dq_one = 1'b1;
+		  t_dq_push_uop = w_nf_uop;
+		  n_dq_tail_ptr = r_dq_tail_ptr + 'd1;
+		  n_dq_next_tail_ptr = r_dq_next_tail_ptr + 'd1;
+		  n_dq_cnt = n_dq_cnt + 'd1;
+	       end
+	     else if(w_trap_push)
 	       begin
 		  /* the queue is empty right after the trap's restart */
 		  t_push_dq_one = 1'b1;

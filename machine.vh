@@ -342,6 +342,9 @@
  * physical addresses are 36 bits, wider than a VA (M_WIDTH), so a memory request's
  * address field, which carries the VA and then the PA, is REQ_ADDR_WIDTH. */
 `define PA_WIDTH 36
+/* the sun4m boot PROM (Viking boot mode, MCR.BM: MMU-off fetches and ASI 8/9
+ * loads read it at PROM_PA | va[18:0]; interpret.cc mmu_xlate) */
+`define SUN4M_PROM_PA 36'hff0000000
 `define REQ_ADDR_WIDTH ((`PA_WIDTH > `M_WIDTH) ? `PA_WIDTH : `M_WIDTH)
 
 /* SRMMU (SPARC V8 reference MMU) */

@@ -25,6 +25,7 @@ typedef struct packed {
    logic       has_delay_slot;
    logic       has_nullifying_delay_slot;
    logic       in_delay_slot;
+   logic       dcti;   /* a CTI in another CTI's delay slot: retires as a mispredict (core.sv) */
    logic       valid_flags_dst;   /* SPARC: pdst also holds the new icc (flags RAT) */
    logic       valid_dst2;        /* SPARC ldd: pdst2 is rd+1 (arch ldst+1) */
    logic [(`LG_PRF_ENTRIES-1):0] ldst;   /* int: the flat windowed arch index */
@@ -104,6 +105,7 @@ typedef struct packed {
    logic has_delay_slot;
    logic has_nullifying_delay_slot;
    logic in_delay_slot;
+   logic dcti;
    logic valid_flags_dst;
    logic valid_dst2;
    logic [(`LG_PRF_ENTRIES-1):0] ldst;
@@ -326,5 +328,6 @@ localparam logic [2:0] FT_INVALID     = 3'd1;
 localparam logic [2:0] FT_PROTECTION  = 3'd2;
 localparam logic [2:0] FT_PRIVILEGE   = 3'd3;
 localparam logic [2:0] FT_TRANSLATION = 3'd4;
+localparam logic [2:0] FT_BUS_ERROR   = 3'd5;   /* access bus error (a data_access_error) */
 
 `endif

@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <boost/archive/binary_oarchive.hpp>
@@ -12,17 +13,17 @@
 #include "sun4m.hh"
 
 /* bump when any serialized layout below changes */
-static const uint32_t CKPT_VERSION = 1;
+static const uint32_t CKPT_VERSION = 5;
 static const uint64_t CKPT_MAGIC = 0x54504b4330315353ULL;   /* "SS10CKPT" */
 
 namespace boost {
 namespace serialization {
 
 template <class A> void serialize(A &ar, escc_t::chn_t &c, unsigned) {
-  ar & c.wregs & c.rregs & c.reg & c.rx & c.tx & c.rxint & c.txint & c.rxint_under_svc & c.txint_under_svc;
+  ar & c.wregs & c.rregs & c.reg & c.rx & c.tx & c.rxint & c.txint & c.rxint_under_svc & c.txint_under_svc & c.queue;
 }
 template <class A> void serialize(A &ar, escc_t &e, unsigned) {
-  ar & e.chn & e.disabled & e.console & e.irq;
+  ar & e.chn & e.disabled & e.console & e.serio & e.irq & e.led_mode & e.mouse_dx & e.mouse_dy & e.mouse_buttons;
 }
 template <class A> void serialize(A &ar, intctl_t &i, unsigned) {
   ar & i.slave_pending & i.irl_out & i.master_pending & i.master_disabled & i.target_cpu;
@@ -37,18 +38,67 @@ template <class A> void serialize(A &ar, slavio_ctr_t &c, unsigned) {
 template <class A> void serialize(A &ar, sparc_dma_t &d, unsigned) {
   ar & d.r & d.irq;
 }
+template <class A> void serialize(A &ar, scsi_req_t &r, unsigned) {
+  ar & r.buf & r.status & r.is_write & r.wr_lba & r.is_mode_select & r.ms10;
+}
 template <class A> void serialize(A &ar, esp_t &e, unsigned) {
-  ar & e.rregs & e.wregs & e.fifo & e.fifo_n & e.tchi_written & e.dma & e.dma_enabled & e.satn_pending & e.irq;
+  ar & e.rregs & e.wregs & e.fifo & e.cmdfifo & e.tchi_written & e.ti_size & e.status & e.dma;
+  ar & e.do_cmd & e.data_in_ready & e.ti_cmd & e.cmdfifo_cdb_offset & e.lun & e.identified & e.dma_enabled & e.dma_cb;
+  ar & e.cur_tgt & e.req_active & e.req_sent & e.req & e.async_off & e.async_len & e.irq;
+}
+template <class A> void serialize(A &ar, lance_t &l, unsigned) {
+  ar & l.csr & l.rap & l.tdra & l.rdra & l.tlen & l.rlen & l.tx_idx;
+}
+template <class A> void serialize(A &ar, tcx_t &t, unsigned) {
+  ar & t.vram & t.vram24 & t.cplane & t.r & t.g & t.b & t.dac_index & t.dac_state;
+  ar & t.tmpblit & t.thcmisc & t.cursmask & t.cursbits & t.cursx & t.cursy;
+}
+template <class A> void serialize(A &ar, cg14_t &c, unsigned) {
+  ar & c.regs & c.vram;
 }
 template <class A> void serialize(A &ar, fw_cfg_t &f, unsigned) {
   ar & f.items & f.cur & f.off;
 }
 template <class A> void serialize(A &ar, sun4m_t &m, unsigned) {
-  ar & m.fw_cfg & m.espdma & m.ledma & m.esp & m.intctl & m.ctr & m.ctr_user_mode;
+  ar & m.fw_cfg & m.espdma & m.ledma & m.esp & m.lance & m.intctl & m.ctr & m.ctr_user_mode;
   ar & m.ns_shift & m.next_event_icnt & m.next_event_ns & m.time_bias_ns & m.cpu_halted & m.rtc_base & m.reset_req;
   ar & m.kbd_ms & m.serial & m.aux1 & m.aux2 & m.diag & m.mdm & m.fdc & m.leds & m.sysctrl;
   ar & make_binary_object(m.prom, sizeof(m.prom));
   ar & m.nvram & m.iommu & m.ecc;
+  /* the TCX (restore with --tcx if the checkpoint has one) */
+  bool have_tcx = (m.tcx != nullptr);
+  ar & have_tcx;
+  if(have_tcx) {
+    if(m.tcx == nullptr) {
+      fprintf(stderr, "checkpoint: has a TCX; restore with --tcx\n");
+      exit(1);
+    }
+    ar & *m.tcx;
+  }
+  bool have_cg14 = (m.cg14 != nullptr);
+  ar & have_cg14;
+  if(have_cg14) {
+    if(m.cg14 == nullptr) {
+      fprintf(stderr, "checkpoint: has a CG14; restore with --cg14\n");
+      exit(1);
+    }
+    ar & *m.cg14;
+  }
+  /* the targets' sense data and pending unit attention (the images are not
+   * part of a checkpoint: restore with the same --scsi-* devices) */
+  for(scsi_dev_t *d : m.scsi) {
+    bool present = (d != nullptr);
+    ar & present;
+    if(present and d != nullptr) {
+      ar & make_binary_object(d->sense, sizeof(d->sense)) & d->unit_attention & d->bs;   /* bs: a CD-ROM's MODE SELECT */
+    }
+    else if(present) {
+      uint8_t sense[18];
+      bool ua;
+      uint32_t bs;
+      ar & make_binary_object(sense, sizeof(sense)) & ua & bs;
+    }
+  }
 }
 /* the architectural state (not the memory, the device pointer or the halt flags) */
 template <class A> void serialize(A &ar, state_t &s, unsigned) {

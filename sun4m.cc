@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -50,7 +51,7 @@ static const uint8_t IVEC_HITXINTA = 0x10;
 static const uint8_t EXTINT_BRKINT = 0x80;
 static const int CHN_B = 0, CHN_A = 1;
 
-escc_t::escc_t(bool disabled_, bool console_) : disabled(disabled_), console(console_) {
+escc_t::escc_t(bool disabled_, bool console_, bool serio_) : disabled(disabled_), console(console_), serio(serio_) {
   /* qemu escc_reset: registers zeroed except RR0 Tx-empty (the Sun PROM spins on it) */
   for(int c = 0; c < 2; c++) {
     chn[c].rregs[R_STATUS] = STATUS_TXEMPTY;
@@ -150,6 +151,18 @@ void escc_t::clr_rxint(int c) {
   update_irq();
 }
 
+bool escc_t::can_receive(int c) const {
+  const chn_t &s = chn[c];
+  return (s.wregs[W_RXCTRL] & 0x01) and not (s.rregs[R_STATUS] & STATUS_RXAV);
+}
+
+void escc_t::receive(int c, uint8_t v) {
+  chn_t &s = chn[c];
+  s.rregs[R_STATUS] |= STATUS_RXAV;
+  s.rx = v;
+  set_rxint(c);
+}
+
 void escc_t::soft_reset(int c) {
   chn_t &s = chn[c];
   s.reg = 0;
@@ -198,7 +211,97 @@ uint32_t escc_t::read(uint32_t off) {
   }
   s.rregs[R_STATUS] &= ~STATUS_RXAV;
   clr_rxint(c);
-  return s.rx;                      /* (no keyboard/mouse queue: the kbd ESCC is disabled) */
+  return serio ? get_queue(c) : s.rx;
+}
+
+/* qemu put_queue / get_queue: the keyboard and mouse send through a 256-byte
+ * queue; every byte (re)raises receive-available */
+void escc_t::put_queue(int c, uint8_t v) {
+  chn_t &s = chn[c];
+  if(s.queue.size() >= 256) {
+    return;
+  }
+  s.queue.push_back(v);
+  receive(c, 0);
+}
+
+uint8_t escc_t::get_queue(int c) {
+  chn_t &s = chn[c];
+  if(s.queue.empty()) {
+    return 0;
+  }
+  const uint8_t v = s.queue.front();
+  s.queue.erase(s.queue.begin());
+  if(not s.queue.empty()) {
+    receive(c, 0);
+  }
+  return v;
+}
+
+/* qemu handle_kbd_command: reset answers ff, the type (4), 7f idle; the
+ * layout query answers fe and the DIP switches (0x21, en-us); the byte after
+ * set-LEDs is the LED state */
+void escc_t::kbd_command(uint8_t v) {
+  if(led_mode) {
+    led_mode = false;
+    return;
+  }
+  switch(v)
+    {
+    case 0x01:
+      chn[CHN_A].queue.clear();
+      put_queue(CHN_A, 0xff);
+      put_queue(CHN_A, 0x04);
+      put_queue(CHN_A, 0x7f);
+      break;
+    case 0x0e:
+      led_mode = true;
+      break;
+    case 0x07:
+    case 0x0f:
+      chn[CHN_A].queue.clear();
+      put_queue(CHN_A, 0xfe);
+      put_queue(CHN_A, 0x21);
+      break;
+    default:
+      break;
+    }
+}
+
+bool escc_t::kbd_idle() const {
+  return chn[CHN_A].queue.empty() and not (chn[CHN_A].rregs[R_STATUS] & STATUS_RXAV);
+}
+
+void escc_t::kbd_event(uint8_t keycode, bool down) {
+  if(serio) {
+    put_queue(CHN_A, down ? keycode : (keycode | 0x80));
+  }
+}
+
+/* qemu sunmouse_sync: a 5-byte Mouse Systems packet -- 0x87 ^ buttons, dx,
+ * dy (each clamped to +-127; any rest goes in later packets), two zero
+ * motion bytes */
+void escc_t::mouse_event(int32_t dx, int32_t dy, uint8_t buttons) {
+  if(not serio) {
+    return;
+  }
+  mouse_dx += dx;
+  mouse_dy -= dy;
+  if(buttons != (mouse_buttons & 0x07)) {
+    mouse_buttons = buttons | 0x80;
+  }
+  while(mouse_dx != 0 or mouse_dy != 0 or (mouse_buttons & 0x80)) {
+    mouse_buttons &= ~0x80;
+    put_queue(CHN_B, 0x87 ^ mouse_buttons);
+    const int32_t x = std::max(-127, std::min(127, mouse_dx));
+    put_queue(CHN_B, static_cast<uint8_t>(x));
+    mouse_dx -= x;
+    const int32_t y = std::max(-127, std::min(127, mouse_dy));
+    put_queue(CHN_B, static_cast<uint8_t>(y));
+    mouse_dy -= y;
+    put_queue(CHN_B, 0);
+    put_queue(CHN_B, 0);
+  }
 }
 
 void escc_t::write(uint32_t off, uint32_t v) {
@@ -288,6 +391,9 @@ void escc_t::write(uint32_t off, uint32_t v) {
     else if(console and c == CHN_A) {
       fputc(s.tx, stdout);
       fflush(stdout);
+    }
+    else if(serio and c == CHN_A and not disabled) {
+      kbd_command(s.tx);
     }
   }
   s.rregs[R_STATUS] |= STATUS_TXEMPTY;
@@ -717,8 +823,8 @@ void sun4m_t::dma_set_irq(sparc_dma_t &d, bool level) {
   }
 }
 
-/* qemu dma_mem_write (the ESP is the espdma's chip; the ledma's Lance has no
- * modeled state, so its reset and enable lines go nowhere) */
+/* qemu dma_mem_write (the ESP is the espdma's chip, the Lance the ledma's;
+ * the Lance has no use for the enable line) */
 void sun4m_t::dma_write(state_t *s, sparc_dma_t &d, bool is_esp, uint32_t reg, uint32_t v) {
   (void)s;
   if(reg != 0) {
@@ -738,8 +844,10 @@ void sun4m_t::dma_write(state_t *s, sparc_dma_t &d, bool is_esp, uint32_t reg, u
   }
   if(v & DMA_RESET) {
     if(is_esp) {             /* the ESP's reset input: a soft reset */
-      esp_set_irq(false);
-      esp_hard_reset();
+      esp_soft_reset();
+    }
+    else {
+      lance_reset();         /* qemu ledma reset: pcnet_h_reset */
     }
   }
   else if(v & DMA_DRAIN_FIFO) {
@@ -749,200 +857,17 @@ void sun4m_t::dma_write(state_t *s, sparc_dma_t &d, bool is_esp, uint32_t reg, u
     v = DMA_DRAIN_FIFO;
   }
   if(is_esp and (v & DMA_EN) and not (d.r[0] & DMA_EN)) {
-    esp.dma_enabled = true;  /* qemu esp_dma_enable: run a deferred Select With ATN */
-    if(esp.satn_pending) {
-      esp.satn_pending = false;
-      esp_select_atn();
-    }
+    esp_dma_enable(true);    /* qemu esp_dma_enable: run a deferred DMA command */
   }
   else if(is_esp and not (v & DMA_EN) and (d.r[0] & DMA_EN)) {
-    esp.dma_enabled = false;
+    esp_dma_enable(false);
   }
   v &= ~DMA_CSR_RO_MASK;
   v |= DMA_VER;
   d.r[0] = (d.r[0] & DMA_CSR_RO_MASK) | v;
 }
 
-enum : uint8_t {
-  ESP_TCLO = 0x0, ESP_TCMID = 0x1, ESP_FIFO = 0x2, ESP_CMD = 0x3, ESP_RSTAT = 0x4, ESP_WBUSID = 0x4,
-  ESP_RINTR = 0x5, ESP_RSEQ = 0x6, ESP_RFLAGS = 0x7, ESP_WSYNO = 0x7, ESP_CFG1 = 0x8, ESP_WCCF = 0x9,
-  ESP_WTEST = 0xa, ESP_CFG2 = 0xb, ESP_CFG3 = 0xc, ESP_RES3 = 0xd, ESP_TCHI = 0xe, ESP_RES4 = 0xf,
-  CMD_DMA = 0x80, CMD_CMD = 0x7f, STAT_TC = 0x10, STAT_INT = 0x80, INTR_FC = 0x08, INTR_DC = 0x20,
-  INTR_RST = 0x80, CFG1_RESREPT = 0x40, TCHI_FAS100A = 0x4, ESP_CMDFIFO_SZ = 32
-};
-
-void sun4m_t::esp_set_irq(bool raise) {
-  if(raise and not (esp.rregs[ESP_RSTAT] & STAT_INT)) {
-    esp.rregs[ESP_RSTAT] |= STAT_INT;
-    esp.irq = true;
-    dma_set_irq(espdma, true);
-  }
-  else if(not raise and (esp.rregs[ESP_RSTAT] & STAT_INT)) {
-    esp.rregs[ESP_RSTAT] &= ~STAT_INT;
-    esp.irq = false;
-    dma_set_irq(espdma, false);
-  }
-}
-
-/* qemu esp_hard_reset (the chip-reset command and the espdma reset line also
- * lower the interrupt first: esp_soft_reset) */
-void sun4m_t::esp_hard_reset() {
-  bool en = esp.dma_enabled;
-  esp = esp_t();
-  esp.dma_enabled = en;      /* the enable line belongs to the espdma */
-  esp.rregs[ESP_CFG1] = 7;
-}
-
-/* qemu handle_satn -> get_cmd -> esp_select with no device: the command bytes are
- * fetched (DMA: up to the transfer count, advancing the espdma address), then
- * the selection times out: status 0, disconnect, sequence 0, interrupt */
-void sun4m_t::esp_select_atn() {
-  if(esp.dma) {
-    uint32_t tc = esp.rregs[ESP_TCLO] | (esp.rregs[ESP_TCMID] << 8) | (esp.rregs[ESP_TCHI] << 16);
-    uint32_t n = (tc < ESP_CMDFIFO_SZ) ? tc : ESP_CMDFIFO_SZ;
-    if(n == 0) {
-      return;                /* qemu: no command bytes, no selection */
-    }
-    espdma.r[1] += n;
-  }
-  else {
-    if(esp.fifo_n == 0) {
-      return;
-    }
-    esp.fifo_n = 0;          /* the FIFO bytes went to the command */
-  }
-  esp.fifo_n = 0;
-  esp.rregs[ESP_RSTAT] = 0;
-  esp.rregs[ESP_RINTR] = INTR_DC;
-  esp.rregs[ESP_RSEQ] = 0;
-  esp_set_irq(true);
-}
-
-uint8_t sun4m_t::esp_read(uint32_t reg) {
-  switch(reg)
-    {
-    case ESP_FIFO: {
-      /* no transfer phase ever starts, so the FIFO only holds what was written */
-      uint8_t v = 0;
-      if(esp.fifo_n > 0) {
-	v = esp.fifo[0];
-	memmove(esp.fifo, esp.fifo + 1, --esp.fifo_n);
-      }
-      esp.rregs[ESP_FIFO] = v;
-      return v;
-    }
-    case ESP_RINTR: {        /* clears the interrupt register, TC and the interrupt */
-      uint8_t v = esp.rregs[ESP_RINTR];
-      esp.rregs[ESP_RINTR] = 0;
-      esp.rregs[ESP_RSTAT] &= ~STAT_TC;
-      esp_set_irq(false);
-      return v;
-    }
-    case ESP_TCHI:           /* the chip id until the register is written */
-      return esp.tchi_written ? esp.rregs[ESP_TCHI] : TCHI_FAS100A;
-    case ESP_RFLAGS:         /* bytes in the FIFO */
-      return static_cast<uint8_t>(esp.fifo_n);
-    default:
-      return esp.rregs[reg];
-    }
-}
-
-void sun4m_t::esp_write(uint32_t reg, uint8_t v) {
-  switch(reg)
-    {
-    case ESP_TCHI:
-      esp.tchi_written = true;
-      /* fall through */
-    case ESP_TCLO:
-    case ESP_TCMID:
-      esp.rregs[ESP_RSTAT] &= ~STAT_TC;
-      break;
-    case ESP_FIFO:
-      if(esp.fifo_n < sizeof(esp.fifo)) {
-	esp.fifo[esp.fifo_n++] = v;
-      }
-      break;
-    case ESP_CMD:
-      esp.rregs[ESP_CMD] = v;
-      if(v & CMD_DMA) {
-	/* reload the transfer count from the start count (0 means 64K) */
-	uint32_t stc = esp.wregs[ESP_TCLO] | (esp.wregs[ESP_TCMID] << 8) | (esp.wregs[ESP_TCHI] << 16);
-	if(stc == 0) {
-	  stc = 0x10000;
-	}
-	esp.dma = true;
-	esp.rregs[ESP_TCLO] = static_cast<uint8_t>(stc);
-	esp.rregs[ESP_TCMID] = static_cast<uint8_t>(stc >> 8);
-	esp.rregs[ESP_TCHI] = static_cast<uint8_t>(stc >> 16);
-      }
-      else {
-	esp.dma = false;
-      }
-      switch(v & CMD_CMD)
-	{
-	case 0x00:           /* NOP */
-	  break;
-	case 0x01:           /* FLUSH */
-	  esp.fifo_n = 0;
-	  break;
-	case 0x02:           /* RESET */
-	  esp_set_irq(false);
-	  esp_hard_reset();
-	  break;
-	case 0x03:           /* BUS RESET (no devices to reset) */
-	  if(not (esp.wregs[ESP_CFG1] & CFG1_RESREPT)) {
-	    esp.rregs[ESP_RINTR] |= INTR_RST;
-	    esp_set_irq(true);
-	  }
-	  break;
-	case 0x41:           /* SELECT, SELECT WITH ATN (and stop): nobody answers */
-	case 0x42:
-	case 0x43:
-	  if(esp.dma and not esp.dma_enabled) {
-	    esp.satn_pending = true;
-	  }
-	  else {
-	    esp_select_atn();
-	  }
-	  break;
-	case 0x12:           /* MESSAGE ACCEPTED */
-	  esp.rregs[ESP_RINTR] |= INTR_DC;
-	  esp.rregs[ESP_RSEQ] = 0;
-	  esp.rregs[ESP_RFLAGS] = 0;
-	  esp_set_irq(true);
-	  break;
-	case 0x18:           /* SET ATN... PAD */
-	  esp.rregs[ESP_RSTAT] = STAT_TC;
-	  esp.rregs[ESP_RINTR] |= INTR_FC;
-	  esp.rregs[ESP_RSEQ] = 0;
-	  break;
-	case 0x1a:           /* SET ATN, RESET ATN */
-	case 0x1b:
-	  break;
-	case 0x44:           /* ENABLE SELECTION */
-	  esp.rregs[ESP_RINTR] = 0;
-	  break;
-	case 0x45:           /* DISABLE SELECTION */
-	  esp.rregs[ESP_RINTR] = 0;
-	  esp_set_irq(true);
-	  break;
-	default:
-	  fprintf(stderr, "sun4m: esp: unmodeled command 0x%02x\n", v);
-	  break;
-	}
-      break;
-    case ESP_CFG1:
-    case ESP_CFG2:
-    case ESP_CFG3:
-    case ESP_RES3:
-    case ESP_RES4:
-      esp.rregs[reg] = v;
-      break;
-    default:                 /* bus id, timeouts, sync, clock conversion, test: write-only */
-      break;
-    }
-  esp.wregs[reg] = v;
-}
+/* the ESP itself (qemu hw/scsi/esp.c) is in esp.cc */
 
 /* ------------------------------------------------------- counter/timers */
 
@@ -1190,14 +1115,26 @@ sun4m_t::sun4m_t() {
 
 void sun4m_t::reset_devices(uint64_t now) {
   intctl = intctl_t();
-  kbd_ms = escc_t(true, false);
+  kbd_ms = escc_t(not have_kbd, false, have_kbd);
   serial = escc_t(false, true);
   aux1 = aux2 = mdm = 0;     /* qemu slavio_misc_reset: config, aux1/2, modem ctl */
   fdc = fdc_t();
   espdma = sparc_dma_t();
   ledma = sparc_dma_t();
   esp = esp_t();
-  esp.rregs[ESP_CFG1] = 7;   /* qemu esp_hard_reset at realize */
+  esp_hard_reset();          /* qemu esp_hard_reset at realize */
+  lance_reset();
+  if(tcx != nullptr) {
+    tcx->reset();
+  }
+  if(cg14 != nullptr) {
+    cg14->reset();
+  }
+  for(scsi_dev_t *d : scsi) {
+    if(d != nullptr) {
+      d->reset();            /* power-on reset: a unit attention */
+    }
+  }
   /* power-on reset values, as qemu's iommu_reset / ecc_realize+ecc_reset */
   memset(iommu, 0, sizeof(iommu));
   memset(ecc, 0, sizeof(ecc));
@@ -1302,6 +1239,25 @@ static uint8_t m48t08_clock(uint32_t off, const uint8_t *nvram, int64_t t) {
   return nvram[off];
 }
 
+/* The DBRI's 0x30-byte ID PROM at slot e + 0x1000.  OBP's onboard probe
+ * creates the DBRI node, adds the audio properties, then runs this as FCode;
+ * qemu leaves it empty, which leaves a node with no name that NeXTSTEP's
+ * autoconf dereferences (proplen(node, "name") fails -> NULL strcmp, Data
+ * access exception).  The real contents aren't dumped; this is a minimal
+ * FCode that gives the node what a real SS-20 shows:
+ *   " SUNW,DBRIe" device-name  10000 my-space 100 reg  (SUNW,DBRIe@e,10000) */
+static const uint64_t DBRI_PROM_BASE = 0xee0001000ULL;
+static const uint8_t dbri_prom[0x30] = {
+  0xf1, 0x08, 0x03, 0x5b, 0x00, 0x00, 0x00, 0x25,   /* start1, checksum, length */
+  0x12, 0x0a, 'S', 'U', 'N', 'W', ',', 'D', 'B', 'R', 'I', 'e',
+  0x02, 0x01,                                       /* device-name */
+  0x10, 0x00, 0x01, 0x00, 0x00,                     /* b(lit) 0x10000 */
+  0x01, 0x03,                                       /* my-space */
+  0x10, 0x00, 0x00, 0x01, 0x00,                     /* b(lit) 0x100 */
+  0x01, 0x16,                                       /* reg */
+  0x00,                                             /* end0 */
+};
+
 /* devices that exist but are not modeled: reads 0, writes dropped, no error
  * (qemu's empty-slot / unimplemented-device regions) */
 static bool is_quiet_region(uint64_t pa) {
@@ -1344,6 +1300,14 @@ void sun4m_t::update_irqs(state_t *s) {
 }
 
 uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) {
+  io_s = s;
+  if(tcx != nullptr and pa >= tcx_t::BASE and pa < tcx_t::BASE + tcx_t::SPAN) {
+    return tcx->read(pa - tcx_t::BASE, size);
+  }
+  if(cg14 != nullptr and ((pa >= cg14_t::REG_BASE and pa < cg14_t::REG_BASE + cg14_t::REG_SPAN) or
+			  (pa >= cg14_t::VRAM_BASE and pa < cg14_t::VRAM_BASE + cg14_t::VRAM_SPAN))) {
+    return cg14->read(pa, size);
+  }
   if(pa >= SUN4M_PROM_BASE and pa < SUN4M_PROM_BASE + SUN4M_PROM_SIZE) {
     return be_read(&prom[pa - SUN4M_PROM_BASE], size);
   }
@@ -1400,8 +1364,9 @@ uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) 
     return 0;                /* APC (qemu: reads 0) */
   }
   if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
-    fprintf(stderr, "sun4m: lance register read pa 0x%llx (unmodeled)\n", static_cast<unsigned long long>(pa));
-    return 0;
+    uint32_t v = lance_read(static_cast<uint32_t>(pa >> 1) & 1);
+    update_irqs(s);
+    return v;
   }
   if(pa >= 0xff1700000ULL and pa < 0xff1700008ULL) {
     uint32_t v = fdc.read(static_cast<uint32_t>(pa & 7));
@@ -1418,6 +1383,9 @@ uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) 
     case 0xff1f00000ULL: return sysctrl;
     default: break;
     }
+  if(pa >= DBRI_PROM_BASE and pa + size <= DBRI_PROM_BASE + sizeof(dbri_prom)) {
+    return be_read(&dbri_prom[pa - DBRI_PROM_BASE], size);
+  }
   if(is_quiet_region(pa)) {
     return 0;
   }
@@ -1471,6 +1439,16 @@ static void ecc_write(uint32_t *regs, uint32_t r, uint32_t v) {
 }
 
 void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bus_error) {
+  io_s = s;
+  if(tcx != nullptr and pa >= tcx_t::BASE and pa < tcx_t::BASE + tcx_t::SPAN) {
+    tcx->write(pa - tcx_t::BASE, size, v);
+    return;
+  }
+  if(cg14 != nullptr and ((pa >= cg14_t::REG_BASE and pa < cg14_t::REG_BASE + cg14_t::REG_SPAN) or
+			  (pa >= cg14_t::VRAM_BASE and pa < cg14_t::VRAM_BASE + cg14_t::VRAM_SPAN))) {
+    cg14->write(pa, size, v);
+    return;
+  }
   if(pa >= 0xff1200000ULL and pa < 0xff1200000ULL + SUN4M_NVRAM_SIZE) {
     uint32_t off = static_cast<uint32_t>(pa - 0xff1200000ULL);
     for(uint32_t i = 0; i < size; i++) {
@@ -1533,7 +1511,8 @@ void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bu
     return;
   }
   if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
-    fprintf(stderr, "sun4m: lance register write pa 0x%llx = 0x%x (unmodeled)\n", static_cast<unsigned long long>(pa), v);
+    lance_write(static_cast<uint32_t>(pa >> 1) & 1, static_cast<uint16_t>(v));
+    update_irqs(s);
     return;
   }
   if(pa >= 0xff1700000ULL and pa < 0xff1700008ULL) {

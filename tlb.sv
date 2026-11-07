@@ -50,7 +50,23 @@ module tlb(clk,
    input logic [31:0] set_m_va;
 
    parameter N = 8;
+   parameter ID = 0;   /* the checker's name for it (top.cc tlb_fill): 0 dtlb, 1 itlb */
    localparam LG_N = $clog2(N);
+`ifdef VERILATOR
+   /* every fill, for the checker: it walks the same VA and context in the ISS's
+    * memory and reports a translation that differs (a stale or mis-tagged entry
+    * shows where it is made, not at the load that finally uses it) */
+   import "DPI-C" function void tlb_fill(input int id, input int va, input int ctx, input int ppn,
+					  input int level, input int c, input int acc);
+   always_ff@(posedge clk)
+     begin
+	if(!reset && replace && !page_walk_rsp.fault)
+	  begin
+	     tlb_fill(ID, int'(replace_va), int'(ctx), int'(page_walk_rsp.ppn), int'(page_walk_rsp.level),
+		      int'(page_walk_rsp.c), int'(page_walk_rsp.acc));
+	  end
+     end
+`endif
 
    logic [N-1:0] r_valid;
    logic [N-1:0] r_c;

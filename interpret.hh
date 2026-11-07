@@ -133,6 +133,9 @@ public:
   uint32_t mmu_ctx = 0;
   uint32_t mmu_fsr = 0;
   uint32_t mmu_far = 0;
+  /* ASI 0x4c, the SuperSPARC MMU breakpoint action register (13 bits, as
+   * qemu's).  Not checkpointed: Solaris's bpt_reg writes it and reads it back. */
+  uint32_t mmu_bpaction = 0;
   /* ASI 0x2 module registers (qemu's mxccregs, present even without an MXCC):
    * [3] control 0x01c00a00, [5] module reset 0x01c00c00, [6] error 0x01c00e00,
    * [7] MBus port address 0x01c00f00 = (MID 8 + cpu) << 24 */
