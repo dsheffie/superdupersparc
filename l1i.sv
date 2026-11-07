@@ -767,6 +767,8 @@ endfunction
 			((w_itlb_acc[2:1] == 2'b01) | (w_itlb_acc == 3'd4));
    wire 		w_itlb_miss1 = r_xlate & !w_itlb_hit;
    wire 		w_iperm_fault = r_xlate & w_itlb_hit & !w_ix;
+   /* no fetch from device space but the PROM (machine.vh SUN4M_IFETCH_PA) */
+   wire 		w_idev_fault = r_xlate & w_itlb_hit & w_ix & !`SUN4M_IFETCH_PA(w_tlb_pc);
 
    /* the walk, one at a time; a faulting walk leaves its verdict in a one-entry
     * fault cache the refetch consumes (single use, as in the l1d) */
@@ -779,8 +781,9 @@ endfunction
    logic [1:0] 		r_ifc_level;
    logic 		t_iwalk_start, t_ifc_use;
    wire 		w_ifc_hit = r_ifc_valid & (r_ifc_vpn == r_cache_pc[31:12]);
-   /* this fetch faults: a cached walk fault for its page, or no execute permission */
-   wire 		w_ifault = r_req & ((w_itlb_miss1 & w_ifc_hit) | w_iperm_fault);
+   /* this fetch faults: a cached walk fault for its page, no execute permission,
+    * or a device-space page */
+   wire 		w_ifault = r_req & ((w_itlb_miss1 & w_ifc_hit) | w_iperm_fault | w_idev_fault);
    assign page_walk_req_valid = r_iwalk_req;
    assign page_walk_req_va = r_iwalk_va;
 

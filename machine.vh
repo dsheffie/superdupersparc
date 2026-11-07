@@ -385,6 +385,18 @@
 /* the sun4m boot PROM (Viking boot mode, MCR.BM: MMU-off fetches and ASI 8/9
  * loads read it at PROM_PA | va[18:0]; interpret.cc mmu_xlate) */
 `define SUN4M_PROM_PA 36'hff0000000
+/* sun4m memory space is PA[35:32] == 0; SBus (0xE) and on-board I/O + the boot
+ * PROM (0xF) are device space */
+`define SUN4M_MEM_PA(pa) ((pa) < `PA_WIDTH'(36'h100000000))
+/* instruction fetch: memory space and the boot PROM (0xF_F000_0000 up, reads
+ * have no side effects).  l1i.sv turns a fetch anywhere else into an
+ * instruction-fetch fault instead of a bus read: the frontend runs down wrong
+ * paths, and a wrong-path fetch during a Solaris 2.5.1 boot line-filled six TCX
+ * lines (SBus slot 2, pa 0xe20200170..; the page passed the execute check), side
+ * effects and all, desyncing the checker's device replay.  sun4m code runs from
+ * RAM and the PROM only, so the fault is only ever squashed; if one retired, the
+ * checker would flag it. */
+`define SUN4M_IFETCH_PA(pa) (`SUN4M_MEM_PA(pa) || ((pa) >= `SUN4M_PROM_PA))
 `define REQ_ADDR_WIDTH ((`PA_WIDTH > `M_WIDTH) ? `PA_WIDTH : `M_WIDTH)
 
 /* SRMMU (SPARC V8 reference MMU) */
