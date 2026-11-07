@@ -4468,19 +4468,16 @@ module core(clk,
 	n_prf_entry = t_gpr_ffs[`LG_PRF_ENTRIES-1:0];
 	n_prf_entry2 = t_gpr_ffs2[`LG_PRF_ENTRIES-1:0];
 	
-	if(t_alloc & t_uop.dst_valid)
+	/* port 0 is slot 1's rd or a WMISS_SEQ fill (no alloc in WMISS_SEQ) */
+	if((t_alloc & t_uop.dst_valid) | t_wm_fill)
 	  begin
-	     n_prf_free[n_prf_entry] = 1'b0;
+	     n_prf_free[t_wm_fill ? t_wm_preg : n_prf_entry] = 1'b0;
 	  end
 	if((t_alloc_two && t_uop2.dst_valid) || (t_alloc && t_uop.dst2_valid))
 	  begin
 	     n_prf_free[n_prf_entry2] = 1'b0;
 	  end
 	n_prf_free = n_prf_free | t_prf_retire_free;
-	if(t_wm_fill)
-	  begin
-	     n_prf_free[t_wm_preg] = 1'b0;
-	  end
      end // always_comb
 
    /* integer frees at retire (r9999's scheme): a GPR writer frees the register it
@@ -4494,43 +4491,47 @@ module core(clk,
    wire w_ret1_gpr = w_ret1 & (t_rob_next_head.ldst != 'd0);
    wire [`LG_PRF_ENTRIES-1:0] w_free0 = w_ret0_gpr ? t_rob_head.old_pdst : t_rob_head.pdst;
    wire [`LG_PRF_ENTRIES-1:0] w_free1 = w_ret1_gpr ? t_rob_next_head.old_pdst : t_rob_next_head.pdst;
+   /* two ports, as the retire RAT: port 0 is the head or a WMISS_SEQ spill/fill
+    * (no retire in WMISS_SEQ), port 1 an ldd's rd+1 or the second retiree (an
+    * ldd retires alone).  Each port clears (takes) one register and sets
+    * (frees) one; port 1 after port 0, so a second retiree freeing the head's
+    * pdst (both write one rd) wins. */
+   wire w_fp0_set = w_ret0 | t_wm_spill;
+   wire [`LG_PRF_ENTRIES-1:0] w_fp0_set_idx = t_wm_spill ? t_wm_preg : w_free0;
+   wire w_rp0_clr = w_ret0_gpr | t_wm_fill;
+   wire [`LG_PRF_ENTRIES-1:0] w_rp0_clr_idx = t_wm_fill ? t_wm_preg : t_rob_head.pdst;
+   wire w_rp0_set = w_ret0_gpr | t_wm_spill;
+   wire [`LG_PRF_ENTRIES-1:0] w_rp0_set_idx = t_wm_spill ? t_wm_preg : t_rob_head.old_pdst;
+   wire w_fp1_set = w_ret0_dst2 | w_ret1;
+   wire [`LG_PRF_ENTRIES-1:0] w_fp1_set_idx = w_ret0_dst2 ? t_rob_head.old_pdst2 : w_free1;
+   wire w_rp1 = w_ret0_dst2 | w_ret1_gpr;
+   wire [`LG_PRF_ENTRIES-1:0] w_rp1_clr_idx = w_ret0_dst2 ? t_rob_head.pdst2 : t_rob_next_head.pdst;
+   wire [`LG_PRF_ENTRIES-1:0] w_rp1_set_idx = w_ret0_dst2 ? t_rob_head.old_pdst2 : t_rob_next_head.old_pdst;
 
    always_comb
      begin
 	t_prf_retire_free = 'd0;
 	n_retire_prf_free = r_retire_prf_free;
-	if(w_ret0)
+	if(w_fp0_set)
 	  begin
-	     t_prf_retire_free[w_free0] = 1'b1;
-	     if(w_ret0_gpr)
-	       begin
-		  n_retire_prf_free[t_rob_head.pdst] = 1'b0;
-		  n_retire_prf_free[t_rob_head.old_pdst] = 1'b1;
-	       end
+	     t_prf_retire_free[w_fp0_set_idx] = 1'b1;
 	  end
-	if(w_ret0_dst2)
+	if(w_fp1_set)
 	  begin
-	     t_prf_retire_free[t_rob_head.old_pdst2] = 1'b1;
-	     n_retire_prf_free[t_rob_head.pdst2] = 1'b0;
-	     n_retire_prf_free[t_rob_head.old_pdst2] = 1'b1;
+	     t_prf_retire_free[w_fp1_set_idx] = 1'b1;
 	  end
-	if(w_ret1)
+	if(w_rp0_clr)
 	  begin
-	     t_prf_retire_free[w_free1] = 1'b1;
-	     if(w_ret1_gpr)
-	       begin
-		  n_retire_prf_free[t_rob_next_head.pdst] = 1'b0;
-		  n_retire_prf_free[t_rob_next_head.old_pdst] = 1'b1;
-	       end
+	     n_retire_prf_free[w_rp0_clr_idx] = 1'b0;
 	  end
-	if(t_wm_spill)
+	if(w_rp0_set)
 	  begin
-	     t_prf_retire_free[t_wm_preg] = 1'b1;
-	     n_retire_prf_free[t_wm_preg] = 1'b1;
+	     n_retire_prf_free[w_rp0_set_idx] = 1'b1;
 	  end
-	if(t_wm_fill)
+	if(w_rp1)
 	  begin
-	     n_retire_prf_free[t_wm_preg] = 1'b0;
+	     n_retire_prf_free[w_rp1_clr_idx] = 1'b0;
+	     n_retire_prf_free[w_rp1_set_idx] = 1'b1;
 	  end
 	/* p0: %g0 (and an absent window register's mapping), pinned */
 	t_prf_retire_free[0] = 1'b0;
