@@ -262,8 +262,6 @@ typedef enum logic [8:0]
    S_WRWIM,
    S_RDTBR,
    S_WRTBR,
-   S_RDASR,      /* asr number in imm (from rs1) */
-   S_WRASR,      /* asr number in srcC (from rd), not renamed */
    /* control transfer */
    S_BICC,       /* target pc + {jmp_imm, imm} */
    S_FBFCC,

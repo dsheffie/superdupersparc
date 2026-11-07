@@ -510,21 +510,16 @@ module decode_sparc(
 			     begin
 				uop.srcA_valid = 1'b0;
 				uop.srcB_valid = 1'b0;
-				if(rs1 == 5'd0)
-				  begin
-				     uop.op = (rd == 5'd0) ? NOP : S_RDY;
-				     uop.hilo_src_valid = (rd != 5'd0);
-				  end
-				else if((rs1 == 5'd15) && (rd == 5'd0))
+				/* as qemu sparc32 (non-LEON) and interpret.cc: rs1 = 15 is stbar
+				 * whatever rd is, every other rs1 (rdasr) reads %y */
+				if(rs1 == 5'd15)
 				  begin
 				     uop.op = NOP;   /* stbar: memory is TSO here */
 				  end
 				else
 				  begin
-				     uop.op = S_RDASR;
-				     uop.imm = {11'd0, rs1};
-				     uop.jmp_imm = 'd0;
-				     uop.serializing_op = 1'b1;
+				     uop.op = (rd == 5'd0) ? NOP : S_RDY;
+				     uop.hilo_src_valid = (rd != 5'd0);
 				  end
 			     end
 			   6'h29, 6'h2a, 6'h2b: /* rdpsr rdwim rdtbr */
@@ -559,9 +554,10 @@ module decode_sparc(
 				  end
 				else
 				  begin
-				     uop.op = S_WRASR;
-				     uop.srcC = w_rd_num;
-				     uop.serializing_op = 1'b1;
+				     /* wr %asrN, N != 0: a nop (qemu sparc32 non-LEON, interpret.cc) */
+				     uop.op = NOP;
+				     uop.srcA_valid = 1'b0;
+				     uop.srcB_valid = 1'b0;
 				  end
 			     end
 			   6'h31, 6'h32, 6'h33: /* wrpsr wrwim wrtbr */

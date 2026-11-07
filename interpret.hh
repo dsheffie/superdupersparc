@@ -121,7 +121,7 @@ public:
   uint32_t wim = 0;
   uint32_t tbr = 0;
   uint32_t y = 0;
-  uint32_t asr[32] = {0};
+  uint32_t asr[32] = {0};   /* unused (rd/wr %asrN read %y / are nops); kept: checkpoints serialize it */
   uint32_t f[32] = {0};
   uint32_t fsr = 0;
   /* one-deep FP queue (FPop traps are taken precisely here; FQ holds the trapping FPop) */

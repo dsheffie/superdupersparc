@@ -1201,14 +1201,14 @@ void execSparc(state_t *s) {
 	case 0x26: wr(rd, a >> (b & 31)); break;                                                     /* srl */
 	case 0x27: wr(rd, static_cast<uint32_t>(static_cast<int32_t>(a) >> (b & 31))); break;       /* sra */
 	case 0x28:                                                        /* rdy / stbar / rdasr */
-	  if(rs1 == 0) {
-	    wr(rd, s->y);
-	  }
-	  else if(rs1 == 15 and rd == 0) {
+	  /* as qemu sparc32 (non-LEON): rs1 = 15 is stbar whatever rd is, and every
+	   * other rs1 reads %y (V8: rs1 1..14 are undefined but must not trap, 16..31
+	   * implementation-dependent; SuperSPARC implements no ASRs) */
+	  if(rs1 == 15) {
 	    /* stbar: stores are already in order here */
 	  }
 	  else {
-	    wr(rd, s->asr[rs1]);
+	    wr(rd, s->y);
 	  }
 	  break;
 	case 0x29: case 0x2a: case 0x2b:                                  /* rdpsr rdwim rdtbr */
@@ -1222,9 +1222,7 @@ void execSparc(state_t *s) {
 	  if(rd == 0) {
 	    s->y = a ^ b;
 	  }
-	  else {
-	    s->asr[rd] = a ^ b;
-	  }
+	  /* wr %asrN, N != 0: a nop, as qemu sparc32 (non-LEON) */
 	  break;
 	case 0x31: case 0x32: case 0x33: {                                /* wrpsr wrwim wrtbr */
 	  if(not s->s) {
