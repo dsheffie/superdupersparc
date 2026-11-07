@@ -1776,6 +1776,23 @@ module core(clk,
    
    uop_t t_uop, t_dec_uop, t_alloc_uop;
    uop_t t_uop2, t_dec_uop2, t_alloc_uop2;
+
+   /* integer RAT read ports: 4 rename reads, 2 displaced-mapping reads.  A uop
+    * that reads more than srcA/srcB from the GPRs (srcC: a reg+reg address
+    * index; srcD: std's rd+1) allocates alone (t_enough_next_iprfs), so it
+    * borrows slot 2's two rename ports; an ldd (alone too) borrows slot 2's
+    * displaced-mapping port for rd+1. */
+   wire w_uop_cd  = (t_uop.srcC_valid & !t_uop.flags_src_valid) | t_uop.srcD_valid;
+   wire w_uop2_cd = (t_uop2.srcC_valid & !t_uop2.flags_src_valid) | t_uop2.srcD_valid;
+   wire [LG_N_INT_ARCH-1:0] w_rat_rp2 = w_uop_cd ? arch_idx(t_uop.srcC) : arch_idx(t_uop2.srcA);
+   wire [LG_N_INT_ARCH-1:0] w_rat_rp3 = w_uop_cd ? arch_idx(t_uop.srcD) : arch_idx(t_uop2.srcB);
+   wire [LG_N_INT_ARCH-1:0] w_rat_op1 = t_uop.dst2_valid ? arch_idx(t_uop.dst2) : arch_idx(t_uop2.dst);
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_rd0 = r_alloc_rat[arch_idx(t_uop.srcA)];
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_rd1 = r_alloc_rat[arch_idx(t_uop.srcB)];
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_rd2 = r_alloc_rat[w_rat_rp2];
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_rd3 = r_alloc_rat[w_rat_rp3];
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_old0 = r_alloc_rat[arch_idx(t_uop.dst)];
+   wire [`LG_PRF_ENTRIES-1:0] w_rat_old1 = r_alloc_rat[w_rat_op1];
    uop_t t_dq_push_uop, t_dq_push_uop2;   /* what the decode queue takes: decoded, or a trap's pair */
       
    assign insn_ack = !t_dq_full && insn_valid && (r_state == ACTIVE) && !r_oldest_first_pending && !r_trap_inj && !w_dec_hold;
@@ -2307,6 +2324,8 @@ module core(clk,
 	/* an ldd allocates alone: in slot 0 its rd+1 uses slot 1's allocator, and in
 	 * slot 1 it would need a third */
 	t_enough_next_iprfs = !((t_uop2.dst_valid) && t_gpr_ffs2_full) && !t_uop.dst2_valid && !t_uop2.dst2_valid &&
+			      /* srcC / srcD GPR readers allocate alone (they borrow slot 2's RAT ports) */
+			      !w_uop_cd && !w_uop2_cd &&
 			      /* a second icc writer needs a second free version */
 			      !(t_uop2.flags_dst_valid && ((r_icc_prf_free == 'd0) ||
 							   (t_uop.flags_dst_valid && !w_icc_two_free)));
@@ -3225,11 +3244,11 @@ module core(clk,
 	
 	if(t_uop.srcA_valid)
 	  begin
-	     t_alloc_uop.srcA = r_alloc_rat[arch_idx(t_uop.srcA)];
+	     t_alloc_uop.srcA = w_rat_rd0;
 	  end
 	if(t_uop.srcB_valid)
 	  begin
-	     t_alloc_uop.srcB = r_alloc_rat[arch_idx(t_uop.srcB)];
+	     t_alloc_uop.srcB = w_rat_rd1;
 	  end
 	/* FP sources: looked up in the FP RAT (mutually exclusive with the int valids above) */
 	if(t_uop.fp_srcA_valid)
@@ -3238,7 +3257,7 @@ module core(clk,
 	  t_alloc_uop.srcB = r_fp_alloc_rat[t_uop.srcB[4:0]];
 	if(t_uop.srcD_valid)
 	  begin
-	     t_alloc_uop.srcD = r_alloc_rat[arch_idx(t_uop.srcD)];
+	     t_alloc_uop.srcD = w_rat_rd3;   /* slot 2's port (allocates alone) */
 	  end
 	/* an icc reader takes the youngest icc version (srcC carries nothing) */
 	if(t_uop.flags_src_valid)
@@ -3248,7 +3267,7 @@ module core(clk,
 	  end
 	else if(t_uop.srcC_valid)
 	  begin
-	     t_alloc_uop.srcC = r_alloc_rat[arch_idx(t_uop.srcC)];
+	     t_alloc_uop.srcC = w_rat_rd2;   /* slot 2's port (allocates alone) */
 	  end
 	if(t_uop.fp_srcC_valid)
 	  t_alloc_uop.srcC = r_fp_alloc_rat[t_uop.srcC[4:0]];
@@ -3267,12 +3286,12 @@ module core(clk,
 	if(t_uop2.srcA_valid)
 	  begin
 	     t_alloc_uop2.srcA = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcA == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcA)];
+				 n_prf_entry : w_rat_rd2;
 	  end
 	if(t_uop2.srcB_valid )
 	  begin
 	     t_alloc_uop2.srcB = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcB == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcB)];
+				 n_prf_entry : w_rat_rd3;
 	  end
 	/* FP sources for slot 1, with bypass from a slot-0 FP dst */
 	if(t_uop2.fp_srcA_valid)
@@ -3281,21 +3300,14 @@ module core(clk,
 	if(t_uop2.fp_srcB_valid)
 	  t_alloc_uop2.srcB = (t_uop.fp_dst_valid && (t_uop2.srcB[4:0] == t_uop.dst[4:0])) ?
 			      n_fp_prf_entry : r_fp_alloc_rat[t_uop2.srcB[4:0]];
-	if(t_uop2.srcD_valid)
-	  begin
-	     t_alloc_uop2.srcD = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcD == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcD)];
-	  end
+	/* slot 2 never renames srcD / srcC from the GPRs: such a uop allocates alone,
+	 * from slot 1 */
 	if(t_uop2.flags_src_valid)
 	  begin
 	     t_alloc_uop2.icc_src = t_uop.flags_dst_valid ? w_icc_entry : r_icc_alloc_rat;
 	     t_alloc_uop2.srcC_valid = 1'b0;
 	  end
-	else if(t_uop2.srcC_valid)
-	  begin
-	     t_alloc_uop2.srcC = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop2.srcC == t_uop.dst)) ?
-				 n_prf_entry : r_alloc_rat[arch_idx(t_uop2.srcC)];
-	  end
+
 	if(t_uop2.fp_srcC_valid)
 	  t_alloc_uop2.srcC = (t_uop.fp_dst_valid && (t_uop2.srcC[4:0] == t_uop.dst[4:0])) ?
 			      n_fp_prf_entry : r_fp_alloc_rat[t_uop2.srcC[4:0]];
@@ -3641,13 +3653,13 @@ module core(clk,
 		  /* this is correct, we do not want the renamed version */
 		  t_rob_tail.ldst = t_uop.dst;
 		  t_rob_tail.pdst = n_prf_entry;
-		  t_rob_tail.old_pdst = r_alloc_rat[arch_idx(t_uop.dst)];
+		  t_rob_tail.old_pdst = w_rat_old0;
 		  t_rob_tail.valid_flags_dst = t_uop.flags_dst_valid;
 		  t_rob_tail.icc_pdst = w_icc_entry;
 		  t_rob_tail.old_icc_pdst = r_icc_alloc_rat;
 		  t_rob_tail.valid_dst2 = t_uop.dst2_valid;
 		  t_rob_tail.pdst2 = n_prf_entry2;
-		  t_rob_tail.old_pdst2 = r_alloc_rat[arch_idx(t_uop.dst2)];
+		  t_rob_tail.old_pdst2 = w_rat_old1;   /* slot 2's port (an ldd allocates alone) */
 	       end
 	     else if(t_uop.fcr_dst_valid)
 	       begin
@@ -3717,7 +3729,7 @@ module core(clk,
 		  t_rob_next_tail.ldst = t_uop2.dst;
 		  t_rob_next_tail.pdst = n_prf_entry2;
 		  t_rob_next_tail.old_pdst = (t_uop.dst_valid && (t_uop.dst != 'd0) && (t_uop.dst == t_uop2.dst)) ?
-					     t_rob_tail.pdst : r_alloc_rat[arch_idx(t_uop2.dst)];
+					     t_rob_tail.pdst : w_rat_old1;
 		  t_rob_next_tail.valid_flags_dst = t_uop2.flags_dst_valid;
 		  t_rob_next_tail.icc_pdst = w_icc_entry2;
 		  t_rob_next_tail.old_icc_pdst = t_uop.flags_dst_valid ? w_icc_entry : r_icc_alloc_rat;
