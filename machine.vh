@@ -122,9 +122,11 @@
  `define LG_INT_SCHED_ENTRIES 3
 `endif
 /* usable ALU scheduler entries, at most 1 << LG_INT_SCHED_ENTRIES (e.g. 12 of 16);
- * the top entries are never allocated and synthesis prunes them, as for the LSU */
+ * the top entries are never allocated and synthesis prunes them, as for the LSU.
+ * 4 of 8 (2026-11): OOC ZU3EG -843 LUTs and +0.29 ns WNS vs 6 (with LSU 6), for
+ * no Dhrystone loss and -0.4% csmith IPC. */
 `ifndef INT_SCHED_ENTRIES
- `define INT_SCHED_ENTRIES (1 << `LG_INT_SCHED_ENTRIES)
+ `define INT_SCHED_ENTRIES 4
 `endif
 
 //PHT: the PC-indexed bimodal under the mini-TAGE tagged tables
@@ -235,8 +237,14 @@
 /* usable LSU slots, at most 1 << LG_MEM_SCHED_ENTRIES.  A smaller count (e.g. 12
  * of 16) never allocates the top slots, so their valid bits are constant 0 and
  * synthesis prunes their state in exec and the l1d store buffer */
+/* 6 of 8 (2026-11): with ALU 4, OOC -2.5K LUTs vs 8/8 at -3.3% Dhrystone and -1.0%
+ * csmith IPC; 4 LSU slots cost Dhrystone 18.5% (store-buffer bound). */
 `ifndef MEM_SCHED_ENTRIES
- `define MEM_SCHED_ENTRIES (1 << `LG_MEM_SCHED_ENTRIES)
+ `ifdef TINY_CORE
+  `define MEM_SCHED_ENTRIES (1 << `LG_MEM_SCHED_ENTRIES)
+ `else
+  `define MEM_SCHED_ENTRIES 6
+ `endif
 `endif
 /* mem data queue */
 `define LG_MEM_DQ_ENTRIES 2

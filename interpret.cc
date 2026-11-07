@@ -713,8 +713,18 @@ static inline bool den64(uint64_t x) { return (((x >> 52) & 0x7ff) == 0) and (x 
 static inline bool spec32(uint32_t x) { return ((x >> 23) & 0xff) == 0xff; }
 static inline bool spec64(uint64_t x) { return ((x >> 52) & 0x7ff) == 0x7ff; }
 
-static bool tiny_q(__float128 q, __float128 min_normal) {
-  __float128 m = (q < 0) ? -q : q;
+/* binary128: the compiler's __float128 where it has one (x86-64 gcc/clang), else
+ * Boost's software binary128 (Apple arm64 clang has no __float128; only FP ops
+ * that reach fp_unfinished pay for it) */
+#ifdef __SIZEOF_FLOAT128__
+typedef __float128 bin128_t;
+#else
+#include <boost/multiprecision/cpp_bin_float.hpp>
+typedef boost::multiprecision::cpp_bin_float_quad bin128_t;
+#endif
+
+static bool tiny_q(bin128_t q, bin128_t min_normal) {
+  bin128_t m = (q < 0) ? bin128_t(-q) : q;
   return (q != 0) and (m < min_normal);
 }
 
@@ -742,9 +752,9 @@ static bool fp_unfinished(uint32_t opf, uint32_t a32, uint32_t b32, uint64_t a64
       if(spec32(a32) or spec32(b32)) {
 	return false;
       }
-      __float128 x = as_f(a32), y = as_f(b32);
-      __float128 q = (opf == 0x041) ? x + y : (opf == 0x045) ? x - y : (opf == 0x049) ? x * y : x / y;
-      return tiny_q(q, static_cast<__float128>(FLT_MIN));
+      bin128_t x = as_f(a32), y = as_f(b32);
+      bin128_t q = (opf == 0x041) ? bin128_t(x + y) : (opf == 0x045) ? bin128_t(x - y) : (opf == 0x049) ? bin128_t(x * y) : bin128_t(x / y);
+      return tiny_q(q, static_cast<bin128_t>(FLT_MIN));
     }
     case 0x042: case 0x046: case 0x04a: case 0x04e: {                 /* faddd fsubd fmuld fdivd */
       if(den64(a64) or den64(b64)) {
@@ -753,9 +763,9 @@ static bool fp_unfinished(uint32_t opf, uint32_t a32, uint32_t b32, uint64_t a64
       if(spec64(a64) or spec64(b64)) {
 	return false;
       }
-      __float128 x = as_d(a64), y = as_d(b64);
-      __float128 q = (opf == 0x042) ? x + y : (opf == 0x046) ? x - y : (opf == 0x04a) ? x * y : x / y;
-      return tiny_q(q, static_cast<__float128>(DBL_MIN));
+      bin128_t x = as_d(a64), y = as_d(b64);
+      bin128_t q = (opf == 0x042) ? bin128_t(x + y) : (opf == 0x046) ? bin128_t(x - y) : (opf == 0x04a) ? bin128_t(x * y) : bin128_t(x / y);
+      return tiny_q(q, static_cast<bin128_t>(DBL_MIN));
     }
     default:
       return false;
