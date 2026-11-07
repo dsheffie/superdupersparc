@@ -825,11 +825,9 @@ module core(clk,
    
    rob_entry_t t_rob_head, t_rob_next_head, t_rob_tail, t_rob_next_tail;
 
-   logic [N_PRF_ENTRIES-1:0] n_prf_free, r_prf_free;
    logic r_bank_sel;
    
    
-   logic [N_PRF_ENTRIES-1:0] n_retire_prf_free, r_retire_prf_free;
       
    logic [N_HILO_ENTRIES-1:0] n_hilo_prf_free,r_hilo_prf_free;
    logic [N_HILO_ENTRIES-1:0] n_retire_hilo_prf_free, r_retire_hilo_prf_free;
@@ -888,7 +886,6 @@ module core(clk,
     * plus the flags RAT) hold each integer physical register.  Changed only at
     * retire; a register is freed when its count reaches 0.  p0 (%g0, also the
     * reset flags register) is pinned and never counted. */
-   logic [N_PRF_ENTRIES-1:0]  t_prf_retire_free;   /* integer registers freed this cycle */
    
    logic [`LG_HILO_PRF_ENTRIES-1:0] r_hilo_alloc_rat;
    logic [`LG_HILO_PRF_ENTRIES-1:0] n_hilo_alloc_rat;
@@ -1055,10 +1052,8 @@ module core(clk,
    
    logic [`LG_PRF_ENTRIES:0] 	    t_gpr_ffs, t_gpr_ffs2;
    logic 			    t_gpr_ffs_full, t_gpr_ffs2_full;
-   /* each quadrant's free bits, compacted: entry j of a quadrant is physical
-    * register {half, j, parity} */
-   wire [N_PRF_ENTRIES/4-1:0] w_alu_even, w_alu_odd, w_mem_even, w_mem_odd;
    wire 		     w_alu_even_full, w_alu_odd_full, w_mem_even_full, w_mem_odd_full;
+   logic [1:0] 		     t_gpr_pool, t_gpr_pool2;   /* {half, parity} of the pool slot 1 / 2 pops */
    wire [`LG_PRF_ENTRIES:0]  w_ffs_alu_even, w_ffs_alu_odd, w_ffs_mem_even, w_ffs_mem_odd;
    
    logic 		     t_uq_full, t_uq_next_full;
@@ -4285,22 +4280,6 @@ module core(clk,
      end // always_ff@ (posedge clk)
    
    
-   always_ff@(posedge clk)
-     begin
-	if(reset)
-	  begin
-	     for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
-	       begin
-		  r_prf_free[i] <= !((i == 0) || reset_mapped(i));
-		  r_retire_prf_free[i] <= !((i == 0) || reset_mapped(i));
-	       end
-	  end
-	else
-	  begin
-	     r_prf_free <= t_rat_copy ? r_retire_prf_free : n_prf_free;
-	     r_retire_prf_free <= n_retire_prf_free;
-	  end
-     end // always_ff@ (posedge clk)
 
 
    always_ff@(posedge clk)
@@ -4395,41 +4374,6 @@ module core(clk,
 	
      end // always_comb
 
-   /* clustered RF: i[LG_PRF_ENTRIES-1] selects the ALU(0)/MEM(1) bank, i[0] the
-    * parity.  Each quadrant searches only the N/4 registers it owns (a search of
-    * the whole N-bit vector with the other three quadrants masked to zero was
-    * ~11K LUTs at 256 entries). */
-   generate
-      for(genvar j = 0; j < N_PRF_ENTRIES/4; j=j+1)
-	begin : prf_pool_split
-	   assign w_alu_even[j] = r_prf_free[2*j];
-	   assign w_alu_odd[j]  = r_prf_free[2*j + 1];
-	   assign w_mem_even[j] = r_prf_free[N_PRF_ENTRIES/2 + 2*j];
-	   assign w_mem_odd[j]  = r_prf_free[N_PRF_ENTRIES/2 + 2*j + 1];
-	end
-   endgenerate
-
-   wire [`LG_PRF_ENTRIES-2:0] w_q_ae, w_q_ao, w_q_me, w_q_mo;   /* {empty, j} */
-   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_ae(.in(w_alu_even), .y(w_q_ae));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_ao(.in(w_alu_odd),  .y(w_q_ao));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_me(.in(w_mem_even), .y(w_q_me));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_mo(.in(w_mem_odd),  .y(w_q_mo));
-
-   assign w_alu_even_full = w_q_ae[`LG_PRF_ENTRIES-2];
-   assign w_alu_odd_full  = w_q_ao[`LG_PRF_ENTRIES-2];
-   assign w_mem_even_full = w_q_me[`LG_PRF_ENTRIES-2];
-   assign w_mem_odd_full  = w_q_mo[`LG_PRF_ENTRIES-2];
-
-   /* back to physical numbers, N (the MSB alone) when the quadrant is empty */
-   assign w_ffs_alu_even = w_alu_even_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
-			   {2'b00, w_q_ae[`LG_PRF_ENTRIES-3:0], 1'b0};
-   assign w_ffs_alu_odd  = w_alu_odd_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
-			   {2'b00, w_q_ao[`LG_PRF_ENTRIES-3:0], 1'b1};
-   assign w_ffs_mem_even = w_mem_even_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
-			   {2'b01, w_q_me[`LG_PRF_ENTRIES-3:0], 1'b0};
-   assign w_ffs_mem_odd  = w_mem_odd_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
-			   {2'b01, w_q_mo[`LG_PRF_ENTRIES-3:0], 1'b1};
-
    always_ff@(posedge clk)
      begin
 	r_bank_sel <= reset ? 1'b0 : ~r_bank_sel;
@@ -4443,41 +4387,33 @@ module core(clk,
 	  begin
 	     t_gpr_ffs      = r_bank_sel ? w_ffs_mem_even : w_ffs_mem_odd;
 	     t_gpr_ffs_full = r_bank_sel ? w_mem_even_full : w_mem_odd_full;
+	     t_gpr_pool     = {1'b1, ~r_bank_sel};
 	  end
 	else
 	  begin
 	     t_gpr_ffs      = r_bank_sel ? w_ffs_alu_even : w_ffs_alu_odd;
 	     t_gpr_ffs_full = r_bank_sel ? w_alu_even_full : w_alu_odd_full;
+	     t_gpr_pool     = {1'b0, ~r_bank_sel};
 	  end
 	/* ldd's rd+1 (the second allocator) is a load result too: the MEM bank */
 	if(t_uop2.is_mem | t_uop.dst2_valid)
 	  begin
 	     t_gpr_ffs2      = r_bank_sel ? w_ffs_mem_odd : w_ffs_mem_even;
 	     t_gpr_ffs2_full = r_bank_sel ? w_mem_odd_full : w_mem_even_full;
+	     t_gpr_pool2     = {1'b1, r_bank_sel};
 	  end
 	else
 	  begin
 	     t_gpr_ffs2      = r_bank_sel ? w_ffs_alu_odd : w_ffs_alu_even;
 	     t_gpr_ffs2_full = r_bank_sel ? w_alu_odd_full : w_alu_even_full;
+	     t_gpr_pool2     = {1'b0, r_bank_sel};
 	  end
      end
    
    always_comb
      begin
-	n_prf_free = r_prf_free;
 	n_prf_entry = t_gpr_ffs[`LG_PRF_ENTRIES-1:0];
 	n_prf_entry2 = t_gpr_ffs2[`LG_PRF_ENTRIES-1:0];
-	
-	/* port 0 is slot 1's rd or a WMISS_SEQ fill (no alloc in WMISS_SEQ) */
-	if((t_alloc & t_uop.dst_valid) | t_wm_fill)
-	  begin
-	     n_prf_free[t_wm_fill ? t_wm_preg : n_prf_entry] = 1'b0;
-	  end
-	if((t_alloc_two && t_uop2.dst_valid) || (t_alloc && t_uop.dst2_valid))
-	  begin
-	     n_prf_free[n_prf_entry2] = 1'b0;
-	  end
-	n_prf_free = n_prf_free | t_prf_retire_free;
      end // always_comb
 
    /* integer frees at retire (r9999's scheme): a GPR writer frees the register it
@@ -4491,52 +4427,108 @@ module core(clk,
    wire w_ret1_gpr = w_ret1 & (t_rob_next_head.ldst != 'd0);
    wire [`LG_PRF_ENTRIES-1:0] w_free0 = w_ret0_gpr ? t_rob_head.old_pdst : t_rob_head.pdst;
    wire [`LG_PRF_ENTRIES-1:0] w_free1 = w_ret1_gpr ? t_rob_next_head.old_pdst : t_rob_next_head.pdst;
-   /* two ports, as the retire RAT: port 0 is the head or a WMISS_SEQ spill/fill
+   /* two free ports, as the retire RAT: port 0 is the head or a WMISS_SEQ spill
     * (no retire in WMISS_SEQ), port 1 an ldd's rd+1 or the second retiree (an
-    * ldd retires alone).  Each port clears (takes) one register and sets
-    * (frees) one; port 1 after port 0, so a second retiree freeing the head's
-    * pdst (both write one rd) wins. */
+    * ldd retires alone).  Port 1 pushes after port 0. */
    wire w_fp0_set = w_ret0 | t_wm_spill;
    wire [`LG_PRF_ENTRIES-1:0] w_fp0_set_idx = t_wm_spill ? t_wm_preg : w_free0;
-   wire w_rp0_clr = w_ret0_gpr | t_wm_fill;
-   wire [`LG_PRF_ENTRIES-1:0] w_rp0_clr_idx = t_wm_fill ? t_wm_preg : t_rob_head.pdst;
-   wire w_rp0_set = w_ret0_gpr | t_wm_spill;
-   wire [`LG_PRF_ENTRIES-1:0] w_rp0_set_idx = t_wm_spill ? t_wm_preg : t_rob_head.old_pdst;
    wire w_fp1_set = w_ret0_dst2 | w_ret1;
    wire [`LG_PRF_ENTRIES-1:0] w_fp1_set_idx = w_ret0_dst2 ? t_rob_head.old_pdst2 : w_free1;
-   wire w_rp1 = w_ret0_dst2 | w_ret1_gpr;
-   wire [`LG_PRF_ENTRIES-1:0] w_rp1_clr_idx = w_ret0_dst2 ? t_rob_head.pdst2 : t_rob_next_head.pdst;
-   wire [`LG_PRF_ENTRIES-1:0] w_rp1_set_idx = w_ret0_dst2 ? t_rob_head.old_pdst2 : t_rob_next_head.old_pdst;
 
-   always_comb
+   /* the integer free list: four FIFOs of free physical register numbers
+    * (free_fifo.sv), one per PRF quadrant.  p[LG_PRF_ENTRIES-1] selects the
+    * ALU(0)/MEM(1) half, p[0] the parity; pool index {half, parity}.  Rename pops
+    * at most one register per pool per cycle (slot 2 takes the other parity);
+    * retire pushes the registers it frees and commits the ones it allocated;
+    * recovery (t_rat_copy, and all of WMISS_SEQ, which follows a flush) returns
+    * the in-flight allocations by moving each head back to its retire head. */
+   localparam N_POOL = N_PRF_ENTRIES/4;
+   localparam LG_N_POOL = `LG_PRF_ENTRIES-2;
+
+   function automatic logic [1:0] gpr_pool(input logic [`LG_PRF_ENTRIES-1:0] p);
+      begin
+	 gpr_pool = {p[`LG_PRF_ENTRIES-1], p[0]};
+      end
+   endfunction // gpr_pool
+
+   /* after reset each pool is filled two entries a cycle (N_POOL/2 cycles; the
+    * pools read empty until then, which stalls rename and a window fill).  Pool
+    * entry j is physical register {half, j, parity}; the ALU pools skip j < 4,
+    * p0..p7 (p0 is pinned, p1..p7 are the reset mappings of %g1..%g7). */
+   logic 		     r_fl_init;
+   logic [LG_N_POOL-2:0]     r_fl_idx;
+   always_ff@(posedge clk)
      begin
-	t_prf_retire_free = 'd0;
-	n_retire_prf_free = r_retire_prf_free;
-	if(w_fp0_set)
+	if(reset)
 	  begin
-	     t_prf_retire_free[w_fp0_set_idx] = 1'b1;
+	     r_fl_init <= 1'b1;
+	     r_fl_idx <= 'd0;
 	  end
-	if(w_fp1_set)
+	else if(r_fl_init)
 	  begin
-	     t_prf_retire_free[w_fp1_set_idx] = 1'b1;
+	     r_fl_idx <= r_fl_idx + 'd1;
+	     r_fl_init <= (r_fl_idx != {(LG_N_POOL-1){1'b1}});
 	  end
-	if(w_rp0_clr)
-	  begin
-	     n_retire_prf_free[w_rp0_clr_idx] = 1'b0;
-	  end
-	if(w_rp0_set)
-	  begin
-	     n_retire_prf_free[w_rp0_set_idx] = 1'b1;
-	  end
-	if(w_rp1)
-	  begin
-	     n_retire_prf_free[w_rp1_clr_idx] = 1'b0;
-	     n_retire_prf_free[w_rp1_set_idx] = 1'b1;
-	  end
-	/* p0: %g0 (and an absent window register's mapping), pinned */
-	t_prf_retire_free[0] = 1'b0;
-	n_retire_prf_free[0] = 1'b0;
-     end // always_comb
+     end // always_ff@ (posedge clk)
+
+   /* retire's frees, as two ports (port 0 first, see w_fp0_set) */
+   wire w_push0_ok = w_fp0_set & (w_fp0_set_idx != 'd0);   /* p0 is pinned */
+   wire w_push1_ok = w_fp1_set & (w_fp1_set_idx != 'd0);
+   wire w_pop1 = t_alloc & t_uop.dst_valid;
+   wire w_pop2 = (t_alloc_two & t_uop2.dst_valid) | (t_alloc & t_uop.dst2_valid);
+   wire w_fl_recover = t_rat_copy | (r_state == WMISS_SEQ);
+
+   logic [`LG_PRF_ENTRIES-1:0] w_fl_head[3:0];
+   logic 		       w_fl_empty[3:0];
+   logic [LG_N_POOL:0] 	       w_fl_count[3:0];
+
+   generate
+      for(genvar q = 0; q < 4; q = q + 1)
+	begin : int_fl
+	   localparam logic HALF = q[1];
+	   localparam logic PAR = q[0];
+	   localparam integer SKIP = HALF ? 0 : 4;
+	   wire [LG_N_POOL-1:0] w_k0 = {r_fl_idx, 1'b0};
+	   wire [LG_N_POOL-1:0] w_k1 = {r_fl_idx, 1'b1};
+	   wire [LG_N_POOL-1:0] w_j0 = w_k0 + LG_N_POOL'(SKIP);
+	   wire [LG_N_POOL-1:0] w_j1 = w_k1 + LG_N_POOL'(SKIP);
+	   wire w_init0 = r_fl_init & (32'(w_k0) < (N_POOL - SKIP));
+	   wire w_init1 = r_fl_init & (32'(w_k1) < (N_POOL - SKIP));
+	   wire w_c0 = w_push0_ok & (gpr_pool(w_fp0_set_idx) == q);
+	   wire w_c1 = w_push1_ok & (gpr_pool(w_fp1_set_idx) == q);
+	   wire w_pop = (w_pop1 & (t_gpr_pool == q)) | (w_pop2 & (t_gpr_pool2 == q)) |
+			(t_wm_fill & (gpr_pool(t_wm_preg) == q));
+	   wire [1:0] w_commit = {1'b0, w_ret0 & (gpr_pool(t_rob_head.pdst) == q)} +
+				 {1'b0, w_ret0_dst2 & (gpr_pool(t_rob_head.pdst2) == q)} +
+				 {1'b0, w_ret1 & (gpr_pool(t_rob_next_head.pdst) == q)} +
+				 {1'b0, t_wm_fill & (gpr_pool(t_wm_preg) == q)};
+	   free_fifo #(.LG_Q(LG_N_POOL), .W(`LG_PRF_ENTRIES))
+	   fl (.clk(clk),
+	       .reset(reset),
+	       .push0(r_fl_init ? w_init0 : w_c0),
+	       .push0_val(r_fl_init ? {HALF, w_j0, PAR} : w_fp0_set_idx),
+	       .push1(r_fl_init ? w_init1 : w_c1),
+	       .push1_val(r_fl_init ? {HALF, w_j1, PAR} : w_fp1_set_idx),
+	       .pop(w_pop),
+	       .commit(w_commit),
+	       .recover(w_fl_recover),
+	       .head_val(w_fl_head[q]),
+	       .empty(w_fl_empty[q]),
+	       .count(w_fl_count[q])
+	       );
+	end
+   endgenerate
+
+   assign w_alu_even_full = w_fl_empty[0] | r_fl_init;
+   assign w_alu_odd_full  = w_fl_empty[1] | r_fl_init;
+   assign w_mem_even_full = w_fl_empty[2] | r_fl_init;
+   assign w_mem_odd_full  = w_fl_empty[3] | r_fl_init;
+   assign w_ffs_alu_even = {1'b0, w_fl_head[0]};
+   assign w_ffs_alu_odd  = {1'b0, w_fl_head[1]};
+   assign w_ffs_mem_even = {1'b0, w_fl_head[2]};
+   assign w_ffs_mem_odd  = {1'b0, w_fl_head[3]};
+
+
 
    /* the icc versions: allocated at rename, the displaced one freed at retire */
    always_comb
@@ -4584,11 +4576,6 @@ module core(clk,
     * register handed out twice: mfc0 k1 and a younger li k0 both got P1) */
    always_ff@(negedge clk)
      begin
-	for(integer i = 1; i < N_PRF_ENTRIES; i = i + 1)
-	  begin
-	     if(!reset && t_prf_retire_free[i] && r_prf_free[i])
-	       $display("[DBLFREE] cyc=%0d p%0d freed while already free, retiring pc=%x", r_cycle, i, t_rob_head.pc);
-	  end
 	for(integer i = 0; i < N_ICC_PRF_ENTRIES; i = i + 1)
 	  begin
 	     if(!reset && t_retire && t_rob_head.valid_flags_dst && (t_rob_head.old_icc_pdst == i[`LG_ICC_PRF_ENTRIES-1:0]) && r_icc_prf_free[i])
@@ -4712,8 +4699,8 @@ module core(clk,
      begin
 	if(!reset && w_take_trap)
 	  begin
-	     $display("[FREE] cyc %0d trap tt %02x pc %x ds %b: retire free %0d alloc free %0d", r_cycle, w_trap_tt, t_rob_head.pc,
-		      t_rob_head.in_delay_slot, $countones(r_retire_prf_free), $countones(r_prf_free));
+	     $display("[FREE] cyc %0d trap tt %02x pc %x ds %b: free %0d", r_cycle, w_trap_tt, t_rob_head.pc,
+		      t_rob_head.in_delay_slot, 32'(w_fl_count[0]) + 32'(w_fl_count[1]) + 32'(w_fl_count[2]) + 32'(w_fl_count[3]));
 	  end
 	if(!reset && (r_state == WAIT_FOR_SERIALIZE_AND_RESTART) && (r_ser_dbg == 32'd5000))
 	  begin
@@ -4879,14 +4866,18 @@ module core(clk,
 		 end
 	       2'd2:
 		 begin
-		    t_wm_fill = 1'b1;
-		    t_wm_preg = !w_alu_even_full ? w_ffs_alu_even[`LG_PRF_ENTRIES-1:0] :
-				w_ffs_alu_odd[`LG_PRF_ENTRIES-1:0];
-		    n_wm_idx = r_wm_idx + 'd1;
-		    if(r_wm_idx == 'd15)
+		    /* waits for a free ALU-half register (the pools fill after reset) */
+		    if(!(w_alu_even_full && w_alu_odd_full))
 		      begin
-			 n_grp_res[r_wm_grp] = 1'b1;
-			 n_wm_phase = 2'd0;
+			 t_wm_fill = 1'b1;
+			 t_wm_preg = !w_alu_even_full ? w_ffs_alu_even[`LG_PRF_ENTRIES-1:0] :
+				     w_ffs_alu_odd[`LG_PRF_ENTRIES-1:0];
+			 n_wm_idx = r_wm_idx + 'd1;
+			 if(r_wm_idx == 'd15)
+			   begin
+			      n_grp_res[r_wm_grp] = 1'b1;
+			      n_wm_phase = 2'd0;
+			   end
 		      end
 		 end
 	       default:
@@ -4953,10 +4944,53 @@ module core(clk,
      begin
 	$display("[WMISS] window misses %0d, group spills %0d, group fills %0d", r_wm_dbg_miss, r_wm_dbg_spill, r_wm_dbg_fill);
      end
+   /* debug only: free-list ownership.  With the ROB empty and the core ACTIVE
+    * nothing is in flight, so every physical register but p0 is either free
+    * (in one pool between head and tail) or mapped in the retire RAT --
+    * exactly once.  A leak, a double free or a double allocation breaks it. */
+   logic [N_PRF_ENTRIES-1:0] t_dbg_rat_mapped, t_dbg_rat_dup;
+   always_comb
+     begin
+	t_dbg_rat_mapped = 'd0;
+	t_dbg_rat_dup = 'd0;
+	for(integer i = 0; i < N_INT_ARCH; i = i + 1)
+	  begin
+	     if(r_retire_rat[i] != 'd0)
+	       begin
+		  t_dbg_rat_dup[r_retire_rat[i]] = t_dbg_rat_dup[r_retire_rat[i]] | t_dbg_rat_mapped[r_retire_rat[i]];
+		  t_dbg_rat_mapped[r_retire_rat[i]] = 1'b1;
+	       end
+	  end
+     end // always_comb
+   wire [N_PRF_ENTRIES-1:0] w_dbg_q0 = int_fl[0].fl.w_dbg_free;
+   wire [N_PRF_ENTRIES-1:0] w_dbg_q1 = int_fl[1].fl.w_dbg_free;
+   wire [N_PRF_ENTRIES-1:0] w_dbg_q2 = int_fl[2].fl.w_dbg_free;
+   wire [N_PRF_ENTRIES-1:0] w_dbg_q3 = int_fl[3].fl.w_dbg_free;
+   wire [N_PRF_ENTRIES-1:0] w_dbg_free_any = w_dbg_q0 | w_dbg_q1 | w_dbg_q2 | w_dbg_q3;
    always_ff@(negedge clk)
      begin
-	if(!reset && t_wm_fill && w_alu_even_full && w_alu_odd_full)
-	  $display("[WMISS] cyc=%0d no free ALU-half register to fill group %0d", r_cycle, r_wm_grp);
+	if(!reset && !r_fl_init && t_rob_empty && (r_state == ACTIVE))
+	  begin
+	     for(integer i = 0; i < N_PRF_ENTRIES; i = i + 1)
+	       begin
+		  if((i != 0) && !w_dbg_free_any[i] && !t_dbg_rat_mapped[i])
+		    begin
+		       $display("[FREEOWN] cyc=%0d p%0d leaked: neither free nor mapped", r_cycle, i);
+		    end
+		  if(w_dbg_free_any[i] && t_dbg_rat_mapped[i])
+		    begin
+		       $display("[FREEOWN] cyc=%0d p%0d both free and mapped", r_cycle, i);
+		    end
+		  if(t_dbg_rat_dup[i])
+		    begin
+		       $display("[FREEOWN] cyc=%0d p%0d mapped twice in the retire RAT", r_cycle, i);
+		    end
+		  if((i == 0) && w_dbg_free_any[0])
+		    begin
+		       $display("[FREEOWN] cyc=%0d p0 is in a free pool", r_cycle);
+		    end
+	       end
+	  end
      end
 `endif
 
