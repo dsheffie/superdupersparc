@@ -850,6 +850,14 @@ module core(clk,
    /* indexed by the flat windowed arch index (decode_sparc.sv widx) */
    logic [`LG_PRF_ENTRIES-1:0] r_alloc_rat[`N_INT_ARCH_REGS-1:0];
    logic [`LG_PRF_ENTRIES-1:0] n_alloc_rat[`N_INT_ARCH_REGS-1:0];
+   /* two write ports on each integer RAT.  Alloc: port 1 is an ldd's rd+1 or
+    * slot 2's rd (an ldd allocates alone).  Retire: port 0 is the head's rd or
+    * a WMISS_SEQ spill/fill (no retire in WMISS_SEQ), port 1 is an ldd's rd+1
+    * or the second retiree's rd (an ldd retires alone). */
+   logic 		       t_rat_wr1;
+   logic 		       t_rrat_wr0, t_rrat_wr1;
+   logic [LG_N_INT_ARCH-1:0]   t_rrat_idx0, t_rrat_idx1;
+   logic [`LG_PRF_ENTRIES-1:0] t_rrat_val0, t_rrat_val1;
    logic [`LG_PRF_ENTRIES-1:0] r_retire_rat[`N_INT_ARCH_REGS-1:0];
    logic [`LG_PRF_ENTRIES-1:0] n_retire_rat[`N_INT_ARCH_REGS-1:0];
    /* the flags RAT: the physical register of the youngest icc writer (icc is
@@ -3230,6 +3238,7 @@ module core(clk,
    always_comb
      begin
 	n_alloc_rat = r_alloc_rat;
+	t_rat_wr1 = 1'b0;
 	n_icc_alloc_rat = r_icc_alloc_rat;
 	n_hilo_alloc_rat = r_hilo_alloc_rat;
 	n_fcr_alloc_rat = r_fcr_alloc_rat;
@@ -3342,7 +3351,7 @@ module core(clk,
 		  t_alloc_uop.dst = n_prf_entry;
 		  if(t_uop.dst2_valid)
 		    begin
-		       n_alloc_rat[arch_idx(t_uop.dst2)] = n_prf_entry2;
+		       t_rat_wr1 = 1'b1;
 		       t_alloc_uop.dst2 = n_prf_entry2;
 		    end
 	       end
@@ -3372,7 +3381,7 @@ module core(clk,
 	       begin
 		  if(t_uop2.dst != 'd0)
 		    begin
-		       n_alloc_rat[arch_idx(t_uop2.dst)] = n_prf_entry2;
+		       t_rat_wr1 = 1'b1;
 		    end
 		  if(t_uop2.flags_dst_valid)
 		    begin
@@ -3388,6 +3397,11 @@ module core(clk,
 	       end
 	     t_alloc_uop2.rob_ptr = r_rob_next_tail_ptr[`LG_ROB_ENTRIES-1:0];
 	  end
+	/* w_rat_op1 is the same select as the displaced-mapping read */
+	if(t_rat_wr1)
+	  begin
+	     n_alloc_rat[w_rat_op1] = n_prf_entry2;
+	  end
 	
      end // always_comb
 
@@ -3400,14 +3414,12 @@ module core(clk,
    always_comb
      begin
 	n_retire_rat = r_retire_rat;
-	if(t_wm_spill)
-	  begin
-	     n_retire_rat[w_wm_flat] = 'd0;   /* absent: maps nothing (p0 is pinned) */
-	  end
-	if(t_wm_fill)
-	  begin
-	     n_retire_rat[w_wm_flat] = t_wm_preg;
-	  end
+	t_rrat_wr0 = t_wm_spill | t_wm_fill;
+	t_rrat_idx0 = w_wm_flat;
+	t_rrat_val0 = t_wm_fill ? t_wm_preg : 'd0;   /* a spilled group maps nothing (p0 is pinned) */
+	t_rrat_wr1 = 1'b0;
+	t_rrat_idx1 = 'd0;
+	t_rrat_val1 = 'd0;
 	n_icc_retire_rat = r_icc_retire_rat;
 	n_hilo_retire_rat = r_hilo_retire_rat;
 	n_fcr_retire_rat = r_fcr_retire_rat;
@@ -3443,7 +3455,9 @@ module core(clk,
 	       begin
 		  if(t_rob_head.ldst != 'd0)
 		    begin
-		       n_retire_rat[arch_idx(t_rob_head.ldst)] = t_rob_head.pdst;
+		       t_rrat_wr0 = 1'b1;
+		       t_rrat_idx0 = arch_idx(t_rob_head.ldst);
+		       t_rrat_val0 = t_rob_head.pdst;
 		    end
 		  if(t_rob_head.valid_flags_dst)
 		    begin
@@ -3451,7 +3465,9 @@ module core(clk,
 		    end
 		  if(t_rob_head.valid_dst2)
 		    begin
-		       n_retire_rat[arch_idx(t_rob_head.ldst + 'd1)] = t_rob_head.pdst2;
+		       t_rrat_wr1 = 1'b1;
+		       t_rrat_idx1 = arch_idx(t_rob_head.ldst + 'd1);
+		       t_rrat_val1 = t_rob_head.pdst2;
 		    end
 	       end
 	     else if(t_rob_head.valid_fcr_dst)
@@ -3484,7 +3500,9 @@ module core(clk,
 	       begin
 		  if(t_rob_next_head.ldst != 'd0)
 		    begin
-		       n_retire_rat[arch_idx(t_rob_next_head.ldst)] = t_rob_next_head.pdst;
+		       t_rrat_wr1 = 1'b1;
+		       t_rrat_idx1 = arch_idx(t_rob_next_head.ldst);
+		       t_rrat_val1 = t_rob_next_head.pdst;
 		    end
 		  if(t_rob_next_head.valid_flags_dst)
 		    begin
@@ -3512,6 +3530,14 @@ module core(clk,
 	     n_branch_fault = t_rob_head.faulted;
 	     n_branch_bpu_idx = t_next_head_br ? t_rob_next_head.bpu_idx : t_rob_head.bpu_idx;
 	  end // if (t_retire)
+	if(t_rrat_wr0)
+	  begin
+	     n_retire_rat[t_rrat_idx0] = t_rrat_val0;
+	  end
+	if(t_rrat_wr1)
+	  begin
+	     n_retire_rat[t_rrat_idx1] = t_rrat_val1;
+	  end
 	
      end // always_comb
    
