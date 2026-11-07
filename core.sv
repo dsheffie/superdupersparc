@@ -434,7 +434,9 @@ module core(clk,
    function automatic logic [`LG_PRF_ENTRIES-1:0] reset_preg(input integer a);
       begin
 	 integer t;
-	 t = (a < N_INT_ARCH/2) ? a : (N_PRF_ENTRIES/2 + a - N_INT_ARCH/2);
+	 /* only the globals hold physical registers at reset: every window group
+	  * starts absent (exec.sv's backing RF holds it) and is filled on first use */
+	 t = (a < 8) ? a : 0;
 	 reset_preg = t[`LG_PRF_ENTRIES-1:0];
       end
    endfunction // reset_preg
@@ -442,10 +444,111 @@ module core(clk,
    /* is physical register p a reset mapping (other than the pinned p0)? */
    function automatic logic reset_mapped(input integer p);
       begin
-	 reset_mapped = ((p >= 1) && (p < N_INT_ARCH/2)) ||
-			((p >= N_PRF_ENTRIES/2) && (p < N_PRF_ENTRIES/2 + N_INT_ARCH - N_INT_ARCH/2));
+	 reset_mapped = (p >= 1) && (p < 8);
       end
    endfunction // reset_mapped
+
+   /* ---- window residency (machine.vh WIN_RESIDENT_GROUPS) ----
+    * group g = flat arch registers 8 + 16g .. 8 + 16g + 15 */
+   function automatic logic [7:0] wm_grp(input logic [`LG_PRF_ENTRIES-1:0] f);
+      logic [`LG_PRF_ENTRIES-1:0] t;
+      begin
+	 t = f - 'd8;
+	 wm_grp = (f < 'd8) ? 8'd0 : (8'd1 << t[6:4]);
+      end
+   endfunction // wm_grp
+   /* the groups an instruction's integer registers fall in */
+   function automatic logic [7:0] wm_need(input uop_t u);
+      logic [7:0] n;
+      begin
+	 n = 8'd0;
+	 if(u.srcA_valid)
+	   begin
+	      n = n | wm_grp(u.srcA);
+	   end
+	 if(u.srcB_valid)
+	   begin
+	      n = n | wm_grp(u.srcB);
+	   end
+	 if(u.srcC_valid && !u.flags_src_valid)
+	   begin
+	      n = n | wm_grp(u.srcC);
+	   end
+	 if(u.srcD_valid)
+	   begin
+	      n = n | wm_grp(u.srcD);
+	   end
+	 if(u.dst_valid)
+	   begin
+	      n = n | wm_grp(u.dst);
+	   end
+	 if(u.dst2_valid)
+	   begin
+	      n = n | wm_grp(u.dst2);
+	   end
+	 wm_need = n;
+      end
+   endfunction // wm_need
+   /* at the dq push: an instruction naming an absent group becomes a WMISS */
+   function automatic uop_t wm_xform(input uop_t u, input logic [7:0] res);
+      uop_t w;
+      logic [7:0] need;
+      begin
+	 need = wm_need(u);
+	 if((need & ~res) != 8'd0)
+	   begin
+	      w = '0;
+	      w.op = WMISS;
+	      w.pc = u.pc;
+	      w.imm = {7'd0, (u.op == TRAP_L1) | (u.op == TRAP_L2), need};
+	      wm_xform = w;
+	   end
+	 else
+	   begin
+	      wm_xform = u;
+	   end
+      end
+   endfunction // wm_xform
+   function automatic logic [3:0] wm_popcnt(input logic [7:0] m);
+      begin
+	 wm_popcnt = 4'(m[0]) + 4'(m[1]) + 4'(m[2]) + 4'(m[3]) +
+		     4'(m[4]) + 4'(m[5]) + 4'(m[6]) + 4'(m[7]);
+      end
+   endfunction // wm_popcnt
+   function automatic logic [2:0] wm_lowest(input logic [7:0] m);
+      logic [2:0] g;
+      begin
+	 g = 3'd0;
+	 for(integer i = 7; i >= 0; i = i - 1)
+	   begin
+	      if(m[i])
+		begin
+		   g = 3'(i);
+		end
+	   end
+	 wm_lowest = g;
+      end
+   endfunction // wm_lowest
+   /* the eviction victim: the candidate group farthest (circularly) from c */
+   function automatic logic [2:0] wm_victim(input logic [7:0] cand, input logic [2:0] c);
+      logic [2:0] g, d0, d1, d, best_d;
+      begin
+	 g = 3'd0;
+	 best_d = 3'd0;
+	 for(integer i = 0; i < 8; i = i + 1)
+	   begin
+	      d0 = 3'(i) - c;
+	      d1 = c - 3'(i);
+	      d = (d0 < d1) ? d0 : d1;
+	      if(cand[i] && (d >= best_d))
+		begin
+		   g = 3'(i);
+		   best_d = d;
+		end
+	   end
+	 wm_victim = g;
+      end
+   endfunction // wm_victim
    /* N_ROB_ENTRIES = pointer index space (masks/ports indexed by rob_ptr stay 2^LG);
     * ROB_ENTRIES = real capacity (storage arrays, pointer wrap) */
    localparam N_ROB_ENTRIES = (1<<`LG_ROB_ENTRIES);
@@ -569,6 +672,7 @@ module core(clk,
       crob_entry_t r;
       r.faulted = e.faulted;
       r.is_ii = e.is_ii;
+      r.is_wmiss = e.is_wmiss;
       r.is_fpe = e.is_fpe;
       r.fp_set_flags = e.fp_set_flags;
       r.overflow = e.overflow;
@@ -599,6 +703,7 @@ module core(clk,
        * so a restart from the CTI's own outcome is the only safe way on */
       r.faulted = c.faulted | m.dcti;
       r.is_ii = c.is_ii;
+      r.is_wmiss = c.is_wmiss;
       r.is_fpe = c.is_fpe;
       r.fp_set_flags = c.fp_set_flags;
       r.overflow = c.overflow;
@@ -922,7 +1027,9 @@ module core(clk,
    
    logic [`LG_PRF_ENTRIES:0] 	    t_gpr_ffs, t_gpr_ffs2;
    logic 			    t_gpr_ffs_full, t_gpr_ffs2_full;
-   wire [N_PRF_ENTRIES-1:0]  w_alu_even, w_alu_odd, w_mem_even, w_mem_odd;
+   /* each quadrant's free bits, compacted: entry j of a quadrant is physical
+    * register {half, j, parity} */
+   wire [N_PRF_ENTRIES/4-1:0] w_alu_even, w_alu_odd, w_mem_even, w_mem_odd;
    wire 		     w_alu_even_full, w_alu_odd_full, w_mem_even_full, w_mem_odd_full;
    wire [`LG_PRF_ENTRIES:0]  w_ffs_alu_even, w_ffs_alu_odd, w_ffs_mem_even, w_ffs_mem_odd;
    
@@ -968,7 +1075,8 @@ module core(clk,
 			     SERIALIZE_IN_FAULTED_DELAY_SLOT = 'd12,
 			     WAIT_FOR_SERIALIZE_IN_FAULTED_DELAY_SLOT = 'd13,
 			     CACHE_FLUSH = 'd14, // serializing CACHE op: nuke L1I/L1D/L2, then restart
-			     DEAD = 'd15
+			     DEAD = 'd15,
+			     WMISS_SEQ = 'd16   // a window miss: spill/fill groups (exec.sv backing RF), then restart
 			     } state_t;
    
    state_t r_state, n_state;
@@ -2189,11 +2297,13 @@ module core(clk,
 	
 	t_fold_uop = (t_uop.op == NOP |
 		      t_uop.op == IRQ |
-		      t_uop.op == II);
+		      t_uop.op == II |
+		      t_uop.op == WMISS);
 
 	t_fold_uop2 = (t_uop2.op == NOP |
 		      t_uop2.op == IRQ |
-		      t_uop2.op == II);
+		      t_uop2.op == II |
+		      t_uop2.op == WMISS);
 	
 	n_ds_done = r_ds_done;
 	n_flush_req_l1d = 1'b0;
@@ -2268,6 +2378,7 @@ module core(clk,
 
 	t_arch_fault = t_rob_head.faulted & 
 		       (t_rob_head.is_ii |
+			t_rob_head.is_wmiss |
 			t_rob_head.is_fpe |
 			t_rob_head.is_bad_addr |
 			t_rob_head.mmu.fault |
@@ -2585,6 +2696,15 @@ module core(clk,
 	       //memq_empty, r_rob_inflight);
 	       if(((r_rob_inflight & ~r_rob_is_mem) == 'd0) && !w_next_color_busy && t_divide_ready && w_drain_min_ok)
 		 begin
+		    /* drained: a window miss now moves registers (no ALU result can
+		     * still land on the PRF's ALU port, which the fills use) */
+		    n_state = r_wm_active ? WMISS_SEQ : RAT;
+		 end
+	    end
+	  WMISS_SEQ:
+	    begin
+	       if(t_wm_done)
+		 begin
 		    n_state = RAT;
 		 end
 	    end
@@ -2797,7 +2917,9 @@ module core(clk,
 		* TRAP_L1/L2 write %l1/%l2).  ET=0: error mode, which halts. */
 	       n_epc = t_rob_head.pc;
 	       t_bump_rob_head = 1'b1;
-	       if(r_psr_et | w_nf_skip)
+	       /* a window miss (WMISS) is no trap, whatever ET: WRITE_EPC restarts at
+		* it once WMISS_SEQ has made its groups resident */
+	       if(r_psr_et | w_nf_skip | t_rob_head.is_wmiss)
 		 begin
 		    n_state = WRITE_EPC;
 		 end
@@ -2817,14 +2939,23 @@ module core(clk,
 	       
 	       n_machine_clr = 1'b1;
 	       
-	       /* a trap: TBR, tt just written; an NF skip: the skipped instruction's npc */
-	       n_restart_pc = r_nf_inj ? r_trap_npc : {r_tbr_tba, r_tbr_tt, 4'd0};
+	       /* a trap: TBR, tt just written; an NF skip: the skipped instruction's npc;
+		* a window miss: the instruction itself (a missed TRAP_L1/L2: the trap
+		* vector again, the pair re-injected) */
+	       n_restart_pc = (r_wm_active & !r_wm_trap) ? r_wm_pc :
+			      r_nf_inj ? r_trap_npc : {r_tbr_tba, r_tbr_tt, 4'd0};
 	       n_restart_src_pc = 'd0;
 	       n_restart_why = RST_WHY_EXCEPTION;
 	       n_restart_head_ptr = r_rob_head_ptr[`LG_ROB_ENTRIES-1:0];
 	       n_restart_src_is_indirect = 1'b0;
 	       n_restart_valid = 1'b1;
 	       n_restart_npc_valid = 1'b0;
+	       if(r_wm_active & !r_wm_trap & r_wm_ds)
+		 begin
+		    /* a missed delay-slot instruction: then its branch's target */
+		    n_restart_npc = r_wm_npc;
+		    n_restart_npc_valid = 1'b1;
+		 end
 
 	       n_got_break = 1'b0;
 	       n_got_ud = 1'b0;
@@ -3243,6 +3374,14 @@ module core(clk,
    always_comb
      begin
 	n_retire_rat = r_retire_rat;
+	if(t_wm_spill)
+	  begin
+	     n_retire_rat[w_wm_flat] = 'd0;   /* absent: maps nothing (p0 is pinned) */
+	  end
+	if(t_wm_fill)
+	  begin
+	     n_retire_rat[w_wm_flat] = t_wm_preg;
+	  end
 	n_flags_retire_rat = r_flags_retire_rat;
 	n_hilo_retire_rat = r_hilo_retire_rat;
 	n_fcr_retire_rat = r_fcr_retire_rat;
@@ -3385,6 +3524,7 @@ module core(clk,
 	t_rob_tail.is_indirect = (t_alloc_uop.op == S_JMPL);
 	
 	t_rob_tail.is_ii = 1'b0;
+	t_rob_tail.is_wmiss = 1'b0;
 	t_rob_tail.is_fpe = 1'b0;
 	t_rob_tail.fp_set_flags = 1'b0;
 	t_rob_tail.overflow = 1'b0;
@@ -3441,6 +3581,7 @@ module core(clk,
 	t_rob_next_tail.trap = 1'b0;
 	
 	t_rob_next_tail.is_ii = 1'b0;
+	t_rob_next_tail.is_wmiss = 1'b0;
 	t_rob_next_tail.is_bad_addr = 1'b0;
 	t_rob_next_tail.mmu = '0;
 	t_rob_next_tail.is_bus_err = 1'b0;
@@ -3527,6 +3668,12 @@ module core(clk,
 		    begin
 		       t_rob_tail.faulted = 1'b1;
 		    end
+		  else if(t_uop.op == WMISS)
+		    begin
+		       t_rob_tail.faulted = 1'b1;
+		       t_rob_tail.is_wmiss = 1'b1;
+		       t_rob_tail.data = `MEM_WIDTH'(t_uop.imm[8:0]);   /* {re-inject trap, needed groups} */
+		    end
 	       end
 	     
 	  end // if (t_alloc)
@@ -3583,6 +3730,12 @@ module core(clk,
 		  else if(t_uop2.op == IRQ)
 		    begin
 		       t_rob_next_tail.faulted = 1'b1;
+		    end
+		  else if(t_uop2.op == WMISS)
+		    begin
+		       t_rob_next_tail.faulted = 1'b1;
+		       t_rob_next_tail.is_wmiss = 1'b1;
+		       t_rob_next_tail.data = `MEM_WIDTH'(t_uop2.imm[8:0]);
 		    end
 	       end // if (t_fold_uop2)
 	  end // if (t_alloc_two)
@@ -4180,26 +4333,40 @@ module core(clk,
 	
      end // always_comb
 
+   /* clustered RF: i[LG_PRF_ENTRIES-1] selects the ALU(0)/MEM(1) bank, i[0] the
+    * parity.  Each quadrant searches only the N/4 registers it owns (a search of
+    * the whole N-bit vector with the other three quadrants masked to zero was
+    * ~11K LUTs at 256 entries). */
    generate
-      for(genvar i = 0; i < N_PRF_ENTRIES; i=i+1)
+      for(genvar j = 0; j < N_PRF_ENTRIES/4; j=j+1)
 	begin : prf_pool_split
-	   /* clustered RF: i[LG_PRF_ENTRIES-1] selects ALU(0)/MEM(1) bank, i[0]=parity */
-	   assign w_alu_even[i] = ((i <  N_PRF_ENTRIES/2) && (i % 2 == 0)) ? r_prf_free[i] : 1'b0;
-	   assign w_alu_odd[i]  = ((i <  N_PRF_ENTRIES/2) && (i % 2 == 1)) ? r_prf_free[i] : 1'b0;
-	   assign w_mem_even[i] = ((i >= N_PRF_ENTRIES/2) && (i % 2 == 0)) ? r_prf_free[i] : 1'b0;
-	   assign w_mem_odd[i]  = ((i >= N_PRF_ENTRIES/2) && (i % 2 == 1)) ? r_prf_free[i] : 1'b0;
+	   assign w_alu_even[j] = r_prf_free[2*j];
+	   assign w_alu_odd[j]  = r_prf_free[2*j + 1];
+	   assign w_mem_even[j] = r_prf_free[N_PRF_ENTRIES/2 + 2*j];
+	   assign w_mem_odd[j]  = r_prf_free[N_PRF_ENTRIES/2 + 2*j + 1];
 	end
    endgenerate
 
-   assign w_alu_even_full = (|w_alu_even) == 1'b0;
-   assign w_alu_odd_full  = (|w_alu_odd)  == 1'b0;
-   assign w_mem_even_full = (|w_mem_even) == 1'b0;
-   assign w_mem_odd_full  = (|w_mem_odd)  == 1'b0;
+   wire [`LG_PRF_ENTRIES-2:0] w_q_ae, w_q_ao, w_q_me, w_q_mo;   /* {empty, j} */
+   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_ae(.in(w_alu_even), .y(w_q_ae));
+   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_ao(.in(w_alu_odd),  .y(w_q_ao));
+   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_me(.in(w_mem_even), .y(w_q_me));
+   find_lowest_set_bit#(`LG_PRF_ENTRIES-2) ffs_mo(.in(w_mem_odd),  .y(w_q_mo));
 
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_ae(.in(w_alu_even), .y(w_ffs_alu_even));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_ao(.in(w_alu_odd),  .y(w_ffs_alu_odd));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_me(.in(w_mem_even), .y(w_ffs_mem_even));
-   find_lowest_set_bit#(`LG_PRF_ENTRIES) ffs_mo(.in(w_mem_odd),  .y(w_ffs_mem_odd));
+   assign w_alu_even_full = w_q_ae[`LG_PRF_ENTRIES-2];
+   assign w_alu_odd_full  = w_q_ao[`LG_PRF_ENTRIES-2];
+   assign w_mem_even_full = w_q_me[`LG_PRF_ENTRIES-2];
+   assign w_mem_odd_full  = w_q_mo[`LG_PRF_ENTRIES-2];
+
+   /* back to physical numbers, N (the MSB alone) when the quadrant is empty */
+   assign w_ffs_alu_even = w_alu_even_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
+			   {2'b00, w_q_ae[`LG_PRF_ENTRIES-3:0], 1'b0};
+   assign w_ffs_alu_odd  = w_alu_odd_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
+			   {2'b00, w_q_ao[`LG_PRF_ENTRIES-3:0], 1'b1};
+   assign w_ffs_mem_even = w_mem_even_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
+			   {2'b01, w_q_me[`LG_PRF_ENTRIES-3:0], 1'b0};
+   assign w_ffs_mem_odd  = w_mem_odd_full ? (`LG_PRF_ENTRIES+1)'(N_PRF_ENTRIES) :
+			   {2'b01, w_q_mo[`LG_PRF_ENTRIES-3:0], 1'b1};
 
    always_ff@(posedge clk)
      begin
@@ -4248,6 +4415,10 @@ module core(clk,
 	     n_prf_free[n_prf_entry2] = 1'b0;
 	  end
 	n_prf_free = n_prf_free | t_prf_ref_free;
+	if(t_wm_fill)
+	  begin
+	     n_prf_free[t_wm_preg] = 1'b0;
+	  end
      end // always_comb
 
    /* the committed reference counts.  A retiring writer adds one reference to
@@ -4273,6 +4444,14 @@ module core(clk,
 	  begin
 	     t_ref_inc[i] = 'd0;
 	     t_ref_dec[i] = 'd0;
+	     if(t_wm_spill && (t_wm_preg == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_dec[i] = t_ref_dec[i] + 'd1;
+	       end
+	     if(t_wm_fill && (t_wm_preg == i[`LG_PRF_ENTRIES-1:0]))
+	       begin
+		  t_ref_inc[i] = t_ref_inc[i] + 'd1;
+	       end
 	     if(w_ret0 && (t_rob_head.pdst == i[`LG_PRF_ENTRIES-1:0]))
 	       begin
 		  t_ref_inc[i] = t_ref_inc[i] + {{(`LG_PRF_REFCNT+1){1'b0}}, w_ret0_gpr} +
@@ -4512,7 +4691,7 @@ module core(clk,
     * was never made, a load's rd keeps its value -- and execution goes on at its
     * npc (interpret.cc: "the access is dropped") */
    wire w_nf_skip = (r_state == ARCH_FAULT) & t_rob_head.mmu.fault & mmu_ctrl_nf;
-   wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et & !w_nf_skip;
+   wire w_take_trap = (r_state == ARCH_FAULT) & r_psr_et & !w_nf_skip & !t_rob_head.is_wmiss;
    /* an fp_exception's ftt: an FPop the FPU punted (a denormal operand or a tiny
     * result: unfinished_FPop) or one with an enabled IEEE exception (exec.sv
     * w_fp_fault), or an unimplemented FPop (decode: II with tt 8) */
@@ -4562,6 +4741,152 @@ module core(clk,
 	     r_trap_npc <= w_trap_npc;
 	  end
      end
+
+
+   /* ---- window-miss sequencer (WMISS_SEQ) ----
+    * With the machine drained (only committed state left: alloc RAT == retire
+    * RAT once RAT copies it), make the missing instruction's groups resident:
+    * while more than WIN_RESIDENT_GROUPS would be, spill the resident group
+    * farthest from it (16 cycles: PRF -> backing RF through exec's store-data
+    * read port, release each register); then fill each missing group (16
+    * cycles: backing RF -> a fresh ALU-half register through the ALU write
+    * port).  Then RAT, and the restart at the instruction. */
+   logic [7:0] 		r_grp_res, n_grp_res;   /* resident window groups */
+   logic 		r_wm_active;            /* a window miss, ARCH_FAULT .. WMISS_SEQ */
+   logic [7:0] 		r_wm_need;
+   logic 		r_wm_trap, r_wm_ds;
+   logic [`M_WIDTH-1:0] r_wm_pc, r_wm_npc;
+   logic [1:0] 		r_wm_phase, n_wm_phase;   /* 0 decide, 1 spill, 2 fill, 3 settle */
+   logic [2:0] 		r_wm_grp, n_wm_grp;
+   logic [4:0] 		r_wm_idx, n_wm_idx;
+   logic 		t_wm_spill, t_wm_fill, t_wm_done;
+   logic [`LG_PRF_ENTRIES-1:0] t_wm_preg;
+   wire [LG_N_INT_ARCH-1:0] w_wm_flat = LG_N_INT_ARCH'(8) + LG_N_INT_ARCH'({r_wm_grp, r_wm_idx[3:0]});
+   wire w_wm_start = (r_state == ARCH_FAULT) & t_rob_head.is_wmiss;
+
+   always_comb
+     begin
+	n_grp_res = r_grp_res;
+	n_wm_phase = r_wm_phase;
+	n_wm_grp = r_wm_grp;
+	n_wm_idx = r_wm_idx;
+	t_wm_spill = 1'b0;
+	t_wm_fill = 1'b0;
+	t_wm_done = 1'b0;
+	t_wm_preg = r_retire_rat[w_wm_flat];
+	if(r_state == WMISS_SEQ)
+	  begin
+	     case(r_wm_phase)
+	       2'd0:
+		 begin
+		    n_wm_idx = 'd0;
+		    if(wm_popcnt(r_grp_res | r_wm_need) > 4'(`WIN_RESIDENT_GROUPS))
+		      begin
+			 n_wm_grp = wm_victim(r_grp_res & ~r_wm_need, wm_lowest(r_wm_need));
+			 n_wm_phase = 2'd1;
+		      end
+		    else if((r_wm_need & ~r_grp_res) != 8'd0)
+		      begin
+			 n_wm_grp = wm_lowest(r_wm_need & ~r_grp_res);
+			 n_wm_phase = 2'd2;
+		      end
+		    else
+		      begin
+			 n_wm_phase = 2'd3;
+		      end
+		 end
+	       2'd1:
+		 begin
+		    t_wm_spill = 1'b1;
+		    n_wm_idx = r_wm_idx + 'd1;
+		    if(r_wm_idx == 'd15)
+		      begin
+			 n_grp_res[r_wm_grp] = 1'b0;
+			 n_wm_phase = 2'd0;
+		      end
+		 end
+	       2'd2:
+		 begin
+		    t_wm_fill = 1'b1;
+		    t_wm_preg = !w_alu_even_full ? w_ffs_alu_even[`LG_PRF_ENTRIES-1:0] :
+				w_ffs_alu_odd[`LG_PRF_ENTRIES-1:0];
+		    n_wm_idx = r_wm_idx + 'd1;
+		    if(r_wm_idx == 'd15)
+		      begin
+			 n_grp_res[r_wm_grp] = 1'b1;
+			 n_wm_phase = 2'd0;
+		      end
+		 end
+	       default:
+		 begin
+		    /* two cycles for exec's last backing-RF read and PRF write */
+		    n_wm_idx = r_wm_idx + 'd1;
+		    if(r_wm_idx == 'd2)
+		      begin
+			 t_wm_done = 1'b1;
+			 n_wm_phase = 2'd0;
+			 n_wm_idx = 'd0;
+		      end
+		 end
+	     endcase // case (r_wm_phase)
+	  end
+     end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_grp_res <= 8'd0;
+	     r_wm_active <= 1'b0;
+	     r_wm_phase <= 2'd0;
+	     r_wm_grp <= 3'd0;
+	     r_wm_idx <= 5'd0;
+	  end
+	else
+	  begin
+	     r_grp_res <= n_grp_res;
+	     r_wm_active <= w_wm_start ? 1'b1 : (t_wm_done ? 1'b0 : r_wm_active);
+	     r_wm_phase <= n_wm_phase;
+	     r_wm_grp <= n_wm_grp;
+	     r_wm_idx <= n_wm_idx;
+	  end
+	if(w_wm_start)
+	  begin
+	     r_wm_need <= t_rob_head.data[7:0];
+	     r_wm_trap <= t_rob_head.data[8];
+	     r_wm_pc <= t_rob_head.pc;
+	     r_wm_npc <= w_trap_npc;
+	     r_wm_ds <= t_rob_head.in_delay_slot;
+	  end
+     end // always_ff@ (posedge clk)
+`ifdef VERILATOR
+   /* window-miss statistics */
+   logic [63:0] r_wm_dbg_miss, r_wm_dbg_spill, r_wm_dbg_fill;
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_wm_dbg_miss <= 'd0;
+	     r_wm_dbg_spill <= 'd0;
+	     r_wm_dbg_fill <= 'd0;
+	  end
+	else
+	  begin
+	     r_wm_dbg_miss <= r_wm_dbg_miss + {63'd0, w_wm_start};
+	     r_wm_dbg_spill <= r_wm_dbg_spill + {63'd0, t_wm_spill && (r_wm_idx == 'd15)};
+	     r_wm_dbg_fill <= r_wm_dbg_fill + {63'd0, t_wm_fill && (r_wm_idx == 'd15)};
+	  end
+     end
+   final
+     begin
+	$display("[WMISS] window misses %0d, group spills %0d, group fills %0d", r_wm_dbg_miss, r_wm_dbg_spill, r_wm_dbg_fill);
+     end
+   always_ff@(negedge clk)
+     begin
+	if(!reset && t_wm_fill && w_alu_even_full && w_alu_odd_full)
+	  $display("[WMISS] cyc=%0d no free ALU-half register to fill group %0d", r_cycle, r_wm_grp);
+     end
+`endif
 
    /* flat arch index of r in window w (decode_sparc.sv widx) */
    function automatic logic [`LG_PRF_ENTRIES-1:0] arch_widx(input logic [`LG_NWINDOWS-1:0] w, input logic [4:0] r);
@@ -4676,6 +5001,11 @@ module core(clk,
 	  begin
 	     n_trap_inj = 1'b1;
 	     n_nf_inj = 1'b1;
+	  end
+	if((r_state == ARCH_FAULT) & t_rob_head.is_wmiss & t_rob_head.data[8])
+	  begin
+	     /* a missed TRAP_L1/L2: inject the pair again after the restart */
+	     n_trap_inj = 1'b1;
 	  end
 	if(w_take_trap)
 	  begin
@@ -4815,6 +5145,10 @@ module core(clk,
    wire [`LG_ROB_ENTRIES-1:0] w_ldd_lo_rob;
    wire w_lsu_st_pending;
    exec e (
+	   .win_spill_valid(t_wm_spill),
+	   .win_fill_valid(t_wm_fill),
+	   .win_preg(t_wm_preg),
+	   .win_bidx({r_wm_grp, r_wm_idx[3:0]}),
 	   .ldd_lo_done(w_ldd_lo_done),
 	   .ldd_lo_rob(w_ldd_lo_rob),
 	   .sparc_psr({8'h41, 4'd0, 6'd0, 1'b0, r_psr_ef, r_psr_pil, r_psr_s, r_psr_ps, r_psr_et, 5'd0}),
@@ -5018,6 +5352,12 @@ module core(clk,
 		  n_dq_cnt = n_dq_cnt + 'd2;
 	       end
 	     
+	     /* window residency: an instruction that names a register of an absent
+	      * group is queued as a WMISS (the residency only changes in WMISS_SEQ,
+	      * which empties the queue) */
+	     t_dq_push_uop = wm_xform(t_dq_push_uop, r_grp_res);
+	     t_dq_push_uop2 = wm_xform(t_dq_push_uop2, r_grp_res);
+
 	     if(t_alloc && !t_alloc_two)
 	       begin
 		  n_dq_head_ptr = r_dq_head_ptr + 'd1;

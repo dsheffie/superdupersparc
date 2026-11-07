@@ -7,6 +7,7 @@
 typedef struct packed {
    logic       faulted;
    logic       is_ii;
+   logic       is_wmiss;   /* a WMISS (core.sv): a window miss, not a trap */
    logic       is_fpe;   /* FP exception (FPE, cause 15): denorm/enabled IEEE flag */
    logic       fp_set_flags; /* completed on FP port 2 (arith/cmp/cvt): update FCSR Cause/Flags at retire */
    logic       overflow;
@@ -137,6 +138,7 @@ typedef struct packed {
 typedef struct packed {
    logic faulted;
    logic is_ii;
+   logic is_wmiss;   /* a WMISS (core.sv): a window miss, not a trap */
    logic is_fpe;
    logic fp_set_flags;
    logic overflow;

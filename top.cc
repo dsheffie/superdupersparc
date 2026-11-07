@@ -45,7 +45,13 @@ static state_t *g_ckpt_state = nullptr;
 extern "C" {
   int       have_checkpoint(void)               { return g_ckpt_state != nullptr; }
   int       have_ckpt_t(void)                   { return 0; }
-  long long loadgpr(int regid)                  { (void)regid; return 0; }
+  /* exec.sv's backing RF of the window registers: flat arch register regid */
+  long long loadgpr(int regid) {
+    if(g_ckpt_state == nullptr or regid < 0 or regid >= N_ARCH_REGS) {
+      return 0;
+    }
+    return static_cast<long long>(g_ckpt_state->r[regid]);
+  }
   /* fp_regfile's reset identity map holds the SPARC pairs at the even arch
    * entries (decode_sparc.sv fidx): f[2k] the high word, f[2k+1] the low */
   long long loadfpr(int regid) {
@@ -54,21 +60,15 @@ extern "C" {
     }
     return static_cast<long long>((static_cast<uint64_t>(g_ckpt_state->f[regid]) << 32) | g_ckpt_state->f[regid + 1]);
   }
-  /* physical register preg of a depth-entry banked PRF under core.sv's
-   * reset_preg map: arch a < N/2 -> a, else depth/2 + a - N/2 */
+  /* physical register preg under core.sv's reset_preg map: only the globals
+   * (arch 1..7 -> p1..p7) are mapped; the window registers start in the
+   * backing RF (loadgpr) */
   long long loadprf(int preg, int depth) {
-    if(g_ckpt_state == nullptr) {
+    (void)depth;
+    if(g_ckpt_state == nullptr or preg < 1 or preg >= 8) {
       return 0;
     }
-    const int half = depth / 2, n2 = N_ARCH_REGS / 2;
-    int a = -1;
-    if(preg < half) {
-      a = (preg < n2) ? preg : -1;
-    }
-    else if(preg - half < N_ARCH_REGS - n2) {
-      a = preg - half + n2;
-    }
-    return (a > 0) ? static_cast<long long>(g_ckpt_state->r[a]) : 0;
+    return static_cast<long long>(g_ckpt_state->r[preg]);
   }
   int ckpt_sreg(int id) {
     if(g_ckpt_state == nullptr) {
@@ -1125,7 +1125,9 @@ int main(int argc, char **argv) {
   tb->mem_rsp_bad = 0;
   /* a checkpoint resume seeds the register file one entry per bank per reset
    * cycle (rf4r2w.sv): hold reset past its depth */
-  const uint64_t reset_cycles = g_ckpt_state ? 2 * (1u << 10) : 4;
+  /* >= 128 cycles: exec.sv seeds its backing RF of the window registers one
+   * entry per reset cycle (and rf4r2w a checkpoint's PRF, HALF per bank) */
+  const uint64_t reset_cycles = g_ckpt_state ? 2 * (1u << 10) : 256;
   for(globals::cycle = 0; (globals::cycle < reset_cycles) && !Verilated::gotFinish(); ++globals::cycle) {
     contextp->timeInc(1);
     tb->mem_rsp_valid = 0;

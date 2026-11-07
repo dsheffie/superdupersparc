@@ -161,7 +161,7 @@
  * into the ALU bank until it was full: no ALU op could allocate, with half the
  * MEM bank free (the OpenBIOS console loop hung after a few hundred window
  * traps).  512x32 is twice r9999's 128x64 bit count. */
-`define LG_PRF_ENTRIES 9
+`define LG_PRF_ENTRIES 8
 
 /* FP physical registers: their own size, not the integer PRF's.  SPARC
  * renames the 16 64-bit FP pairs (only the even arch indices, decode_sparc.sv
@@ -171,6 +171,17 @@
  * 16 + ROB_ENTRIES.  Sizing it at the integer PRF's 512 cost ~20K LUTs (the
  * register file and its two 512-wide free-list searches). */
 `define LG_FP_PRF_ENTRIES 6
+
+/* Register windows resident in the integer PRF.  A window group is 16 flat arch
+ * registers (window g's outs and locals = window g-1's ins); window w reads
+ * groups w and w+1, a save three.  At most WIN_RESIDENT_GROUPS groups (plus the
+ * globals) hold physical registers; the rest live in exec.sv's 1R/1W backing
+ * RF.  An instruction that names an absent group becomes a WMISS (core.sv dq
+ * push), taken at the ROB head like a fault: spill the farthest resident group,
+ * fill the missing ones, restart at it.  8 = every group may be resident
+ * (misses only on first use).  Each PRF half must hold 16 * groups + 16 arch
+ * registers plus the in-flight destinations. */
+`define WIN_RESIDENT_GROUPS 5
 
 /* SPARC register windows (power of two: the flat arch index wraps mod 16*NWINDOWS) */
 `define LG_NWINDOWS 3

@@ -17,6 +17,10 @@ import "DPI-C" function void report_exec(input int int_valid,
 `endif
 
 module exec(clk, 
+	    win_spill_valid,
+	    win_fill_valid,
+	    win_preg,
+	    win_bidx,
 	    ldd_lo_done,
 	    ldd_lo_rob,
 	    sparc_psr,
@@ -183,6 +187,13 @@ module exec(clk,
     * a block parks it with a code; a wakeup makes it issuable again */
    input logic 			     mem_rsp_valid;
    input logic 			     mem_rsp_lsu_hold;
+   /* core.sv WMISS_SEQ: move one register of a window group between the PRF and
+    * the backing RF (spill: PRF[win_preg] -> backing[win_bidx]; fill: the
+    * reverse).  Only while the machine is drained. */
+   input logic 			     win_spill_valid;
+   input logic 			     win_fill_valid;
+   input logic [`LG_PRF_ENTRIES-1:0] win_preg;
+   input logic [6:0] 		     win_bidx;
    input logic [`LG_MEM_SCHED_ENTRIES-1:0] mem_rsp_lsu_idx;
    input logic 			     mem_blk_valid;
    input 			     blk_code_t mem_blk_code;
@@ -1661,6 +1672,10 @@ module exec(clk,
 	if(t_iwb)
 	  begin
 	     n_prf_inflight[t_iwb_dst] = 1'b0;
+	  end
+	if(r_wfl_valid)
+	  begin
+	     n_prf_inflight[r_wfl_preg] = 1'b0;   /* a window fill */
 	  end
      end // always_comb
 
@@ -3486,6 +3501,11 @@ module exec(clk,
 	       begin
 		  r_prf_zero[mem_rsp_dst_ptr] <= (w_mem_rsp_int_data == 'd0);
 	       end
+	     /* a window fill (core.sv WMISS_SEQ) writes the PRF too */
+	     if(r_wfl_valid)
+	       begin
+		  r_prf_zero[r_wfl_preg] <= (r_wfl_data == 'd0);
+	       end
 	  end
      end // always_ff@ (posedge clk)
 `endif
@@ -3513,23 +3533,66 @@ module exec(clk,
 	  end
      end // always_ff@ (posedge clk)
 
+   /* backing RF of the non-resident window groups (core.sv WMISS_SEQ): flat arch
+    * register 8 + i at entry i.  1R/1W.  A spill reads the PRF through the
+    * store-data port (rdptr3, idle while drained) and writes the next cycle; a
+    * fill reads here and writes the PRF through the ALU port the next cycle. */
+   logic [`M_WIDTH-1:0] r_wbk[127:0];
+   logic 		r_wsp_valid, r_wfl_valid;
+   logic [6:0] 		r_wsp_bidx;
+   logic [`LG_PRF_ENTRIES-1:0] r_wfl_preg;
+   logic [`M_WIDTH-1:0] r_wfl_data;
+`ifdef VERILATOR
+   import "DPI-C" function longint loadgpr(input int regid);
+   logic [6:0] 		r_wbk_seed;
+`endif
+   always_ff@(posedge clk)
+     begin
+	r_wsp_valid <= reset ? 1'b0 : win_spill_valid;
+	r_wfl_valid <= reset ? 1'b0 : win_fill_valid;
+	r_wsp_bidx <= win_bidx;
+	r_wfl_preg <= win_preg;
+	r_wfl_data <= r_wbk[win_bidx];
+`ifdef VERILATOR
+	/* at reset: the checkpoint's window registers (or 0), one per cycle (the
+	 * harness holds reset for at least 128 cycles) */
+	r_wbk_seed <= reset ? (r_wbk_seed + 7'd1) : 7'd0;
+	if(reset)
+	  begin
+	     r_wbk[r_wbk_seed] <= `M_WIDTH'(loadgpr(32'd8 + 32'(r_wbk_seed)));
+	  end
+	else
+`endif
+	if(r_wsp_valid)
+	  begin
+	     r_wbk[r_wsp_bidx] <= w_mem_srcB;
+	  end
+     end
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset && r_wfl_valid && t_iwb)
+	  $display("[WMISS] window fill and an ALU writeback share the PRF's ALU port");
+     end
+`endif
+
    rf4r2w #(.WIDTH(`M_WIDTH), .LG_DEPTH(`LG_PRF_ENTRIES))
    intprf (.clk(clk),
 	   .reset(reset),
 	   .rdptr0(t_picked_uop.srcA),
 	   .rdptr1(t_picked_uop.srcB),
 	   .rdptr2(t_picked_mem_uop.srcA),
-	   .rdptr3(t_sd_src),
+	   .rdptr3(win_spill_valid ? win_preg : t_sd_src),
 `ifdef ENABLE_INT_SRCC
 	   .rdptr4(t_picked_mem_uop.srcC),
 `else
 	   .rdptr4('d0),
 `endif
-	   .wrptr0(t_iwb_dst),
+	   .wrptr0(r_wfl_valid ? r_wfl_preg : t_iwb_dst),
 	   .wrptr1(mem_rsp_dst_ptr),
-	   .wen0(t_iwb),
+	   .wen0(t_iwb | r_wfl_valid),
 	   .wen1(mem_rsp_dst_valid & ~mem_rsp_fp_dst),
-	   .wr0(t_iwb_data),
+	   .wr0(r_wfl_valid ? r_wfl_data : t_iwb_data),
 	   .wr1(w_mem_rsp_int_data),
 	   .rd0(w_srcA),
 	   .rd1(w_srcB),
@@ -3755,6 +3818,11 @@ module exec(clk,
 		  r_vchk_shadow[mem_rsp_dst_ptr] <= w_mem_rsp_int_data;
 		  r_vchk_valid[mem_rsp_dst_ptr]  <= 1'b1;
 	       end
+	     if(r_wfl_valid)
+	       begin
+		  r_vchk_shadow[r_wfl_preg] <= r_wfl_data;   /* a window fill */
+		  r_vchk_valid[r_wfl_preg]  <= 1'b1;
+	       end
 
 	     if(w_vchk_read & (t_srcA != t_vchk_expect))
 	       begin
@@ -3820,6 +3888,11 @@ module exec(clk,
 	     if(uq_push_two && uq_uop_two.dst_valid)
 	       begin
 		  r_rd_seen[uq_uop_two.dst] <= 1'b0;
+	       end
+	     /* a window fill (core.sv WMISS_SEQ) gives the physreg a new value too */
+	     if(r_wfl_valid)
+	       begin
+		  r_rd_seen[r_wfl_preg] <= 1'b0;
 	       end
 
 	     if(w_rda_valid)

@@ -287,7 +287,11 @@ typedef enum logic [8:0]
     * in {jmp_imm, imm}, executed as a sethi).  TRAP_L2 retires as the trapped
     * instruction (its pc); TRAP_L1 is not an architectural retirement. */
    TRAP_L1,
-   TRAP_L2
+   TRAP_L2,
+   /* core.sv: an instruction that names a register of a non-resident window
+    * group (machine.vh WIN_RESIDENT_GROUPS), folded and faulted at alloc: imm
+    * [7:0] = the groups it needs, imm[8] = it was TRAP_L1/L2 (re-inject the trap) */
+   WMISS
    } opcode_t;
 
 function logic is_mult(opcode_t op);
