@@ -235,6 +235,12 @@ public:
    * which snoops the RTL's caches before the bytes reach its memory image */
   void (*dma_hook)(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len) = nullptr;
   void *dma_hook_ctx = nullptr;
+  /* coherence with caches the DMA cannot see (Kodiak's ARM, which reads and writes
+   * DRAM directly): called before the IOMMU reads an IOPTE or DMA reads RAM, and
+   * before and after DMA writes RAM, for the bytes [pa, pa + len); the caller
+   * snoops those lines out of the CPU's caches (null: the DMA is coherent) */
+  void (*dma_snoop)(void *ctx, uint64_t pa, uint32_t len) = nullptr;
+  void *dma_snoop_ctx = nullptr;
   intctl_t intctl;
   slavio_ctr_t ctr[SUN4M_NTIMER_CPUS + 1];
   uint32_t ctr_user_mode = 0;          /* bit n: CPU n's counter is a user timer */

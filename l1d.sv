@@ -1382,12 +1382,6 @@ endfunction
 	  end
      end // always_ff@ (posedge clk)
 
-   wire w_buserr_trap = mem_rsp_bad & mmu_ctrl_e & !mmu_ctrl_nf;
-   assign buserr_valid = (r_state == INJECT_UNCACHE_LOAD) & mem_rsp_valid & mem_rsp_bad;
-   assign buserr_at = {r_req.is_store, 1'b0, (r_req.asi != 8'h0a)};
-   assign buserr_asi = !((r_req.asi == 8'h0a) | (r_req.asi == 8'h0b));
-   assign buserr_pa = r_req.addr[31:0];
-
    /* an uncached LOAD must reach memory only when non-speculative (at the ROB
     * head, the head's committable delay slot, or draining dead ops, which the
     * t_ucld_dead_drop arm answers without an access) */
@@ -1402,6 +1396,12 @@ endfunction
 	  end
      end // always_ff@ (posedge clk)
 `endif
+
+   wire w_buserr_trap = mem_rsp_bad & mmu_ctrl_e & !mmu_ctrl_nf;
+   assign buserr_valid = (r_state == INJECT_UNCACHE_LOAD) & mem_rsp_valid & mem_rsp_bad;
+   assign buserr_at = {r_req.is_store, 1'b0, (r_req.asi != 8'h0a)};
+   assign buserr_asi = !((r_req.asi == 8'h0a) | (r_req.asi == 8'h0b));
+   assign buserr_pa = r_req.addr[31:0];
 
 `ifdef SCSI_CLOBBER_TRACE
    // SCSI INQUIRY-clobber debug (address-hardwired to 0x0841d / 0x083dcb). Was under

@@ -633,6 +633,13 @@ function logic [15:0] bswap16(logic [15:0] in);
 `endif
 endfunction
 
+/* the ASIs that reach memory: 8/9 user/supervisor instruction, 0xa/0xb
+ * user/supervisor data (translated), 0x20-0x2f MMU bypass (interpret.cc
+ * asi_is_memory) */
+function automatic logic asi_is_memory(input logic [7:0] asi);
+   asi_is_memory = (asi == 8'h08) | (asi == 8'h09) | (asi == 8'h0a) | (asi == 8'h0b) | (asi[7:4] == 4'h2);
+endfunction
+
 function logic sext16(logic [15:0] in);
 `ifdef BIG_ENDIAN
    return in[7];

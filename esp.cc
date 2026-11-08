@@ -96,6 +96,9 @@ void sun4m_t::iommu_dma(const char *who, uint32_t dvma, uint8_t *buf, uint32_t l
     const uint64_t pte_pa = (static_cast<uint64_t>(iommu[1]) << 4) + (((dvma & (range - 1)) >> 12) << 2);
     uint32_t pte = 0;
     if(io_s != nullptr and pte_pa + 4 <= io_s->ram_size) {
+      if(dma_snoop != nullptr) {
+	dma_snoop(dma_snoop_ctx, pte_pa, 4);
+      }
       const uint8_t *p = io_s->mem.mem + pte_pa;
       pte = (static_cast<uint32_t>(p[0]) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
     }
@@ -110,7 +113,13 @@ void sun4m_t::iommu_dma(const char *who, uint32_t dvma, uint8_t *buf, uint32_t l
       }
     }
     else if(to_mem) {
+      if(dma_snoop != nullptr) {
+	dma_snoop(dma_snoop_ctx, pa, n);
+      }
       memcpy(io_s->mem.mem + pa, buf + done, n);
+      if(dma_snoop != nullptr) {
+	dma_snoop(dma_snoop_ctx, pa, n);   /* drop a copy the CPU fetched meanwhile */
+      }
       if(dma_hook != nullptr) {
 	dma_hook(dma_hook_ctx, pa, buf + done, n);
       }
@@ -119,6 +128,9 @@ void sun4m_t::iommu_dma(const char *who, uint32_t dvma, uint8_t *buf, uint32_t l
       }
     }
     else {
+      if(dma_snoop != nullptr) {
+	dma_snoop(dma_snoop_ctx, pa, n);
+      }
       memcpy(buf + done, io_s->mem.mem + pa, n);
     }
     dvma += n;

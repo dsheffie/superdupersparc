@@ -28,7 +28,8 @@ module core_l1d_l1i(clk,
 		    mem_req_mask,
 		    mem_req_uncached,
 		    mem_rsp_valid,
-		    mem_rsp_bad,		    
+		    mem_rsp_bad,
+		    mem_rsp_retry,
 		    mem_rsp_load_data,
 		    
 		    retire_fp_reg_ptr,
@@ -192,6 +193,7 @@ module core_l1d_l1i(clk,
    
    input logic  			  mem_rsp_valid;
    input logic				  mem_rsp_bad;
+   input logic				  mem_rsp_retry;   /* the uncached load was NACKed (l2.sv) */
    
    input logic [127:0] 			  mem_rsp_load_data;
 
@@ -920,6 +922,7 @@ module core_l1d_l1i(clk,
 	       
 	       .mem_rsp_valid(mem_rsp_valid),
 	       .mem_rsp_bad(mem_rsp_bad),
+	       .mem_rsp_retry(mem_rsp_retry),
 	       .mem_rsp_load_data(mem_rsp_load_data),
 	       .cache_accesses(l2_cache_accesses),
 	       .cache_hits(l2_cache_hits),

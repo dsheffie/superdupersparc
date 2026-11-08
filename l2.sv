@@ -41,6 +41,7 @@ module l2(clk,
 	  //mem -> l2
 	  mem_rsp_valid,
 	  mem_rsp_bad,
+	  mem_rsp_retry,
 	  mem_rsp_load_data,
 
 	  cache_hits,
@@ -129,6 +130,10 @@ module l2(clk,
    
    input logic 		mem_rsp_valid;
    input logic		mem_rsp_bad;
+   /* with mem_rsp_valid: the uncached load was NACKed (Kodiak's ARM-served device
+    * window, when the ARM needs a snoop while it holds the load -- as an MBus
+    * relinquish-and-retry): no data; the L2 serves snoops, then re-issues it */
+   input logic		mem_rsp_retry;
    
    input logic [127:0] 	mem_rsp_load_data;
 
@@ -200,6 +205,14 @@ module l2(clk,
    logic 	       r_snp_wbinv, n_snp_wbinv;
    logic 	       r_snoop_done, n_snoop_done;
    assign snoop_done = r_snoop_done;
+   /* a NACKed uncached load waiting to be re-issued (from IDLE, after any snoop) */
+   logic 	       r_rty_pend, n_rty_pend;
+   logic [`PA_WIDTH-1:0] r_rty_addr, n_rty_addr;
+   logic [4:0] 	       r_rty_mem_op, n_rty_mem_op;
+   logic [15:0]        r_rty_mask, n_rty_mask;
+   logic [127:0]       r_rty_data, n_rty_data;
+   logic [5:0] 	       r_rty_opcode, n_rty_opcode;
+   logic 	       r_rty_from_d, n_rty_from_d;
    /* R10000 block op (MEM_BLK_*): acked on arrival, then IDLE launches its eight 16-byte
     * lines one at a time and, once all eight are done and the L1I has invalidated the
     * block (r_blk_l1i_done), answers the L1D.  r_blk_cnt = the next line (8 = all
@@ -449,6 +462,13 @@ module l2(clk,
 	     r_snoop_ack <= 1'b0;
 	     r_snp_wbinv <= 1'b0;
 	     r_snoop_done <= 1'b0;
+	     r_rty_pend <= 1'b0;
+	     r_rty_addr <= 'd0;
+	     r_rty_mem_op <= 5'd0;
+	     r_rty_mask <= 16'd0;
+	     r_rty_data <= 128'd0;
+	     r_rty_opcode <= 6'd0;
+	     r_rty_from_d <= 1'b0;
 	     r_blk_pend <= 1'b0;
 	     r_blk_cnt <= 'd0;
 	     r_blk_addr <= 'd0;
@@ -498,6 +518,13 @@ module l2(clk,
 	     r_snoop_ack <= n_snoop_ack;
 	     r_snp_wbinv <= n_snp_wbinv;
 	     r_snoop_done <= n_snoop_done;
+	     r_rty_pend <= n_rty_pend;
+	     r_rty_addr <= n_rty_addr;
+	     r_rty_mem_op <= n_rty_mem_op;
+	     r_rty_mask <= n_rty_mask;
+	     r_rty_data <= n_rty_data;
+	     r_rty_opcode <= n_rty_opcode;
+	     r_rty_from_d <= n_rty_from_d;
 	     r_blk_pend <= n_blk_pend;
 	     r_blk_cnt <= n_blk_cnt;
 	     r_blk_addr <= n_blk_addr;
@@ -783,6 +810,13 @@ module l2(clk,
 	n_snoop_ack = 1'b0;
 	n_snp_wbinv = r_snp_wbinv;
 	n_snoop_done = 1'b0;
+	n_rty_pend = r_rty_pend;
+	n_rty_addr = r_rty_addr;
+	n_rty_mem_op = r_rty_mem_op;
+	n_rty_mask = r_rty_mask;
+	n_rty_data = r_rty_data;
+	n_rty_opcode = r_rty_opcode;
+	n_rty_from_d = r_rty_from_d;
 	n_blk_pend = r_blk_pend;
 	n_blk_cnt = r_blk_cnt;
 	n_blk_addr = r_blk_addr;
@@ -905,6 +939,22 @@ module l2(clk,
 		     * line -- skipping it reads the prior index and invalidates the wrong
 		     * line (the boot wedge). */
 		    n_state = WAIT_FOR_RAM;
+		 end
+	       else if(r_rty_pend)
+		 begin
+		    /* re-issue the NACKed uncached load (any snoop went first, above);
+		     * a snoop reused r_opcode/r_from_d, so put the load's back */
+		    n_addr = r_rty_addr;
+		    n_saveaddr = r_rty_addr;
+		    n_mem_opcode = r_rty_mem_op;
+		    n_store_mask = r_rty_mask;
+		    n_mem_req_store_data = r_rty_data;
+		    n_opcode = r_rty_opcode;
+		    n_from_d = r_rty_from_d;
+		    n_mem_req = 1'b1;
+		    n_got_mem_rsp_valid = 1'b0;
+		    n_rty_pend = 1'b0;
+		    n_state = UNCACHE_LOAD;
 		 end
 	       else if(r_blk_pend && r_blk_cnt[3])
 		 begin
@@ -1530,7 +1580,21 @@ module l2(clk,
 		 begin
 		    n_mem_req = 1'b0;
 		 end	       
-	       if(mem_rsp_valid)
+	       if(mem_rsp_valid & mem_rsp_retry)
+		 begin
+		    /* NACKed: no answer to the L1; back to IDLE (snoops are taken there)
+		     * and re-issue it from there */
+		    n_rty_pend = 1'b1;
+		    n_rty_addr = r_addr;
+		    n_rty_mem_op = r_mem_opcode;
+		    n_rty_mask = r_store_mask;
+		    n_rty_data = r_mem_req_store_data;
+		    n_rty_opcode = r_opcode;
+		    n_rty_from_d = r_from_d;
+		    n_state = IDLE;
+		    n_mem_req = 1'b0;
+		 end
+	       else if(mem_rsp_valid)
 		 begin
 		    n_rsp_valid = 1'b1;
 		    n_rsp_data = mem_rsp_load_data;
