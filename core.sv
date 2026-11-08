@@ -4767,12 +4767,9 @@ module core(clk,
    wire w_irq = r_psr_et & (irl != 4'd0) & ((irl == 4'd15) | (irl > r_psr_pil));
    /* the fault status/address are recorded with the trap, never for a wrong-path
     * access (the ISS records them at the access, which is the same instruction) */
-   /* a data bus error is recorded too (interpret.cc mmu_bus_error): FT = access
-    * bus error, level 0, AT = {store, 0, S}, FAR = its physical address */
-   wire mmu_fault_t w_bus_err_fault = '{fault: 1'b1, ft: FT_BUS_ERROR, level: 2'd0,
-					at: {t_rob_head.is_store, 1'b0, r_psr_s}};
-   assign mmu_fault_valid = (r_state == ARCH_FAULT) & (t_rob_head.mmu.fault | t_rob_head.is_bus_err);
-   assign mmu_fault = t_rob_head.mmu.fault ? t_rob_head.mmu : w_bus_err_fault;
+   /* (a data bus error is recorded by the L1D at its response, l1d.sv buserr_*) */
+   assign mmu_fault_valid = (r_state == ARCH_FAULT) & t_rob_head.mmu.fault;
+   assign mmu_fault = t_rob_head.mmu;
    /* FAR: a data fault's VA (the ROB data), an instruction fault's pc (an II's
     * data is its trap type) */
    assign mmu_fault_va = t_rob_head.is_ii ? t_rob_head.pc[31:0] : t_rob_head.data[31:0];

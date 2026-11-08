@@ -48,6 +48,7 @@ module mmu(clk,
 	   fault_level,
 	   fault_at,
 	   fault_va,
+	   fault_asi,
 	   mem_req_valid,
 	   mem_req_addr,
 	   mem_req_store,
@@ -95,6 +96,7 @@ module mmu(clk,
    input logic [1:0] fault_level;
    input logic [2:0] fault_at;
    input logic [31:0] fault_va;
+   input logic fault_asi;   /* a bus error of an alternate-space access: FSR bit 16 (qemu) */
 
    output logic mem_req_valid;
    output logic [`PA_WIDTH-1:0] mem_req_addr;   /* line aligned */
@@ -179,7 +181,7 @@ module mmu(clk,
 	      * the status (OW if it was a bus error too) */
 	     if((r_fsr[4:2] == 3'd0) || (r_fsr[4:2] > 3'd4))
 	       begin
-		  n_fsr = {22'd0, fault_level, fault_at, fault_ft, 1'b1, (r_fsr[4:2] == FT_BUS_ERROR)};
+		  n_fsr = {15'd0, fault_asi, 6'd0, fault_level, fault_at, fault_ft, 1'b1, (r_fsr[4:2] == FT_BUS_ERROR)};
 		  n_far = fault_va;
 	       end
 	     else

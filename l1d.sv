@@ -127,8 +127,13 @@ module l1d(clk,
 	   cache_accesses,
 	   cache_hits,
 	   mmu_ctrl_e,
+	   mmu_ctrl_nf,
 	   mmu_ctrl_bm,
 	   mmu_ctx,
+	   buserr_valid,
+	   buserr_at,
+	   buserr_asi,
+	   buserr_pa,
 	   page_walk_req_valid,
 	   page_walk_req_va,
 	   page_walk_req_mark,
@@ -159,7 +164,17 @@ module l1d(clk,
     * the VA is held until the response) and response, and tlb_busy (a walk is
     * pending: the LSU holds BLK_TLB requests until it drops) */
    input logic mmu_ctrl_e;
+   input logic mmu_ctrl_nf;
    input logic mmu_ctrl_bm;   /* Viking boot mode: MMU-off ASI 8/9 loads read the PROM */
+   /* an uncached load (or ldstub/swap) answered with a bus error: recorded in
+    * the SRMMU fault status/address registers here, at the response (it is
+    * non-speculative: an uncached load reaches memory only from the ROB head),
+    * as interpret.cc mmu_bus_error records it at the access: AT = {store,
+    * 0, S}, bit 16 for an alternate-space access, FAR = the physical address */
+   output logic buserr_valid;
+   output logic [2:0] buserr_at;
+   output logic buserr_asi;
+   output logic [31:0] buserr_pa;
    input logic [`SRMMU_CTX_BITS-1:0] mmu_ctx;
    output logic page_walk_req_valid;
    output logic [31:0] page_walk_req_va;
@@ -1367,6 +1382,12 @@ endfunction
 	     $stop();
 	  end
      end // always_ff@ (posedge clk)
+
+   wire w_buserr_trap = mem_rsp_bad & mmu_ctrl_e & !mmu_ctrl_nf;
+   assign buserr_valid = (r_state == INJECT_UNCACHE_LOAD) & mem_rsp_valid & mem_rsp_bad;
+   assign buserr_at = {r_req.is_store, 1'b0, (r_req.asi != 8'h0a)};
+   assign buserr_asi = !((r_req.asi == 8'h0a) | (r_req.asi == 8'h0b));
+   assign buserr_pa = r_req.addr[31:0];
 
    /* an uncached LOAD must reach memory only when non-speculative (at the ROB
     * head, the head's committable delay slot, or draining dead ops, which the
@@ -3487,12 +3508,15 @@ endfunction
 		 begin
 		    //$display("data returns for uncached load");
 		    t_pt1 = "P";
-		    /* a bus error's data is its physical address: the trap records it
-		     * in the SRMMU fault address register (core.sv mmu_fault_va) */
-		    n_core_mem_rsp.data = mem_rsp_bad ? `MEM_WIDTH'(r_req.addr[31:0]) : t_rsp_data[`MEM_WIDTH-1:0];
-                    n_core_mem_rsp.dst_valid = r_req.dst_valid & !mem_rsp_bad;
+		    /* a bus error traps (data_access_error at retirement) only with
+		     * the MMU on and not no-fault (qemu sparc_cpu_do_transaction_failed);
+		     * otherwise the load completes reading 0.  Either way it is
+		     * recorded here (buserr_valid). */
+		    n_core_mem_rsp.data = w_buserr_trap ? `MEM_WIDTH'(r_req.addr[31:0]) :
+					  mem_rsp_bad ? 'd0 : t_rsp_data[`MEM_WIDTH-1:0];
+                    n_core_mem_rsp.dst_valid = r_req.dst_valid & !w_buserr_trap;
 		    n_core_mem_rsp.bad_addr = r_req.bad_addr;		    
-		    n_core_mem_rsp.bus_err = mem_rsp_bad;   /* DBE at retirement */
+		    n_core_mem_rsp.bus_err = w_buserr_trap;
                     n_core_mem_rsp_valid = 1'b1;
 		    n_state = ACTIVE;		    
 		 end

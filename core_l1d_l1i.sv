@@ -969,6 +969,11 @@ module core_l1d_l1i(clk,
    wire [31:0] 			  w_mmu_fault_va;
    wire 			  w_mmu_ctrl_e;
    wire 			  w_mmu_ctrl_nf;
+   /* the L1D's record of a data bus error (l1d.sv buserr_*) */
+   wire 			  w_buserr_valid;
+   wire [2:0] 			  w_buserr_at;
+   wire 			  w_buserr_asi;
+   wire [31:0] 			  w_buserr_pa;
    wire 			  w_mmu_ctrl_bm;
    wire [`SRMMU_CTX_BITS-1:0] 	  w_mmu_ctx;
    page_walk_rsp_t 		  w_page_walk_rsp;
@@ -995,11 +1000,12 @@ module core_l1d_l1i(clk,
 	    .walk_pte(w_walk_pte),
 	    .l1i_rsp_valid(w_mmu_l1i_rsp_valid),
 	    .l1d_rsp_valid(w_mmu_l1d_rsp_valid),
-	    .fault_valid(w_mmu_fault_valid),
-	    .fault_ft(w_mmu_fault.ft),
-	    .fault_level(w_mmu_fault.level),
-	    .fault_at(w_mmu_fault.at),
-	    .fault_va(w_mmu_fault_va),
+	    .fault_valid(w_mmu_fault_valid | w_buserr_valid),
+	    .fault_ft(w_mmu_fault_valid ? w_mmu_fault.ft : FT_BUS_ERROR),
+	    .fault_level(w_mmu_fault_valid ? w_mmu_fault.level : 2'd0),
+	    .fault_at(w_mmu_fault_valid ? w_mmu_fault.at : w_buserr_at),
+	    .fault_va(w_mmu_fault_valid ? w_mmu_fault_va : w_buserr_pa),
+	    .fault_asi(!w_mmu_fault_valid & w_buserr_asi),
 	    .mem_req_valid(w_mmu_mem_req_valid),
 	    .mem_req_addr(w_mmu_mem_req_addr),
 	    .mem_req_store(w_mmu_mem_req_store),
@@ -1097,6 +1103,11 @@ module core_l1d_l1i(clk,
 	       .cache_accesses(l1d_cache_accesses),
 	       .cache_hits(l1d_cache_hits),
 	       .mmu_ctrl_e(w_mmu_ctrl_e),
+	       .mmu_ctrl_nf(w_mmu_ctrl_nf),
+	       .buserr_valid(w_buserr_valid),
+	       .buserr_at(w_buserr_at),
+	       .buserr_asi(w_buserr_asi),
+	       .buserr_pa(w_buserr_pa),
 	       .mmu_ctrl_bm(w_mmu_ctrl_bm),
 	       .mmu_ctx(w_mmu_ctx),
 	       .page_walk_req_valid(w_dtlb_walk_req),
