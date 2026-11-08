@@ -29,6 +29,7 @@ import "DPI-C" function void mmu_set_ref(input longint pte_pa, input int pte);
  * so no L1D access to the line can land between them. */
 module mmu(clk,
 	   reset,
+	   sys_reset,
 	   ctrl_e,
 	   ctrl_nf,
 	   ctrl_bm,
@@ -71,6 +72,11 @@ module mmu(clk,
 
    input logic clk;
    input logic reset;
+   /* a system reset (the SS-20's sysctrl): the walker resets and the control
+    * register leaves translation (E, NF clear) for boot mode (BM); the context
+    * table pointer, context and fault status/address keep their values, as
+    * ss10sim's system_reset (qemu's cpu reset) */
+   input logic sys_reset;
    output logic ctrl_e;
    output logic ctrl_nf;   /* MCR.NF: data-access faults are recorded, not trapped (core.sv) */
    output logic ctrl_bm;   /* MCR.BM: Viking boot mode (the L1I/L1D redirect to the PROM) */
@@ -205,12 +211,17 @@ module mmu(clk,
 	     r_ctpr <= mmu_preload(1) & 32'hfffffffc;
 	     r_ctx <= `SRMMU_CTX_BITS'(mmu_preload(2));
 `else
-	     r_ctrl <= 32'h00000800;   /* MCR_MMODE: MBus mode */
+	     r_ctrl <= 32'h00002800;   /* MCR_MMODE: MBus mode, MCR_BM: boot mode (Viking) */
 	     r_ctpr <= 32'd0;
 	     r_ctx <= 'd0;
 `endif
 	     r_fsr <= 32'd0;
 	     r_far <= 32'd0;
+	     r_tlb_flush <= 1'b0;
+	  end
+	else if(sys_reset)
+	  begin
+	     r_ctrl <= (r_ctrl & 32'hfffffffc) | 32'h00002000;
 	     r_tlb_flush <= 1'b0;
 	  end
 	else
@@ -423,7 +434,7 @@ module mmu(clk,
 
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(reset | sys_reset)
 	  begin
 	     r_state <= IDLE;
 	     r_l1i_req <= 1'b0;

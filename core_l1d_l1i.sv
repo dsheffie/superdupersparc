@@ -4,6 +4,7 @@
 
 module core_l1d_l1i(clk, 
 		    reset,
+		    sys_reset,
 		    retire_allowed,
 		    single_step,
 		    bp_enable,
@@ -126,6 +127,10 @@ module core_l1d_l1i(clk,
    
    input logic clk;
    input logic reset;
+   /* a system reset (the SS-20 sysctrl): resets the core as reset does, except
+    * the MMU keeps its context, table pointer and fault registers (mmu.sv) */
+   input logic sys_reset;
+   wire w_reset = reset | sys_reset;
    input logic retire_allowed;
    
    
@@ -412,7 +417,7 @@ module core_l1d_l1i(clk,
    logic [7:0] r_ext_req_cnt, r_ext_done_cnt;
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_ext_req_cnt <= 8'd0;
 	     r_ext_done_cnt <= 8'd0;
@@ -450,7 +455,7 @@ module core_l1d_l1i(clk,
    logic [63:0] r_dbg_cyc, r_dbg_stuck;
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_dbg_cyc <= 64'd0;
 	     r_dbg_stuck <= 64'd0;
@@ -511,7 +516,7 @@ module core_l1d_l1i(clk,
  
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_flush_state <= FLUSH_IDLE;
 	     r_flush <= 1'b0;
@@ -840,11 +845,11 @@ module core_l1d_l1i(clk,
    logic [63:0] r_pt_cycle;
    always_ff@(posedge clk)
      begin
-	r_pt_cycle <= reset ? 64'd0 : r_pt_cycle + 64'd1;
+	r_pt_cycle <= w_reset ? 64'd0 : r_pt_cycle + 64'd1;
      end
    always_ff@(negedge clk)
      begin
-	if(!reset && !dcache.r_req.is_store)
+	if(!w_reset && !dcache.r_req.is_store)
 	  begin
 	     if((r_state == IDLE) && (n_state == GNT_L1D))
 	       begin
@@ -876,7 +881,7 @@ module core_l1d_l1i(clk,
    wire [`PA_WIDTH-1:0] w_l1i_blk_inv_addr;
    l2 l2cache (
 	       .clk(clk),
-	       .reset(reset),
+	       .reset(w_reset),
 	       .state(l2_state),
 	       .rsp_state(l2_rsp_state),
 	       /* the L2 keys its own flush off these (n_need_l1i/l1d in l2.sv), so the
@@ -937,7 +942,7 @@ module core_l1d_l1i(clk,
    
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_state <= IDLE;
 	     r_last_gnt <= 1'b0;
@@ -986,6 +991,7 @@ module core_l1d_l1i(clk,
    mmu mmu0(
 	    .clk(clk),
 	    .reset(reset),
+	    .sys_reset(sys_reset),
 	    .ctrl_e(w_mmu_ctrl_e),
 	    .ctrl_nf(w_mmu_ctrl_nf),
 	    .ctrl_bm(w_mmu_ctrl_bm),
@@ -1032,7 +1038,7 @@ module core_l1d_l1i(clk,
    
    l1d dcache (
 	       .clk(clk),
-	       .reset(reset),
+	       .reset(w_reset),
 	       .state(l1d_state),
 	       .head_of_rob_ptr_valid(head_of_rob_ptr_valid),
 	       .head_of_rob_ptr(head_of_rob_ptr),
@@ -1104,6 +1110,8 @@ module core_l1d_l1i(clk,
 	       .cache_hits(l1d_cache_hits),
 	       .mmu_ctrl_e(w_mmu_ctrl_e),
 	       .mmu_ctrl_nf(w_mmu_ctrl_nf),
+	       .mmu_ctrl_de(w_mmureg_ctrl[8]),
+	       .mmu_ctrl_ac(w_mmureg_ctrl[15]),
 	       .buserr_valid(w_buserr_valid),
 	       .buserr_at(w_buserr_at),
 	       .buserr_asi(w_buserr_asi),
@@ -1132,7 +1140,7 @@ module core_l1d_l1i(clk,
 
    l1i icache(
 	      .clk(clk),
-	      .reset(reset),
+	      .reset(w_reset),
 	      .state(l1i_state),
 	      .flush_req(flush_req_l1i ),
 	      .flush_line_req(w_flush_line_req_l1i),
@@ -1191,7 +1199,7 @@ module core_l1d_l1i(clk,
 
    core cpu (
 	     .clk(clk),
-	     .reset(reset),
+	     .reset(w_reset),
 	     .single_step(single_step),
 	     .bp_enable(bp_enable),
 	     .fault_clear(fault_clear),
@@ -1369,7 +1377,7 @@ module core_l1d_l1i(clk,
    wire 	     w_l2_evt = (mem_req_valid & ~r_mem_req_valid_d) | mem_rsp_valid;
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_l2trace_wptr    <= 8'd0;
 	     r_mem_req_valid_d <= 1'b0;
@@ -1417,7 +1425,7 @@ module core_l1d_l1i(clk,
    localparam CHK_IDX_IN_PG = CHK_L1D_TAG_LSB - `LG_L1D_CL_LEN;   /* set bits below the colour */
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     r_preschk_cnt <= 'd0;
 	     r_preschk_bad <= 'd0;
@@ -1519,7 +1527,7 @@ module core_l1d_l1i(clk,
    logic [63:0] r_bi_cnt[10][3];   /* [reason][0 probes, 1 L1D hit, 2 dirty] */
    always_ff@(posedge clk)
      begin
-	if(reset)
+	if(w_reset)
 	  begin
 	     for(integer r = 0; r < 10; r = r + 1)
 	       begin

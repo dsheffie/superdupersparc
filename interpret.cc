@@ -278,10 +278,16 @@ static bool mmu_bus_error(state_t *s, uint64_t pa, bool is_write, bool is_exec, 
 
 /* Translate va for an access through a memory ASI.  Returns FT_NONE and *pa, or
  * the fault type (already recorded in the fault status/address registers). */
-/* the cacheability of mmu_xlate's last translation, as the RTL decides it (the
- * PTE's C; MMU off = cached; the bypass ASIs uncached): the store check logs
- * only the stores the L1D writes into its array */
+/* the cacheability of mmu_xlate's last translation, as the RTL decides it
+ * (l1d.sv w_req2_cached: RAM only, MCR.DE, then the PTE's C with the MMU on and
+ * MCR.AC with it off; the bypass ASIs uncached): the store check logs only the
+ * stores the L1D writes into its array */
 static bool g_xlate_cached = false;
+#define MCR_DE (1u<<8)    /* Viking: data cache enable */
+#define MCR_AC (1u<<15)   /* Viking: MMU-off memory accesses cacheable */
+static bool xlate_cached(const state_t *s, uint64_t pa, bool c) {
+  return c and (s->mmu_ctrl & MCR_DE) and (pa < 0x20000000ULL);
+}
 
 static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint64_t *pa) {
   if(asi_is_bypass(asi)) {
@@ -290,7 +296,6 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
     return FT_NONE;
   }
   if(not (s->mmu_ctrl & MCR_E)) {
-    g_xlate_cached = true;
     /* Viking boot mode: MMU-off instruction-space accesses come from the PROM
      * (offset masked to 512KB, as qemu does): fetches, and loads through the
      * instruction ASIs 8/9 (OBP's POST reads its tables with lduba ASI 9; qemu
@@ -301,6 +306,7 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
     else {
       *pa = va;
     }
+    g_xlate_cached = xlate_cached(s, *pa, (s->mmu_ctrl & MCR_AC) != 0);
     return FT_NONE;
   }
   /* ACC permissions: bit 0 = read, 1 = write, 2 = execute */
@@ -322,13 +328,13 @@ static uint32_t mmu_xlate(state_t *s, uint32_t asi, uint32_t va, acc_t acc, uint
     mmu_record_fault(s, ft, level, at, va);
     return ft;
   }
-  g_xlate_cached = (pte >> 7) & 1;
   /* referenced on every access, modified on a store */
   uint32_t npte = pte | (1u << 5) | ((acc == acc_t::store) ? (1u << 6) : 0);
   if(npte != pte) {
     st_phys<uint32_t>(s, pte_pa, npte);
   }
   *pa = pte_pa_of(pte, level, va);
+  g_xlate_cached = xlate_cached(s, *pa, ((pte >> 7) & 1) != 0);
   return FT_NONE;
 }
 

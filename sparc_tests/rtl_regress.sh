@@ -6,7 +6,7 @@
 #   ./rtl_regress.sh [jobs]
 cd "$(dirname "$0")"
 J=${1:-8}
-MMU="--mmu-ctrl 0x801 --mmu-ctpr 0x80000 --mmu-ctx 0"
+MMU="--mmu-ctrl 0x901 --mmu-ctpr 0x80000 --mmu-ctx 0"
 TESTS="wiggle winfill muldiv dcti probe:MMU atomic_0 atomic_1 fp_mem fp_cmp fp_bare fp_trap sv sv_gas mmu
        mmu_on:MMU mmu_iside_1:MMU mmu_iside_2:MMU atomic_mmu_0:MMU atomic_mmu_1:MMU atomic_mmu_2:MMU"
 # (fib/div/fp/cc are Linux user programs: ISS only, run.sh)

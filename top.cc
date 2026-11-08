@@ -975,7 +975,9 @@ int main(int argc, char **argv) {
   std::string branch_name = "branch_info.txt";
   uint64_t heartbeat = 1UL<<36, start_trace_at = ~0UL;
   uint64_t max_cycle = 0, max_icnt = 0, mem_lat = 2;
-  std::string mmu_ctrl = "0x800", mmu_ctpr = "0", mmu_ctx = "0";
+  /* MBus mode, data cache enabled (DE), MMU-off accesses cacheable (AC): an elf
+   * runs cached, as the RTL caches only with DE (and AC with the MMU off) */
+  std::string mmu_ctrl = "0x8900", mmu_ctpr = "0", mmu_ctx = "0";
   std::string ckpt_file, tcx_rom;
   std::vector<std::string> scsi_disks, scsi_cdroms;
   bool cg14 = false;

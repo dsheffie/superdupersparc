@@ -464,22 +464,12 @@ typedef struct packed {
 `define CCA_CACHED(c) ((c) == 3'd3)
 `endif
 
-/* I/O physical space: the reserved range, the GIO slots, MC, HPC3 and IOC
- * (0x18000000-0x1fbfffff; the PROM at 0x1fc00000 runs and reads cached), plus on
- * IP28 the EISA window.  A CACHED access here never leaves the core (l1d.sv): an
- * out-of-order core issues cached misses speculatively, and a garbage address in
- * I/O space would read a device (side effects) or trip the MC's unsquashable GIO
- * time-out + bus-error interrupt.  Real software only reaches I/O space uncached.
- *   IP22: the access completes as if the space read 0 (stores are dropped).
- *   IP28: precise DBE on the instruction, as the R10000 does for an ERR completion
- *         of a block read (the IP28 module rejects cached I/O; IRIX checks this at
- *         boot: "Processor Module allows GIO speculation"). */
-`ifdef ENABLE_R10000
-`define IS_IO_PA(pa) ((((pa) >= `PA_WIDTH'(36'h18000000)) && ((pa) < `PA_WIDTH'(36'h1fc00000))) || \
-		      (((pa) >= `PA_WIDTH'(36'h00080000)) && ((pa) < `PA_WIDTH'(36'h000a0000))))
-`else
-`define IS_IO_PA(pa) (((pa) >= `PA_WIDTH'(36'h18000000)) && ((pa) < `PA_WIDTH'(36'h1fc00000)))
-`endif
+/* sun4m RAM: an SS-20 holds up to 512 MB at physical 0.  Only RAM is cached
+ * (l1d.sv): everything else -- the VSIMM slots, SBus and on-board devices, the
+ * boot PROM -- is accessed uncached whatever the MMU says, so it reaches the bus
+ * only from the ROB head.  (The out-of-order core issues cached misses
+ * speculatively; a wrong-path line fill from a device would have side effects.) */
+`define SUN4M_RAM_PA(pa) ((pa) < `PA_WIDTH'(36'h20000000))
 
 `ifdef ENABLE_R10000
 /* IP28: an R10000 rev 2.5 (0x0925, as IRIS and indysim report; the IP28 kernel

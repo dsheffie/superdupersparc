@@ -103,6 +103,7 @@ module tb_decode_sparc(
 		    .irq(1'b0),
 		    .iacc_exc(1'b0),
 		    .iacc_mmu('0), .irq_level(4'd0),
+		    .xflush(1'b0), .xflush_op(II),
 		    .iacc_err(1'b0),
 		    .insn(insn),
 		    .pc('d0),

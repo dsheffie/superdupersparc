@@ -128,6 +128,8 @@ module l1d(clk,
 	   cache_hits,
 	   mmu_ctrl_e,
 	   mmu_ctrl_nf,
+	   mmu_ctrl_de,
+	   mmu_ctrl_ac,
 	   mmu_ctrl_bm,
 	   mmu_ctx,
 	   buserr_valid,
@@ -165,6 +167,8 @@ module l1d(clk,
     * pending: the LSU holds BLK_TLB requests until it drops) */
    input logic mmu_ctrl_e;
    input logic mmu_ctrl_nf;
+   input logic mmu_ctrl_de;   /* MCR bit 8: the data cache is enabled */
+   input logic mmu_ctrl_ac;   /* MCR bit 15: MMU-off memory accesses are cacheable */
    input logic mmu_ctrl_bm;   /* Viking boot mode: MMU-off ASI 8/9 loads read the PROM */
    /* an uncached load (or ldstub/swap) answered with a bus error: recorded in
     * the SRMMU fault status/address registers here, at the response (it is
@@ -543,7 +547,6 @@ endfunction
    logic 				  t_got_non_mem, r_got_non_mem;
 
    logic 				  t_ucld_dead_drop;
-   logic 				  t_io_drop;   /* port 1 answered a cached I/O-space load (machine.vh IS_IO_PA) */
       
    logic 				  n_is_retry, r_is_retry;
    logic 				  r_q_priority, n_q_priority;
@@ -556,6 +559,7 @@ endfunction
    mem_rsp_t n_core_mem_rsp, r_core_mem_rsp;
 
    logic [2:0] w_tlb_c;     /* translated page cacheability (CCA encoding) */
+   wire w_req2_cached;      /* port 2's request is cacheable (Viking rules, below) */
 
       
    mem_req_t n_req, r_req, t_req;
@@ -969,10 +973,6 @@ endfunction
 	       begin
 		  r_rob_inflight[{r_req.restart_id, r_req.rob_ptr}] <= 1'b0;
 	       end
-	     if(t_io_drop)
-	       begin
-		  r_rob_inflight[{r_req.restart_id, r_req.rob_ptr}] <= 1'b0;
-	       end
 	     /* a CACHE hit-op retry completes the op on THIS pass whether it hits,
 	      * misses, or tag-mismatches (the line op / L2 scrub is issued either
 	      * way) -- clear its inflight bit unconditionally, else a miss/mismatch
@@ -997,16 +997,15 @@ endfunction
 	 * synonym (same PA, other colour) misses here and the L2 probes the old copy. */
 	t_req2_idx = r_req2.addr[IDX_STOP-1:IDX_START];
 `endif
-	/* For a TLB-MAPPED access, cacheability comes from the matched page's C
-	 * field (machine.vh CCA_CACHED) rather than mipsseg's segment default; for an
-	 * unmapped (direct) access keep the segment decision in r_req2.cached.
-	 * w_tlb_c is registered in lockstep with w_mapped_addr, so it lines up
-	 * with r_req2 here. (This is the proper fix the L2 UNCACHE_WB_TURNAROUND
-	 * worked around: a cacheable mapped store was being routed uncached.) */
+	/* Viking cacheability: only RAM (machine.vh SUN4M_RAM_PA), only with the
+	 * data cache enabled (MCR.DE), and then for a memory-ASI access the page's C
+	 * with the MMU on, MCR.AC with it off; the bypass ASIs are uncached
+	 * (r_req2.cached).  w_tlb_c and r_xlate2 are registered in lockstep with
+	 * w_mapped_addr, so they line up with r_req2 here. */
 `ifdef FORCE_UNCACHED
 	t_remapped_req2.cached = 1'b0;   /* SCIENCE: force ALL data traffic uncached */
 `else
-	t_remapped_req2.cached = r_req2.mapped ? `CCA_CACHED(w_tlb_c) : r_req2.cached;
+	t_remapped_req2.cached = w_req2_cached;
 `endif
 	/* the queued/replayed req now carries the TLB-translated PHYSICAL address;
 	 * mark it unmapped so the replay refills from / re-tags with the PA and
@@ -1413,7 +1412,7 @@ endfunction
      if(r_got_req2 & (w_mapped_addr[35:12] == 24'h00841d))
        $display("[desc-acc] va=%x pa=%x mapped=%b cca=%0d cached=%b store=%b op=%0d",
 		r_req2.addr, w_mapped_addr, r_req2.mapped, w_tlb_c,
-		(r_req2.mapped ? `CCA_CACHED(w_tlb_c) : r_req2.cached), r_req2.is_store, r_req2.op);
+		w_req2_cached, r_req2.is_store, r_req2.op);
    // TEMP: CPU reads of the INQUIRY buffer (BP=0x083dcb00).  hit=1 -> served from
    // L1D (STALE if it predates the DMA write); hit=0 -> miss/refill (FRESH from DRAM).
    always_ff @(posedge clk)
@@ -1426,7 +1425,7 @@ endfunction
      if(r_got_req2 & r_req2.is_store & (w_mapped_addr[31:8] == 24'h083dcb))
        $display("[bufwr] cyc=%0d pa=%09x va=%x pc=%x op=%0d data=%016x cached=%b",
 		r_cycle, w_mapped_addr, r_req2.addr, r_req2.pc, r_req2.op,
-		r_req2.data, (r_req2.mapped ? `CCA_CACHED(w_tlb_c) : r_req2.cached));
+		r_req2.data, w_req2_cached);
    // L1D FILL of the buffer line: what data lands (fresh INQUIRY or stale DRAM)?
    always_ff @(posedge clk)
      if(w_cacheable_mem_rsp_valid & (r_mem_req_addr[35:8] == 28'h0083dcb))
@@ -2373,6 +2372,8 @@ endfunction
 	r_bmode2 <= !mmu_ctrl_e & mmu_ctrl_bm & !core_mem_req.is_store &
 		    ((core_mem_req.asi == 8'h08) | (core_mem_req.asi == 8'h09));
      end
+   assign w_req2_cached = `SUN4M_RAM_PA(w_mapped_addr) & mmu_ctrl_de &
+			  (r_req2.mapped ? (r_xlate2 ? `CCA_CACHED(w_tlb_c) : mmu_ctrl_ac) : r_req2.cached);
    always_comb
      begin
 	w_tlb_c = w_dtlb_c ? 3'd3 : 3'd2;
@@ -2649,7 +2650,6 @@ endfunction
 	n_is_retry = 1'b0;
 	n_chop_wait = r_chop_wait;
 	t_ucld_dead_drop = 1'b0;
-	t_io_drop = 1'b0;
 	
 
 	n_q_priority = !r_q_priority;
@@ -2872,28 +2872,6 @@ endfunction
 			  * line first on a miss (rv64core's AMOs) */
 			 t_push_miss = 1'b1;
 		      end
-		    else if(t_remapped_req2.cached && `IS_IO_PA(t_remapped_req2.addr[`PA_WIDTH-1:0]) && !w_is_chop2
-`ifndef ENABLE_R10000
-			    && !r_req2.is_store
-`endif
-			    )
-		      begin
-			 /* cached access to I/O space (machine.vh IS_IO_PA): answer here, with no
-			  * fill -- the line is never allocated and nothing reaches the bus.  IP28:
-			  * DBE at retirement for loads and stores (the R10000's ERR completion).
-			  * IP22: a load reads 0; a store takes its normal address pass and is
-			  * dropped when it commits (the port-1 arm below). */
-`ifdef ENABLE_R10000
-			 n_core_mem_rsp.data = `MEM_WIDTH'(r_req2.addr);
-			 n_core_mem_rsp.dst_valid = 1'b0;
-			 n_core_mem_rsp.bus_err = 1'b1;
-`else
-			 n_core_mem_rsp.data = 'd0;
-			 n_core_mem_rsp.dst_valid = r_req2.dst_valid;
-`endif
-			 n_core_mem_rsp.bad_addr = r_req2.bad_addr;
-			 n_core_mem_rsp_valid = 1'b1;
-		      end
 		    else if(r_req2.is_store && r_req2.lsu_hold && !w_is_chop2)
 		      begin
 			 /* plain store address pass: record PA/mask in the store buffer and
@@ -3101,29 +3079,6 @@ endfunction
 			      n_mem_req_valid = 1'b1;
 			      n_chop_wait = 1'b1;
 			      n_state = FLUSH_CL_WAIT;
-			   end
-		      end
-		    else if(r_req.cached && `IS_IO_PA(r_req.addr[`PA_WIDTH-1:0]))
-		      begin
-			 /* cached access to I/O space that reached the queue (an IP22 store's
-			  * commit, or a load queued behind another): never filled, never
-			  * allocated.  A store is dropped; a load answers as port 2 would. */
-			 if(r_req.commit)
-			   begin
-			      n_core_mem_st_done_valid = 1'b1;
-			   end
-			 else
-			   begin
-			      t_io_drop = 1'b1;
-`ifdef ENABLE_R10000
-			      n_core_mem_rsp.dst_valid = 1'b0;
-			      n_core_mem_rsp.bus_err = 1'b1;
-`else
-			      n_core_mem_rsp.data = 'd0;
-			      n_core_mem_rsp.dst_valid = r_req.dst_valid;
-`endif
-			      n_core_mem_rsp.bad_addr = r_req.bad_addr;
-			      n_core_mem_rsp_valid = 1'b1;
 			   end
 		      end
 		    else if((r_req.cached == 1'b0) && !r_req.is_store && drain_ds_complete && dead_rob_mask[r_req.rob_ptr])

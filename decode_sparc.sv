@@ -38,6 +38,8 @@ module decode_sparc(
 		    wim,
 		    irq,
 		    irq_level,
+		    xflush,
+		    xflush_op,
 		    iacc_exc,
 		    iacc_mmu,
 		    iacc_err,
@@ -58,6 +60,10 @@ module decode_sparc(
    input logic [`NWINDOWS-1:0]	wim;
    input logic			irq;
    input logic [3:0]		irq_level;   /* with irq: the interrupt level taken (1..15) */
+   /* an external cache flush (core.sv ext_flush_req, never in a delay slot):
+    * the instruction is replaced by the flush op, which restarts at its pc */
+   input logic			xflush;
+   input opcode_t		xflush_op;
    input logic			iacc_exc;   /* instruction_access_exception (MMU fault on fetch) */
    input 			mmu_fault_t iacc_mmu;   /* its fault status fields (for the trap) */
    input logic			iacc_err;   /* instruction_access_error (bus error on fetch) */
@@ -364,6 +370,14 @@ module decode_sparc(
 	      * are its own -- the precise SPARC interrupt point */
 	     uop.op = II;
 	     uop.imm = {8'd0, 4'h1, irq_level};
+	  end
+	else if(xflush)
+	  begin
+	     uop.op = xflush_op;
+	     uop.is_int = 1'b1;
+	     uop.serializing_op = 1'b1;
+	     uop.srcA = 'd0;
+	     uop.srcA_valid = 1'b1;
 	  end
 	else if(iacc_exc)
 	  begin
