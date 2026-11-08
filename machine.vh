@@ -59,12 +59,13 @@
  * CPU-model switch, not a free widening.  The C++ checker follows it (Makefile ->
  * -DENABLE_R10000). */
 //`define ENABLE_R10000 1
-/* validation knob: keep the L1I coherent with core stores by making a line live in the
- * L1I XOR the L1D (the L2 drops it from the L1I before an L1D fill or uncached store, and
- * probes it out of the L1D before an L1I fill).  The architecture allows a stale L1I;
- * this makes the RTL match an ISS with no I-cache.  Instructions already fetched are not
- * covered, nor is DMA.  Off for FPGA builds. */
-//`define ENABLE_COHERENT_L1I 1
+/* keep the L1I coherent with core stores by making a line live in the L1I XOR the L1D
+ * (the L2 drops it from the L1I before an L1D fill or uncached store, and probes it out
+ * of the L1D before an L1I fill).  The SuperSPARC's I-cache is coherent with stores in
+ * hardware and software relies on it: Linux's viking_flush_sig_insns is a no-op, and OBP
+ * patches code with cached stores and runs it with no FLUSH.  Instructions already
+ * fetched are not covered (FLUSH still refetches), nor is DMA. */
+`define ENABLE_COHERENT_L1I 1
 
 /* ENABLE_MIPS4: the MIPS IV (R5000/R10000) instructions; on by itself for an R4400
  * with MIPS IV bolted on (the cmov silicon builds), and implied by ENABLE_R10000.

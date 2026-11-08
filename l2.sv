@@ -90,12 +90,19 @@ module l2(clk,
     * handlers still run (find an empty L2, ack/write through).  l2_nocache=0 => normal L2.  Set
     * before-go only, so no mid-run flush needed (no lines exist to go stale). Was `ENABLE_L2_NOCACHE. */
    wire w_l2_cacheable = l1_mem_req_cacheable & (~l2_nocache | (l1_mem_req_opcode >= 6'd24));
-`ifdef ENABLE_COHERENT_L1I
+   /* the L1I drops the block of an L1D request first (r_ci_wait/r_ci_ok below)
+    * when the L1D writes around the caches: an uncached store or atomic, which
+    * the L1I would otherwise keep a stale copy of (OBP patches code with the
+    * caches disabled, MCR.IE clear, and so issues no FLUSH).  With
+    * ENABLE_COHERENT_L1I, also before an L1D fill (r9999's coherent L1I). */
    wire w_ci_need = l1_mem_req_from_d && !is_blkop(l1_mem_req_opcode) &&
-		    (((l1_mem_req_opcode == 6'd4) && w_l2_cacheable) ||
-		     ((l1_mem_req_opcode == 6'd7) && !w_l2_cacheable));
-   wire w_ci_ok = r_ci_ok && (l1_mem_req_addr[`PA_WIDTH-1:7] == r_blk_addr);
+		    ((((l1_mem_req_opcode == 6'd7) || (l1_mem_req_opcode == 6'd8) ||
+		       (l1_mem_req_opcode == 6'd9)) && !w_l2_cacheable)
+`ifdef ENABLE_COHERENT_L1I
+		     || ((l1_mem_req_opcode == 6'd4) && w_l2_cacheable)
 `endif
+		     );
+   wire w_ci_ok = r_ci_ok && (l1_mem_req_addr[`PA_WIDTH-1:7] == r_blk_addr);
    input logic l2_nocache;
    input logic [15:0] l1_mem_req_mask;
    
@@ -200,12 +207,10 @@ module l2(clk,
    logic 	       r_blk_pend, n_blk_pend;
    logic [3:0] 	       r_blk_cnt, n_blk_cnt;
    logic 	       r_blk_l1i_req, n_blk_l1i_req;
-`ifdef ENABLE_COHERENT_L1I
-   /* coherent L1I: r_ci_wait = the L1I is dropping the block of the held L1D request;
+   /* r_ci_wait = the L1I is dropping the block of the held L1D request (w_ci_need);
     * r_ci_ok = it has (for the block in r_blk_addr), so the request may now be taken */
    logic 	       r_ci_wait, n_ci_wait;
    logic 	       r_ci_ok, n_ci_ok;
-`endif
    logic 	       r_blk_l1i_done, n_blk_l1i_done;
    assign l1i_blk_inv_req = r_blk_l1i_req;
    assign l1i_blk_inv_addr = {r_blk_addr, 7'd0};
@@ -451,10 +456,8 @@ module l2(clk,
 	     r_blk_way <= 1'b0;
 	     r_blk_l1i_req <= 1'b0;
 	     r_blk_l1i_done <= 1'b0;
-`ifdef ENABLE_COHERENT_L1I
 	     r_ci_wait <= 1'b0;
 	     r_ci_ok <= 1'b0;
-`endif
 `ifdef VERILATOR
 	     r_snoop_hit <= 64'd0;
 	     r_snoop_dirty <= 64'd0;
@@ -502,10 +505,8 @@ module l2(clk,
 	     r_blk_way <= n_blk_way;
 	     r_blk_l1i_req <= n_blk_l1i_req;
 	     r_blk_l1i_done <= n_blk_l1i_done;
-`ifdef ENABLE_COHERENT_L1I
 	     r_ci_wait <= n_ci_wait;
 	     r_ci_ok <= n_ci_ok;
-`endif
 `ifdef VERILATOR
 	     r_snoop_hit <= n_snoop_hit;
 	     r_snoop_dirty <= n_snoop_dirty;
@@ -789,10 +790,8 @@ module l2(clk,
 	n_blk_way = r_blk_way;
 	n_blk_l1i_req = 1'b0;
 	n_blk_l1i_done = r_blk_l1i_done | l1i_blk_inv_done;
-`ifdef ENABLE_COHERENT_L1I
 	n_ci_wait = r_ci_wait & !l1i_blk_inv_done;
 	n_ci_ok = r_ci_ok | (r_ci_wait & l1i_blk_inv_done);
-`endif
 	n_probe_req = r_probe_req;
 	n_probe_addr = r_probe_addr;
 	n_probe_colour = r_probe_colour;
@@ -932,12 +931,12 @@ module l2(clk,
 		    n_blk_cnt = r_blk_cnt + 4'd1;
 		    n_state = WAIT_FOR_RAM;
 		 end
-`ifdef ENABLE_COHERENT_L1I
 	       else if(l1_mem_req_valid && (r_ci_wait || (w_ci_need && !w_ci_ok)))
 		 begin
-		    /* the L1D is about to own the line (fill) or write around it (uncached
-		     * store): first drop its block from the L1I, holding the request (the L1
-		     * keeps it until the ack); nothing else is taken while the L1I works */
+		    /* the L1D is about to write around the line (uncached store) or own it
+		     * (fill, ENABLE_COHERENT_L1I): first drop its block from the L1I, holding
+		     * the request (the L1 keeps it until the ack); nothing else is taken
+		     * while the L1I works */
 		    if(!r_ci_wait)
 		      begin
 			 n_blk_l1i_req = 1'b1;
@@ -946,12 +945,9 @@ module l2(clk,
 			 n_ci_ok = 1'b0;
 		      end
 		 end
-`endif
 	       else if(l1_mem_req_valid)
 		 begin
-`ifdef ENABLE_COHERENT_L1I
 		    n_ci_ok = 1'b0;
-`endif
 		    if(is_blkop(l1_mem_req_opcode))
 		      begin
 			 /* R10000 block op: take it; the r_blk_pend arm above runs its lines */
