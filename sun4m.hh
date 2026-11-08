@@ -242,6 +242,11 @@ public:
   uint64_t next_event_icnt = ~0ULL;    /* the main loop calls timer_event() at this icnt */
   uint64_t next_event_ns = ~0ULL;      /* ... the time of that event */
   uint64_t time_bias_ns = 0;           /* time skipped while the CPU was halted */
+  /* an RTL co-simulation's clock (the kodiak testbench): when set, time is
+   * clock_ns(clock_ctx) + time_bias_ns, not the instruction count, so the C++
+   * timers count the RTL's cycles; next_event_ns says when timer_event is due */
+  uint64_t (*clock_ns)(void *ctx) = nullptr;
+  void *clock_ctx = nullptr;
   bool cpu_halted = false;             /* an APC (0xefa000000) write: halt until an interrupt */
   int64_t rtc_base = 1767225600;       /* the RTC at time 0: 2026-01-01T00:00:00 UTC (--rtc-base) */
   bool reset_req = false;              /* a SYS_RESET write: the main loop resets the machine */
@@ -273,7 +278,7 @@ public:
   /* the time a device access sees: qemu's icount clock has already counted
    * the instruction doing the I/O */
   uint64_t io_now_ns(const state_t *s) const {
-    return now_ns(s) + (1ULL << ns_shift);
+    return (clock_ns != nullptr) ? now_ns(s) : now_ns(s) + (1ULL << ns_shift);
   }
   /* halted: jump time to the next timer event and run it; false if none is due */
   bool warp_to_next_event(state_t *s);

@@ -888,6 +888,9 @@ static uint64_t ctr_wrap(const slavio_ctr_t &t) {
 }
 
 uint64_t sun4m_t::now_ns(const state_t *s) const {
+  if(clock_ns != nullptr) {
+    return clock_ns(clock_ctx) + time_bias_ns;
+  }
   return (s->icnt << ns_shift) + time_bias_ns;
 }
 
@@ -1501,7 +1504,8 @@ void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bu
     update_irqs(s);
     return;
   }
-  if(pa >= 0xef0800000ULL and pa < 0xef0800040ULL and size == 1) {
+  /* qemu esp_mem_accepts: byte accesses, and 4-byte writes (the low byte) */
+  if(pa >= 0xef0800000ULL and pa < 0xef0800040ULL and (size == 1 or size == 4)) {
     esp_write(static_cast<uint32_t>(pa - 0xef0800000ULL) >> 2, static_cast<uint8_t>(v));
     update_irqs(s);
     return;
