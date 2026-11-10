@@ -429,6 +429,16 @@ extern "C" void dirtydrop(unsigned long long cycle, long long pc, unsigned long 
 static uint64_t insns_retired = 0;
 static uint64_t pipestart = 0, pipeend = ~(0UL);
 static pipeline_logger *pl = nullptr;
+/* the instruction word at a pc for the pipeline log and the TIP report: through the
+ * checker ISS's MMU state (ss), since the RTL-side image is physical and a VA read
+ * there gives garbage once the MMU is on; the physical read when that fails */
+static uint32_t insn_at(uint32_t pc, const state_t *s) {
+  uint32_t iw = 0;
+  if(ss != nullptr and debug_fetch(ss, pc, &iw)) {
+    return iw;
+  }
+  return get_insn(pc, s);
+}
 static uint64_t l1d_misses = 0, l1d_insns = 0;
 static uint64_t last_retire_cycle = 0, last_retire_pc  = 0;
 
@@ -882,7 +892,7 @@ void record_retirement(long long pc, long long fetch_cycle, long long alloc_cycl
   
   if((pl != nullptr) and (record_insns_retired >= pipestart) and (record_insns_retired < pipeend)) {
     static const std::list<std::pair<uint64_t, char>> no_events;
-    pl->append(record_insns_retired, getAsmString(get_insn(pc, s), pc), pc, fetch_cycle, alloc_cycle, complete_cycle, retire_cycle, faulted,
+    pl->append(record_insns_retired, getAsmString(insn_at(pc, s), pc), pc, fetch_cycle, alloc_cycle, complete_cycle, retire_cycle, faulted,
 	       (pt::cur >= 0) ? pt::ev[pt::cur] : no_events);
   }
   pt::cur = -1;
@@ -1425,6 +1435,11 @@ int main(int argc, char **argv) {
     if(g_board and g_board->cpu_halted) {
       last_retire = 0;
     }
+    /* FLUSH_FOR_HALT (core state 0) walks the whole L2 before got_break: with a
+     * 512KB L2 that alone is ~2^16 cycles with nothing retiring */
+    if(tb->core_state == 0) {
+      last_retire = 0;
+    }
     if(last_retire > (1U<<16) && not(tb->in_flush_mode)) {
       std::cerr << "no retire in " << last_retire << " cycles, last retired "
 		<< std::hex << last_retired_pc << std::dec
@@ -1724,7 +1739,7 @@ int main(int argc, char **argv) {
       for(auto &p : tv) {
 	uint32_t pc = static_cast<uint32_t>(p.first);
 	tf << std::hex << p.first << std::dec << ":"
-	   << getAsmString(get_insn(pc, s), pc) << ","
+	   << getAsmString(insn_at(pc, s), pc) << ","
 	   << p.second << ","
 	   << (insns_retired ? (p.second / insns_retired) * 1000.0 : 0.0) << "\n";
       }

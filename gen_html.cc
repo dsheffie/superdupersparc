@@ -91,6 +91,7 @@ int main(int argc, char *argv[]) {
     ss << "{" << "\"str\":\""
        << hex << rec.pc << dec
        << " " << rec.disasm << "\""
+       << ",\"faulted\":" << (rec.faulted ? 1 : 0)
        << ",uops:[{"
        << "\"uuid\":"
        << "\"" << rec.uuid << "\","

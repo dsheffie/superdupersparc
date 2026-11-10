@@ -56,6 +56,7 @@ module uni_divider(clk,
 		   fp_src_a,
 		   fp_src_b,
 		   fp_rm,
+		   fp_ns,
 		   fp_rob_ptr_in,
 		   fp_dst_ptr_in,
 		   fp_wb_slot_used,
@@ -102,6 +103,7 @@ module uni_divider(clk,
    input logic [63:0]  fp_src_a;
    input logic [63:0]  fp_src_b;
    input logic [1:0]   fp_rm;		/* FCSR.RM (0=RN 1=RZ 2=RP 3=RM) */
+   input logic 	       fp_ns;		/* FSR.NS: flush denormals to zero (fp_nan.vh fp_ftz) */
    input logic [`LG_ROB_ENTRIES-1:0] fp_rob_ptr_in;
    input logic [`LG_PRF_ENTRIES-1:0] fp_dst_ptr_in;
    input logic 			     fp_wb_slot_used;
@@ -148,6 +150,7 @@ module uni_divider(clk,
    /* ---- FP metadata ---- */
    logic [`LG_PRF_ENTRIES-1:0] 	     r_fp_dst, n_fp_dst;
    logic [1:0] 			     r_rm, n_rm;
+   logic 			     r_ns, n_ns;
    logic 			     r_fmt, n_fmt;
    logic 			     r_fp_sign, n_fp_sign;
    logic signed [EW+2:0] 	     r_ebase, n_ebase;	/* biased result exponent (pre round-carry) */
@@ -206,18 +209,21 @@ module uni_divider(clk,
    wire        w_rs2 = (r_state == FP_RSQRT2);
    wire        w_rs2_dbl = r_fmt;
    wire        w_op_rsqrt = (fp_opcode == SP_RSQRT) || (fp_opcode == DP_RSQRT);
-   wire [63:0] w_in_a = w_rs2 ? (w_rs2_dbl ? 64'h3ff0000000000000 : 64'h000000003f800000) : fp_src_a;
-   wire [63:0] w_in_b = w_rs2 ? r_fp_y : fp_src_b;
    wire        w_is_sqrt_op = ~w_rs2 & ((fp_opcode == SP_SQRT) || (fp_opcode == DP_SQRT) || w_op_rsqrt);
    wire        w_fmt_op     = w_rs2 ? w_rs2_dbl :
 			      ((fp_opcode == DP_DIV) || (fp_opcode == DP_SQRT) ||
 			       (fp_opcode == DP_RECIP) || (fp_opcode == DP_RSQRT));
+   /* FSR.NS: a denormal operand reads as a zero of its sign */
+   wire [63:0] w_in_a = w_rs2 ? (w_rs2_dbl ? 64'h3ff0000000000000 : 64'h000000003f800000) :
+			fp_ns ? fp_ftz(fp_src_a, w_fmt_op) : fp_src_a;
+   wire [63:0] w_in_b = w_rs2 ? r_fp_y : fp_ns ? fp_ftz(fp_src_b, w_fmt_op) : fp_src_b;
 `else
    wire        w_op_rsqrt = 1'b0;
-   wire [63:0] w_in_a = fp_src_a;
-   wire [63:0] w_in_b = fp_src_b;
    wire        w_is_sqrt_op = (fp_opcode == SP_SQRT) || (fp_opcode == DP_SQRT);
    wire        w_fmt_op     = (fp_opcode == DP_DIV)  || (fp_opcode == DP_SQRT);
+   /* FSR.NS: a denormal operand reads as a zero of its sign */
+   wire [63:0] w_in_a = fp_ns ? fp_ftz(fp_src_a, w_fmt_op) : fp_src_a;
+   wire [63:0] w_in_b = fp_ns ? fp_ftz(fp_src_b, w_fmt_op) : fp_src_b;
 `endif
 
    wire        sgn_a = w_fmt_op ? w_in_a[63] : w_in_a[31];
@@ -358,6 +364,7 @@ module uni_divider(clk,
 	r_is_32b <= n_is_32b;
 	r_fp_dst <= n_fp_dst;
 	r_rm <= n_rm;
+	r_ns <= n_ns;
 	r_fmt <= n_fmt;
 	r_fp_sign <= n_fp_sign;
 	r_ebase <= n_ebase;
@@ -393,6 +400,7 @@ module uni_divider(clk,
 	n_is_32b = r_is_32b;
 	n_fp_dst = r_fp_dst;
 	n_rm = r_rm;
+	n_ns = r_ns;
 	n_fmt = r_fmt;
 	n_fp_sign = r_fp_sign;
 	n_ebase = r_ebase;
@@ -450,6 +458,7 @@ module uni_divider(clk,
 		    n_rob_ptr = fp_rob_ptr_in;
 		    n_fp_dst = fp_dst_ptr_in;
 		    n_rm = fp_rm;
+		    n_ns = fp_ns;
 		    n_fmt = w_fmt_op;
 		    n_fp_sign = w_sign;
 		    n_special = w_op_early | w_in_denorm;
@@ -618,14 +627,18 @@ module uni_divider(clk,
 
    /* special/early result (NaN/Inf/zero/DZ-inf) bypasses the arithmetic pack;
     * a denormal operand or an underflowing result raises E so the op traps. */
-   wire [63:0] w_y = r_special ? r_early_y : w_overflow ? ovf_y : norm_y;
+   wire [63:0] w_y_arith = r_special ? r_early_y : w_overflow ? ovf_y : norm_y;
    /* the unfinished_FPop punt (the same rule in interpret.cc fp_unfinished): any
     * denormal operand, or a nonzero exact result below the smallest normal
     * (tininess before rounding) */
    wire        w_tiny = w_arith & (r_ebase[EW+2] | ~(|r_ebase));
-   wire        w_denorm = r_inden | w_tiny;
-   wire        w_f_inexact = w_arith & (w_inexact | w_overflow);
-   wire [4:0]  w_fflags = {r_inv, r_dz, w_arith & w_overflow, w_arith & w_underflow, w_f_inexact};
+   /* FSR.NS: the operands arrive flushed, and a tiny result is a zero of its sign,
+    * underflowed and inexact */
+   wire        w_ftz = r_ns & w_tiny;
+   wire        w_denorm = r_inden | (w_tiny & ~r_ns);
+   wire [63:0] w_y = w_ftz ? (r_fmt ? {r_fp_sign, 63'd0} : {32'd0, r_fp_sign, 31'd0}) : w_y_arith;
+   wire        w_f_inexact = (w_arith & (w_inexact | w_overflow)) | w_ftz;
+   wire [4:0]  w_fflags = {r_inv, r_dz, w_arith & w_overflow, (w_arith & w_underflow) | w_ftz, w_f_inexact};
 
    logic [63:0] r_fp_y;
    logic [4:0] 	r_fp_fflags;

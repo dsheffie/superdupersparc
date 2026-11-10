@@ -879,7 +879,7 @@ module core_l1d_l1i(clk,
    wire [127:0] 	 w_probe_data;
 
    /* R10000 block op: the L2 has the L1I invalidate the block (l2.sv, l1i.sv) */
-   wire w_l1i_blk_inv_req, w_l1i_blk_inv_done;
+   wire w_l1i_blk_inv_req, w_l1i_blk_inv_done, w_l1i_blk_inv_line;
    wire [`PA_WIDTH-1:0] w_l1i_blk_inv_addr;
    l2 l2cache (
 	       .clk(clk),
@@ -939,6 +939,7 @@ module core_l1d_l1i(clk,
 	       .probe_data(w_probe_data),
 	       .l1i_blk_inv_req(w_l1i_blk_inv_req),
 	       .l1i_blk_inv_addr(w_l1i_blk_inv_addr),
+	       .l1i_blk_inv_line(w_l1i_blk_inv_line),
 	       .l1i_blk_inv_done(w_l1i_blk_inv_done)
 	       );
    
@@ -1151,6 +1152,7 @@ module core_l1d_l1i(clk,
 	      .flush_line_complete(w_l1i_flush_line_complete),
 	      .blk_inv_req(w_l1i_blk_inv_req),
 	      .blk_inv_addr(w_l1i_blk_inv_addr),
+	      .blk_inv_line(w_l1i_blk_inv_line),
 	      .blk_inv_done(w_l1i_blk_inv_done),
 	      .flush_complete(l1i_flush_complete),
 	      .restart_pc(restart_pc),
@@ -1564,6 +1566,42 @@ module core_l1d_l1i(clk,
      end
 `endif
 
+`ifdef VERILATOR
+   /* address-translation stall accounting (sim only): cycles with a D-side walk
+    * in flight (l1d tlb_busy) or the fetch waiting on an I-side one (l1i
+    * WAIT_FOR_TLB), and the part of each in which nothing retired */
+   longint unsigned c_cyc, c_dwalk, c_iwalk, c_anywalk, c_nr, c_nr_dwalk, c_nr_iwalk, c_nr_anywalk;
+   wire w_iwalk = (l1i_state == 4'd8);
+   wire w_noret = !(retire_valid | retire_two_valid);
+   wire w_anywalk = w_tlb_busy | w_iwalk;
+   wire w_nr_dwalk = w_noret & w_tlb_busy;
+   wire w_nr_iwalk = w_noret & w_iwalk;
+   wire w_nr_anywalk = w_noret & w_anywalk;
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     c_cyc <= 0; c_dwalk <= 0; c_iwalk <= 0; c_anywalk <= 0;
+	     c_nr <= 0; c_nr_dwalk <= 0; c_nr_iwalk <= 0; c_nr_anywalk <= 0;
+	  end
+	else
+	  begin
+	     c_cyc <= c_cyc + 1;
+	     c_dwalk <= c_dwalk + 64'(w_tlb_busy);
+	     c_iwalk <= c_iwalk + 64'(w_iwalk);
+	     c_anywalk <= c_anywalk + 64'(w_anywalk);
+	     c_nr <= c_nr + 64'(w_noret);
+	     c_nr_dwalk <= c_nr_dwalk + 64'(w_nr_dwalk);
+	     c_nr_iwalk <= c_nr_iwalk + 64'(w_nr_iwalk);
+	     c_nr_anywalk <= c_nr_anywalk + 64'(w_nr_anywalk);
+	  end
+     end
+   final
+     begin
+	$display("[XLAT] cycles %0d: walk in flight D %0d I %0d any %0d; no-retire %0d, of which walk in flight D %0d I %0d any %0d",
+		 c_cyc, c_dwalk, c_iwalk, c_anywalk, c_nr, c_nr_dwalk, c_nr_iwalk, c_nr_anywalk);
+     end
+`endif
 endmodule // core_l1d_l1i
 
 

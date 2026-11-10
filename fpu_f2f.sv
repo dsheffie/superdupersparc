@@ -6,10 +6,11 @@
 
 `include "fp_nan.vh"
 
-module fpu_f2f(in, to_double, rm, out, denorm, fflags);
+module fpu_f2f(in, to_double, rm, ns, out, denorm, fflags);
    input  logic [63:0] in;
    input  logic        to_double;
    input  logic [1:0]  rm;
+   input  logic        ns;              // FSR.NS: denormals flush to zero, no punt
    output logic [63:0] out;
    output logic        denorm;
    output logic [4:0]  fflags;          // {V,Z,O,U,I}
@@ -41,7 +42,8 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    wire [63:0] 	 wide_zero = {s_sign, 63'd0};
    wire [10:0] 	 wide_exp  = {3'd0, s_exp} + 11'd896;   // bias 1023 - 127
    wire [63:0] 	 wide_norm = {s_sign, wide_exp, s_frac, 29'd0};
-   wire [63:0] 	 wide_y = s_nan ? wide_nan : s_inf ? wide_inf : s_zero ? wide_zero : wide_norm;
+   /* FSR.NS: a denormal single widens to a zero of its sign */
+   wire [63:0] 	 wide_y = s_nan ? wide_nan : s_inf ? wide_inf : (s_zero | (ns & s_den)) ? wide_zero : wide_norm;
 
    // ===== narrow f64 -> f32 (round 52->23) =====
    wire [31:0] 	 narrow_nan  = {d_sign, 8'hff, 1'b1, d_frac[50:29]};         /* the payload's top, quieted */
@@ -76,16 +78,20 @@ module fpu_f2f(in, to_double, rm, out, denorm, fflags);
    wire 	 n_is_special = d_nan | d_inf | d_zero;
    /* the unfinished_FPop punt: a denormal operand, or a value below the smallest
     * single normal before rounding (interpret.cc fp_unfinished) */
-   wire 	 narrow_denorm = d_den | (~n_is_special & (n_e <= 13'sd0));
+   wire 	 narrow_tiny = ~d_den & ~n_is_special & (n_e <= 13'sd0);
+   wire 	 narrow_denorm = d_den | narrow_tiny;
+   /* FSR.NS: a denormal operand reads as zero (exact, no flags); a tiny result is
+    * a zero of its sign, underflowed and inexact */
+   wire 	 narrow_ftz = ~to_double & ns & narrow_tiny;
 
    // ===== select =====
-   assign out = to_double ? wide_y : {32'd0, narrow_y32};
-   assign denorm = to_double ? s_den : narrow_denorm;
+   assign out = to_double ? wide_y : (ns & narrow_denorm) ? {32'd0, narrow_zero} : {32'd0, narrow_y32};
+   assign denorm = ~ns & (to_double ? s_den : narrow_denorm);
 
    wire 	 w_invalid  = to_double ? s_snan : d_snan;
    wire 	 w_overflow = ~to_double & ~n_is_special & n_overflow;
    wire 	 w_inexact  = to_double ? 1'b0
 		 : (~n_is_special & ~n_underflow & (n_inexact | n_overflow));
-   assign fflags = {w_invalid, 1'b0, w_overflow, 1'b0, w_inexact};
+   assign fflags = {w_invalid, 1'b0, w_overflow, narrow_ftz, w_inexact | narrow_ftz};
 
 endmodule // fpu_f2f

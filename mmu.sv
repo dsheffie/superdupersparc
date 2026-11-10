@@ -164,7 +164,11 @@ module mmu(clk,
 	     if(reg_sel == 3'd0)
 	       begin
 		  n_ctrl = reg_wdata & 32'h00ffffff;
-		  n_tlb_flush = 1'b1;
+		  /* only E (translation on/off) and BM (boot mode) change what a TLB
+		   * entry means.  Solaris toggles NF around every user window spill
+		   * and fill (~600 control writes per 10M insns in li): those keep
+		   * the TLBs */
+		  n_tlb_flush = (reg_wdata[0] != r_ctrl[0]) | (reg_wdata[13] != r_ctrl[13]);
 	       end
 	     else if(reg_sel == 3'd1)
 	       begin
@@ -248,6 +252,7 @@ module mmu(clk,
    /* ---- walker ---- */
    typedef enum logic [2:0] {
 			     IDLE,
+			     LOOKUP,
 			     RD,
 			     RD_WAIT,
 			     WR,
@@ -271,6 +276,56 @@ module mmu(clk,
    logic r_mem_store, n_mem_store;
    logic r_lock, n_lock;
    logic r_l1i_rsp, n_l1i_rsp, r_l1d_rsp, n_l1d_rsp;
+
+   /* ---- the walker's caches ----
+    * Second-level TLB: level-3 (4KB) PTEs of completed walks, indexed by
+    * VA[19:12] ^ ctx, tagged {ctx, VA[31:12]}.  Walk cache: level-2 PTDs (the
+    * level-3 table's pointer), indexed by VA[22:18], tagged {ctx, VA[31:18]}.
+    * Both are looked up in LOOKUP (the cycle after a request is taken: their
+    * reads are registered); probes and mark walks skip them (a probe answers
+    * from memory, as interpret.cc srmmu_probe; a mark walk must write M).
+    * Invalidation (the TLB flush cases): every tlb_flush -- an ASI 3 store, a
+    * control write that changes E or BM, a table-pointer write -- and reset
+    * clear both.  A context write does not: entries carry their context.  A walk
+    * in flight across a flush fills neither (r_nofill).  The walk's context is
+    * latched when it starts (r_wctx). */
+   localparam LG_L2T = `LG_L2TLB_ENTRIES;
+   localparam LG_WC = `LG_WALKC_ENTRIES;
+   localparam L2T_ON = (LG_L2T != 0);
+   localparam WC_ON = (LG_WC != 0);
+   localparam LG_L2T_A = L2T_ON ? LG_L2T : 1;
+   localparam LG_WC_A = WC_ON ? LG_WC : 1;
+   typedef struct packed {
+      logic [`SRMMU_CTX_BITS-1:0] ctx;
+      logic [19:0] 		  tag;    /* VA[31:12] */
+      logic [31:0] 		  pte;
+   } l2t_ent_t;
+   typedef struct packed {
+      logic [`SRMMU_CTX_BITS-1:0] ctx;
+      logic [13:0] 		  tag;    /* VA[31:18] */
+      logic [31:0] 		  ptd;
+   } wc_ent_t;
+   l2t_ent_t r_l2t[(1<<LG_L2T_A)-1:0];
+   wc_ent_t r_wc[(1<<LG_WC_A)-1:0];
+   l2t_ent_t r_l2t_q;
+   wc_ent_t r_wc_q;
+   logic [(1<<LG_L2T_A)-1:0] r_l2t_v;
+   logic [(1<<LG_WC_A)-1:0] r_wc_v;
+   logic [`SRMMU_CTX_BITS-1:0] r_wctx, n_wctx;
+   logic r_nofill, n_nofill;
+   logic t_l2t_wr, t_wc_wr;
+   function automatic logic [LG_L2T_A-1:0] l2t_idx(input logic [31:0] va, input logic [`SRMMU_CTX_BITS-1:0] c);
+      begin
+	 l2t_idx = LG_L2T_A'(va[31:12]) ^ LG_L2T_A'(c);
+      end
+   endfunction
+   function automatic logic [LG_WC_A-1:0] wc_idx(input logic [31:0] va);
+      begin
+	 wc_idx = LG_WC_A'(va[31:18]);
+      end
+   endfunction
+   wire w_l2t_hit = L2T_ON & r_l2t_v[l2t_idx(r_va, r_wctx)] & (r_l2t_q.ctx == r_wctx) & (r_l2t_q.tag == r_va[31:12]);
+   wire w_wc_hit = WC_ON & r_wc_v[wc_idx(r_va)] & (r_wc_q.ctx == r_wctx) & (r_wc_q.tag == r_va[31:18]);
 
    /* the PTE word at r_ea in a 128-bit line: bus word k holds the bytes at
     * line+4k little-endian, so the big-endian entry is that word byte-swapped */
@@ -335,6 +390,10 @@ module mmu(clk,
 	n_lock = r_lock;
 	n_l1i_rsp = 1'b0;
 	n_l1d_rsp = 1'b0;
+	n_wctx = r_wctx;
+	n_nofill = r_nofill | r_tlb_flush;
+	t_l2t_wr = 1'b0;
+	t_wc_wr = 1'b0;
 	if(mem_req_ack)
 	  begin
 	     n_mem_req = 1'b0;
@@ -353,7 +412,10 @@ module mmu(clk,
 		    n_do_probe = l1d_probe;
 		    n_do_l1i = 1'b0;
 		    n_va = l1d_va;
-		    n_state = RD;
+		    n_wctx = r_ctx;
+		    n_nofill = r_tlb_flush;
+		    /* probes and mark walks go to memory */
+		    n_state = (l1d_mark | l1d_probe) ? RD : LOOKUP;
 		 end
 	       else if(n_l1i_req)
 		 begin
@@ -362,6 +424,30 @@ module mmu(clk,
 		    n_do_probe = 1'b0;
 		    n_do_l1i = 1'b1;
 		    n_va = l1i_va;
+		    n_wctx = r_ctx;
+		    n_nofill = r_tlb_flush;
+		    n_state = LOOKUP;
+		 end
+	    end
+	  LOOKUP:
+	    begin
+	       /* r_l2t_q / r_wc_q were read with this walk's VA.  A flush since the
+		* walk started (its valid bits clear a cycle later) is a miss */
+	       if(w_l2t_hit & !(r_nofill | r_tlb_flush))
+		 begin
+		    n_pte = r_l2t_q.pte;
+		    n_level = 2'd3;
+		    n_state = DONE;
+		 end
+	       else if(w_wc_hit & !(r_nofill | r_tlb_flush))
+		 begin
+		    /* straight to the level-3 entry: PTD << 4 + 4 * VA[17:12] */
+		    n_ea = {r_wc_q.ptd[31:2], 6'd0} + {26'd0, 2'd0, r_va[17:12], 2'd0};
+		    n_level = 2'd3;
+		    n_state = RD;
+		 end
+	       else
+		 begin
 		    n_state = RD;
 		 end
 	    end
@@ -393,6 +479,8 @@ module mmu(clk,
 		      end
 		    else if((w_entry[1:0] == 2'd1) && (r_level != 2'd3))
 		      begin
+			 /* a level-2 PTD: the walk cache's entry for this 256KB */
+			 t_wc_wr = WC_ON & (r_level == 2'd2) & !r_do_probe & !n_nofill;
 			 n_ea = w_next_ea;
 			 n_level = r_level + 2'd1;
 			 n_lock = 1'b0;
@@ -421,6 +509,9 @@ module mmu(clk,
 	    end
 	  DONE:
 	    begin
+	       /* a completed 4KB translation (as written back: R, and M for a mark
+		* walk) goes into the second-level TLB */
+	       t_l2t_wr = L2T_ON & !r_fault & !r_do_probe & (r_level == 2'd3) & !n_nofill;
 	       n_lock = 1'b0;
 	       n_l1i_rsp = r_do_l1i;
 	       n_l1d_rsp = !r_do_l1i;
@@ -461,9 +552,48 @@ module mmu(clk,
 	r_do_l1i <= n_do_l1i;
 	r_do_mark <= n_do_mark;
 	r_do_probe <= n_do_probe;
+	r_wctx <= n_wctx;
 	r_fault <= n_fault;
 	r_ft <= n_ft;
 	r_mem_store <= n_mem_store;
+     end // always_ff@ (posedge clk)
+
+   /* the walker caches: registered reads with the next VA (valid in LOOKUP),
+    * one write port each; the valid bits are flops so a flush clears them at once */
+   always_ff@(posedge clk)
+     begin
+	r_l2t_q <= r_l2t[l2t_idx(n_va, n_wctx)];
+	r_wc_q <= r_wc[wc_idx(n_va)];
+	if(t_l2t_wr)
+	  begin
+	     r_l2t[l2t_idx(r_va, r_wctx)] <= '{ctx: r_wctx, tag: r_va[31:12], pte: r_pte};
+	  end
+	if(t_wc_wr)
+	  begin
+	     r_wc[wc_idx(r_va)] <= '{ctx: r_wctx, tag: r_va[31:18], ptd: w_entry};
+	  end
+     end // always_ff@ (posedge clk)
+
+   always_ff@(posedge clk)
+     begin
+	if(reset | sys_reset | r_tlb_flush)
+	  begin
+	     r_l2t_v <= 'd0;
+	     r_wc_v <= 'd0;
+	     r_nofill <= 1'b1;
+	  end
+	else
+	  begin
+	     r_nofill <= n_nofill;
+	     if(t_l2t_wr)
+	       begin
+		  r_l2t_v[l2t_idx(r_va, r_wctx)] <= 1'b1;
+	       end
+	     if(t_wc_wr)
+	       begin
+		  r_wc_v[wc_idx(r_va)] <= 1'b1;
+	       end
+	  end
      end // always_ff@ (posedge clk)
 
 `ifdef VERILATOR
@@ -478,4 +608,37 @@ module mmu(clk,
      end
 `endif
 
+`ifdef VERILATOR
+   /* walker accounting (sim only): requests by side, how each was answered, the
+    * memory reads they cost and the cycles the walker was busy */
+   longint unsigned c_req_i, c_req_d, c_l2t_hit, c_wc_hit, c_full, c_rd, c_busy, c_probe_mark;
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     c_req_i <= 0; c_req_d <= 0; c_l2t_hit <= 0; c_wc_hit <= 0; c_full <= 0; c_rd <= 0; c_busy <= 0; c_probe_mark <= 0;
+	  end
+	else
+	  begin
+	     if((r_state == IDLE) && (n_state != IDLE))
+	       begin
+		  if(n_do_l1i) c_req_i <= c_req_i + 1; else c_req_d <= c_req_d + 1;
+		  if(n_state == RD) c_probe_mark <= c_probe_mark + 1;
+	       end
+	     if(r_state == LOOKUP)
+	       begin
+		  if(n_state == DONE) c_l2t_hit <= c_l2t_hit + 1;
+		  else if(n_level == 2'd3) c_wc_hit <= c_wc_hit + 1;
+		  else c_full <= c_full + 1;
+	       end
+	     if(r_state == RD) c_rd <= c_rd + 1;
+	     if(r_state != IDLE) c_busy <= c_busy + 1;
+	  end
+     end
+   final
+     begin
+	$display("[WALK] requests I %0d D %0d; L2TLB hits %0d, walk-cache hits %0d, full walks %0d, probe/mark %0d; PTE reads %0d; walker busy cycles %0d",
+		 c_req_i, c_req_d, c_l2t_hit, c_wc_hit, c_full, c_probe_mark, c_rd, c_busy);
+     end
+`endif
 endmodule // mmu

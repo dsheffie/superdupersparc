@@ -25,6 +25,7 @@ typedef struct packed {
    logic       valid_fcr_dst;  /* dst is an FCR (FP cond-code) physical reg; pdst/old_pdst hold the FCR ptr */
    logic       has_delay_slot;
    logic       has_nullifying_delay_slot;
+   logic       annul_skip;   /* uop.vh: a b<cond>,a whose slot fetch skipped */
    logic       in_delay_slot;
    logic       dcti;   /* a CTI in another CTI's delay slot: retires as a mispredict (core.sv) */
    logic       valid_flags_dst;   /* SPARC: writes icc (icc_pdst, the icc rename) */
@@ -106,6 +107,7 @@ typedef struct packed {
    logic valid_fcr_dst;
    logic has_delay_slot;
    logic has_nullifying_delay_slot;
+   logic annul_skip;
    logic in_delay_slot;
    logic dcti;
    logic valid_flags_dst;

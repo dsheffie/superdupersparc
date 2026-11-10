@@ -442,6 +442,9 @@ typedef struct packed {
      
    logic 		       has_delay_slot;
    logic 		       has_nullifying_delay_slot;
+   /* SPARC b<cond>,a predicted not taken: fetch skipped its (annulled) slot, so it
+    * has none in the stream; taken, it restarts into the slot (core.sv) */
+   logic 		       annul_skip;
    logic [15:0] 	       imm;
    logic [`M_WIDTH-17:0]       jmp_imm;
    logic [`M_WIDTH-1:0]        pc;

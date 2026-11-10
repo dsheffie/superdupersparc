@@ -637,6 +637,7 @@ module core(clk,
       r.valid_fcr_dst = e.valid_fcr_dst;
       r.has_delay_slot = e.has_delay_slot;
       r.has_nullifying_delay_slot = e.has_nullifying_delay_slot;
+      r.annul_skip = e.annul_skip;
       r.in_delay_slot = e.in_delay_slot;
       r.dcti = e.dcti;
       r.valid_flags_dst = e.valid_flags_dst;
@@ -722,6 +723,7 @@ module core(clk,
       r.valid_fcr_dst = m.valid_fcr_dst;
       r.has_delay_slot = m.has_delay_slot;
       r.has_nullifying_delay_slot = m.has_nullifying_delay_slot;
+      r.annul_skip = m.annul_skip;
       r.in_delay_slot = m.in_delay_slot;
       r.dcti = m.dcti;
       r.valid_flags_dst = m.valid_flags_dst;
@@ -2475,6 +2477,15 @@ module core(clk,
 					t_rob_head.take_br ? t_rob_head.target_pc : (r_last_branch_target + 'd4);
 			 n_restart_src_pc = t_rob_head.pc;
 			 n_restart_src_is_indirect = t_rob_head.is_indirect && !t_rob_head.is_ret;
+			 if(!t_arch_fault & t_rob_head.annul_skip & t_rob_head.take_br)
+			   begin
+			      /* a b<cond>,a predicted not taken whose slot fetch skipped,
+			       * taken after all: the slot, then the target (as a restart
+			       * into a delay slot: PC = pc + 4, nPC = the target) */
+			      n_restart_pc = t_rob_head.pc + 'd4;
+			      n_restart_npc = t_rob_head.target_pc;
+			      n_restart_npc_valid = 1'b1;
+			   end
 			 
 			 n_has_delay_slot = t_rob_head.has_delay_slot;
 			 n_has_nullifying_delay_slot = t_rob_head.has_nullifying_delay_slot;
@@ -3648,9 +3659,11 @@ module core(clk,
 	
 	t_rob_tail.has_delay_slot = t_alloc_uop.has_delay_slot;
 	t_rob_tail.has_nullifying_delay_slot = t_alloc_uop.has_nullifying_delay_slot;
+	t_rob_tail.annul_skip = t_alloc_uop.annul_skip;
 
 	t_rob_next_tail.has_delay_slot = t_uop2.has_delay_slot;
 	t_rob_next_tail.has_nullifying_delay_slot = t_uop2.has_nullifying_delay_slot;
+	t_rob_next_tail.annul_skip = t_uop2.annul_skip;
 `ifdef ENABLE_CYCLE_ACCOUNTING
 	// unconditional defaults so the cycle fields never infer a latch (only assigned in if(t_alloc)/if(t_alloc_two) below)
 	t_rob_tail.fetch_cycle = t_alloc_uop.fetch_cycle;

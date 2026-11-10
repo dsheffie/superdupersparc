@@ -13,7 +13,7 @@ module fpu_mul(/*AUTOARG*/
    // Outputs
    y, denorm, fflags,
    // Inputs
-   clk, a, b, en, rm, fmt
+   clk, a, b, en, rm, ns, fmt
    );
    parameter MUL_LAT = 4;
 
@@ -22,6 +22,7 @@ module fpu_mul(/*AUTOARG*/
    input logic [63:0] b;
    input logic 	      en;
    input logic [1:0]  rm;
+   input logic 	      ns;   /* FSR.NS: a tiny result -> a signed zero (UF, NX), no punt */
    input logic 	      fmt;
    output logic [63:0] y;
    output logic        denorm;
@@ -71,11 +72,12 @@ module fpu_mul(/*AUTOARG*/
    logic [EW-1:0] r1_expa, r1_expb;
    logic 	r1_sign, r1_fmt, r1_evalid, r1_special, r1_inv, r1_inden;
    logic [1:0] 	r1_rm;
+   logic 	r1_ns;
    logic [63:0] r1_early;
    always_ff @(posedge clk)
      begin
 	r1_siga <= sig_a; r1_sigb <= sig_b; r1_expa <= exp_a; r1_expb <= exp_b;
-	r1_sign <= w_sign; r1_fmt <= fmt; r1_rm <= rm;
+	r1_sign <= w_sign; r1_fmt <= fmt; r1_rm <= rm; r1_ns <= ns;
 	r1_evalid <= s1_early_valid; r1_special <= special; r1_inv <= s1_invalid;
 	r1_inden <= s1_in_denorm; r1_early <= s1_early_y;
      end
@@ -87,11 +89,12 @@ module fpu_mul(/*AUTOARG*/
    logic [EW-1:0]   r2_expa, r2_expb;
    logic 	    r2_sign, r2_fmt, r2_evalid, r2_special, r2_inv, r2_inden;
    logic [1:0] 	    r2_rm;
+   logic 	    r2_ns;
    logic [63:0]     r2_early;
    always_ff @(posedge clk)
      begin
 	r2_prod <= s2_prod; r2_expa <= r1_expa; r2_expb <= r1_expb;
-	r2_sign <= r1_sign; r2_fmt <= r1_fmt; r2_rm <= r1_rm;
+	r2_sign <= r1_sign; r2_fmt <= r1_fmt; r2_rm <= r1_rm; r2_ns <= r1_ns;
 	r2_evalid <= r1_evalid; r2_special <= r1_special; r2_inv <= r1_inv;
 	r2_inden <= r1_inden; r2_early <= r1_early;
      end
@@ -110,12 +113,13 @@ module fpu_mul(/*AUTOARG*/
    logic [FW:0] r3_sig;
    logic 	r3_gd, r3_rd, r3_sd, r3_sign, r3_fmt, r3_evalid, r3_special, r3_inv, r3_inden;
    logic [1:0] 	r3_rm;
+   logic 	r3_ns;
    logic signed [EW+2:0] r3_ebase;
    logic [63:0] r3_early;
    always_ff @(posedge clk)
      begin
 	r3_sig <= s3_sig; r3_gd <= s3_gd; r3_rd <= s3_rd; r3_sd <= s3_sd;
-	r3_sign <= r2_sign; r3_fmt <= r2_fmt; r3_rm <= r2_rm; r3_ebase <= s3_ebase;
+	r3_sign <= r2_sign; r3_fmt <= r2_fmt; r3_rm <= r2_rm; r3_ns <= r2_ns; r3_ebase <= s3_ebase;
 	r3_evalid <= r2_evalid; r3_special <= r2_special; r3_inv <= r2_inv;
 	r3_inden <= r2_inden; r3_early <= r2_early;
      end
@@ -161,10 +165,13 @@ module fpu_mul(/*AUTOARG*/
     * denormal operand, or a nonzero exact result below the smallest normal
     * (tininess before rounding) */
    wire 	w_tiny = w_arith & (r3_ebase[EW+2] | ~(|r3_ebase));
-   wire 	w_denorm = r3_inden | (~r3_special & w_tiny);
-   wire 	w_f_inexact  = w_arith & (w_inexact | w_overflow);
+   /* FSR.NS: the operands arrive flushed (fpu.sv fp_ftz), and a tiny result is a
+    * zero of its sign, underflowed and inexact */
+   wire 	w_ftz = r3_ns & ~r3_special & w_tiny;
+   wire 	w_denorm = r3_inden | (~r3_special & w_tiny & ~r3_ns);
+   wire 	w_f_inexact  = (w_arith & (w_inexact | w_overflow)) | w_ftz;
    wire 	w_f_overflow = w_overflow;
-   wire 	w_f_underflow = w_underflow;
+   wire 	w_f_underflow = w_underflow | w_ftz;
    wire [4:0] 	w_fflags = {r3_inv, 1'b0, w_f_overflow, w_f_underflow, w_f_inexact};
 
    logic [63:0] r4_y;
@@ -172,7 +179,8 @@ module fpu_mul(/*AUTOARG*/
    logic [4:0] 	r4_fflags;
    always_ff @(posedge clk)
      begin
-	r4_y <= w_y; r4_denorm <= w_denorm; r4_fflags <= w_fflags;
+	r4_y <= w_ftz ? (r3_fmt ? {r3_sign, 63'd0} : {32'd0, r3_sign, 31'd0}) : w_y;
+	r4_denorm <= w_denorm; r4_fflags <= w_fflags;
      end
    assign y = r4_y;
    assign denorm = r4_denorm;

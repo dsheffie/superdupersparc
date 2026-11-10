@@ -65,6 +65,7 @@ module l2(clk,
 	  // R10000 block op: invalidate the block in the L1I
 	  l1i_blk_inv_req,
 	  l1i_blk_inv_addr,
+	  l1i_blk_inv_line,
 	  l1i_blk_inv_done
 	  );
 
@@ -91,19 +92,19 @@ module l2(clk,
     * handlers still run (find an empty L2, ack/write through).  l2_nocache=0 => normal L2.  Set
     * before-go only, so no mid-run flush needed (no lines exist to go stale). Was `ENABLE_L2_NOCACHE. */
    wire w_l2_cacheable = l1_mem_req_cacheable & (~l2_nocache | (l1_mem_req_opcode >= 6'd24));
-   /* the L1I drops the block of an L1D request first (r_ci_wait/r_ci_ok below)
-    * when the L1D writes around the caches: an uncached store or atomic, which
-    * the L1I would otherwise keep a stale copy of (OBP patches code with the
-    * caches disabled, MCR.IE clear, and so issues no FLUSH).  With
-    * ENABLE_COHERENT_L1I, also before an L1D fill (r9999's coherent L1I). */
-   wire w_ci_need = l1_mem_req_from_d && !is_blkop(l1_mem_req_opcode) &&
-		    ((((l1_mem_req_opcode == 6'd7) || (l1_mem_req_opcode == 6'd8) ||
-		       (l1_mem_req_opcode == 6'd9)) && !w_l2_cacheable)
-`ifdef ENABLE_COHERENT_L1I
-		     || ((l1_mem_req_opcode == 6'd4) && w_l2_cacheable)
-`endif
-		     );
-   wire w_ci_ok = r_ci_ok && (l1_mem_req_addr[`PA_WIDTH-1:7] == r_blk_addr);
+   /* L1I presence (pi, ipres_ram below): the L1I may hold this L2 line.  Kept so
+    * that the L1I holds a line only while the L2 does, with pi set -- the L1I is
+    * inclusive in the L2 -- so the L2 drops a line from the L1I (one line, every
+    * L1I colour) exactly when it must:
+    *  - before it replaces or invalidates an entry with pi set, for any reason (the
+    *    tag RAM keeps the old tag when an entry is invalidated, so the drop names
+    *    the right line even then; a flush leaves pi for the next access to drop);
+    *  - before an uncached store or atomic writes around a line the L1I may hold
+    *    (OBP patches code with the caches disabled, MCR.IE clear, and no FLUSH);
+    *  - with ENABLE_COHERENT_L1I, before an L1D fill of such a line (a line lives
+    *    in the L1I XOR the L1D).
+    * A line the L2 does not hold, or holds with pi clear, is in no L1I: an L1D
+    * miss on data no longer waits for an L1I walk. */
    input logic l2_nocache;
    input logic [15:0] l1_mem_req_mask;
    
@@ -162,6 +163,10 @@ module l2(clk,
     * waits for the L1I's done */
    output logic 	      l1i_blk_inv_req;
    output logic [`PA_WIDTH-1:0] l1i_blk_inv_addr;
+   /* with l1i_blk_inv_req: drop only the line at l1i_blk_inv_addr (at every colour),
+    * not its 128-byte block -- the coherence drop before an L1D fill or write-around,
+    * which concerns one line (a block op still clears the block) */
+   output logic 		      l1i_blk_inv_line;
    input logic 		      l1i_blk_inv_done;
    logic 		      r_probe_req, n_probe_req;
    logic [`PA_WIDTH-1:0]      r_probe_addr, n_probe_addr;
@@ -220,14 +225,17 @@ module l2(clk,
    logic 	       r_blk_pend, n_blk_pend;
    logic [3:0] 	       r_blk_cnt, n_blk_cnt;
    logic 	       r_blk_l1i_req, n_blk_l1i_req;
-   /* r_ci_wait = the L1I is dropping the block of the held L1D request (w_ci_need);
-    * r_ci_ok = it has (for the block in r_blk_addr), so the request may now be taken */
-   logic 	       r_ci_wait, n_ci_wait;
-   logic 	       r_ci_ok, n_ci_ok;
+   /* the CHECK_VALID_AND_TAG L1I drop (pi): requested and waiting, and done for
+    * this request (as r_probe_req / r_probed for the L1D) */
+   logic 	       r_idrop_wait, n_idrop_wait;
+   logic 	       r_idropped, n_idropped;
    logic 	       r_blk_l1i_done, n_blk_l1i_done;
    assign l1i_blk_inv_req = r_blk_l1i_req;
-   assign l1i_blk_inv_addr = {r_blk_addr, 7'd0};
    logic [`PA_WIDTH-1:7] r_blk_addr, n_blk_addr;
+   logic [2:0] 	       r_ci_lsel, n_ci_lsel;   /* the coherence drop's line in r_blk_addr */
+   logic 	       r_inv_line, n_inv_line;   /* the L1I drop in flight is that one line */
+   assign l1i_blk_inv_addr = {r_blk_addr, r_inv_line ? r_ci_lsel : 3'd0, 4'd0};
+   assign l1i_blk_inv_line = r_inv_line;
    logic [5:0] 	       r_blk_op, n_blk_op;
    logic 	       r_blk_way, n_blk_way;
    function automatic logic is_blkop(logic [5:0] op);
@@ -399,6 +407,12 @@ module l2(clk,
    reg_ram1rw #(.WIDTH(N_PIDX+1), .LG_DEPTH(LG_L2_LINES)) pres_ram
      (.clk(clk), .addr(t_idx), .wr_data(t_pres), .wr_en(t_wr_pres), .rd_data(w_pres));
 
+   /* L1I presence (pi, see w_l2_cacheable's comment above): set by an L1I fill,
+    * cleared by the L1I drop that precedes anything else the line meets */
+   logic 		t_ipres, w_ipres, t_wr_ipres;
+   reg_ram1rw #(.WIDTH(1), .LG_DEPTH(LG_L2_LINES)) ipres_ram
+     (.clk(clk), .addr(t_idx), .wr_data(t_ipres), .wr_en(t_wr_ipres), .rd_data(w_ipres));
+
 `ifdef VERILATOR
    /* sim-only per-index history, read by the PRESCHK inclusion checker: the last
     * valid/tag write and the last presence write of each L2 index */
@@ -417,6 +431,15 @@ module l2(clk,
    int 	        dbg_p_val [1 << LG_L2_LINES];
 `endif
    wire 		w_hit = w_valid ? (r_tag == w_tag) : 1'b0;
+   /* drop the resident line from the L1I first (pi): for anything but an L1I fill
+    * that hits it (which keeps it) and a block op (which clears the whole block in
+    * the L1I itself); without ENABLE_COHERENT_L1I an L1D fill may share it too */
+   wire 		w_idrop_need = w_ipres && !r_idropped && !is_blkop(r_opcode) &&
+			       !(!r_from_d && !r_is_uncache && w_hit && (r_opcode == 6'd4))
+`ifndef ENABLE_COHERENT_L1I
+			       && !(r_from_d && !r_is_uncache && w_hit && (r_opcode == 6'd4))
+`endif
+			       ;
    /* stage C2 alias (push, the R10000 PIdx scheme): an L1D request for a line the L1D
     * holds at a DIFFERENT colour -- probe that copy out first (it comes back if dirty).
     * Only for ops whose line the L1D did not supply itself: a fill (LW), an invalidate
@@ -476,8 +499,10 @@ module l2(clk,
 	     r_blk_way <= 1'b0;
 	     r_blk_l1i_req <= 1'b0;
 	     r_blk_l1i_done <= 1'b0;
-	     r_ci_wait <= 1'b0;
-	     r_ci_ok <= 1'b0;
+	     r_idrop_wait <= 1'b0;
+	     r_idropped <= 1'b0;
+	     r_ci_lsel <= 3'd0;
+	     r_inv_line <= 1'b0;
 `ifdef VERILATOR
 	     r_snoop_hit <= 64'd0;
 	     r_snoop_dirty <= 64'd0;
@@ -532,8 +557,10 @@ module l2(clk,
 	     r_blk_way <= n_blk_way;
 	     r_blk_l1i_req <= n_blk_l1i_req;
 	     r_blk_l1i_done <= n_blk_l1i_done;
-	     r_ci_wait <= n_ci_wait;
-	     r_ci_ok <= n_ci_ok;
+	     r_idrop_wait <= n_idrop_wait;
+	     r_idropped <= n_idropped;
+	     r_ci_lsel <= n_ci_lsel;
+	     r_inv_line <= n_inv_line;
 `ifdef VERILATOR
 	     r_snoop_hit <= n_snoop_hit;
 	     r_snoop_dirty <= n_snoop_dirty;
@@ -824,8 +851,12 @@ module l2(clk,
 	n_blk_way = r_blk_way;
 	n_blk_l1i_req = 1'b0;
 	n_blk_l1i_done = r_blk_l1i_done | l1i_blk_inv_done;
-	n_ci_wait = r_ci_wait & !l1i_blk_inv_done;
-	n_ci_ok = r_ci_ok | (r_ci_wait & l1i_blk_inv_done);
+	n_idrop_wait = r_idrop_wait;
+	n_idropped = r_idropped;
+	t_wr_ipres = 1'b0;
+	t_ipres = 1'b0;
+	n_ci_lsel = r_ci_lsel;
+	n_inv_line = r_inv_line;
 	n_probe_req = r_probe_req;
 	n_probe_addr = r_probe_addr;
 	n_probe_colour = r_probe_colour;
@@ -872,6 +903,8 @@ module l2(clk,
 	       
 	       t_wr_valid = 1'b1;
 	       t_wr_dirty = 1'b1;
+	       t_wr_ipres = 1'b1;
+	       t_ipres = 1'b0;
 	       
 	       t_idx = r_idx + 'd1;
 	       if(r_idx == (L2_LINES-1))
@@ -890,6 +923,7 @@ module l2(clk,
 	       n_from_d = l1_mem_req_from_d;
 	       n_req_colour = l1_mem_req_colour;
 	       n_probed = 1'b0;
+	       n_idropped = 1'b0;
 	       n_probe_dirty = 1'b0;
 	       n_store_data = l1_mem_req_store_data;
 	       n_store_mask = 16'h0;
@@ -981,23 +1015,8 @@ module l2(clk,
 		    n_blk_cnt = r_blk_cnt + 4'd1;
 		    n_state = WAIT_FOR_RAM;
 		 end
-	       else if(l1_mem_req_valid && (r_ci_wait || (w_ci_need && !w_ci_ok)))
-		 begin
-		    /* the L1D is about to write around the line (uncached store) or own it
-		     * (fill, ENABLE_COHERENT_L1I): first drop its block from the L1I, holding
-		     * the request (the L1 keeps it until the ack); nothing else is taken
-		     * while the L1I works */
-		    if(!r_ci_wait)
-		      begin
-			 n_blk_l1i_req = 1'b1;
-			 n_blk_addr = l1_mem_req_addr[`PA_WIDTH-1:7];
-			 n_ci_wait = 1'b1;
-			 n_ci_ok = 1'b0;
-		      end
-		 end
 	       else if(l1_mem_req_valid)
 		 begin
-		    n_ci_ok = 1'b0;
 		    if(is_blkop(l1_mem_req_opcode))
 		      begin
 			 /* R10000 block op: take it; the r_blk_pend arm above runs its lines */
@@ -1007,6 +1026,7 @@ module l2(clk,
 			 n_blk_l1i_req = 1'b1;
 			 n_blk_l1i_done = 1'b0;
 			 n_blk_addr = l1_mem_req_addr[`PA_WIDTH-1:7];
+			 n_inv_line = 1'b0;   /* a block op clears the whole block */
 			 n_blk_way = l1_mem_req_addr[0];
 			 n_blk_op = l1_mem_req_opcode;
 		      end
@@ -1042,7 +1062,28 @@ module l2(clk,
 	  CHECK_VALID_AND_TAG:
 	    begin
 	       //load hit
-	       if(r_is_uncache && w_hit && w_pres[N_PIDX] && !r_probed)
+	       if(w_idrop_need)
+		 begin
+		    /* the L1I may hold the resident line (pi) and this request may not
+		     * leave it there: drop it from the L1I (one line, every colour) and
+		     * clear pi, holding here (t_idx holds) until the L1I is done */
+		    if(!r_idrop_wait)
+		      begin
+			 n_blk_l1i_req = 1'b1;
+			 n_blk_addr = {w_tag, t_idx[LG_L2_LINES-1:3]};
+			 n_ci_lsel = t_idx[2:0];
+			 n_inv_line = 1'b1;
+			 n_idrop_wait = 1'b1;
+		      end
+		    else if(l1i_blk_inv_done)
+		      begin
+			 n_idrop_wait = 1'b0;
+			 n_idropped = 1'b1;
+			 t_wr_ipres = 1'b1;
+			 t_ipres = 1'b0;
+		      end
+		 end
+	       else if(r_is_uncache && w_hit && w_pres[N_PIDX] && !r_probed)
 		 begin
 		    /* an uncached access to a line the L1D may hold (pd): probe it out first,
 		     * as before any other drop -- else the L2 drops a line the L1D keeps
@@ -1358,6 +1399,12 @@ module l2(clk,
 			      t_wr_pres = 1'b1;
 			      t_pres = 'd0;
 			   end
+			 if(!r_from_d)
+			   begin
+			      /* an L1I fill: the L1I may now hold the line */
+			      t_wr_ipres = 1'b1;
+			      t_ipres = 1'b1;
+			   end
 			 n_rsp_data =  w_d0;
 			 if(r_probe_dirty)
 			   begin
@@ -1672,5 +1719,39 @@ module l2(clk,
         $display("[desc l2->dram] op=%2d addr=%09x data=%08x", mem_req_opcode,
                  mem_req_addr, mem_req_store_data[31:0]);
    end
+`endif
+`ifdef VERILATOR
+   /* sim-only: cycles the L2 spends in each state, and how many times each is
+    * entered (where an L1 request's latency goes) */
+   longint unsigned c_l2_cyc[16], c_l2_ent[16];
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     for(integer i = 0; i < 16; i = i + 1)
+	       begin
+		  c_l2_cyc[i] <= 0;
+		  c_l2_ent[i] <= 0;
+	       end
+	  end
+	else
+	  begin
+	     c_l2_cyc[r_state] <= c_l2_cyc[r_state] + 1;
+	     if(n_state != r_state)
+	       begin
+		  c_l2_ent[n_state] <= c_l2_ent[n_state] + 1;
+	       end
+	  end
+     end
+   final
+     begin
+	for(integer i = 0; i < 16; i = i + 1)
+	  begin
+	     if(c_l2_cyc[i] != 0)
+	       begin
+		  $display("[L2STATE] %0d cycles %0d entries %0d", i, c_l2_cyc[i], c_l2_ent[i]);
+	       end
+	  end
+     end
 `endif
 endmodule

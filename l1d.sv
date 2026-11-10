@@ -2333,6 +2333,16 @@ endfunction
    wire w_asi_special2 = !((r_req2.asi == 8'h08) | (r_req2.asi == 8'h09) | (r_req2.asi == 8'h0a) |
 			   (r_req2.asi == 8'h0b) | (r_req2.asi[7:4] == 4'h2));
    assign asi_tlb_flush = t_asi_tlb_flush;
+`ifdef VERILATOR
+   /* the SRMMU flush type is va[11:8]: 0 page, 1 segment, 2 region, 3 context, 4 entire */
+   always_ff@(negedge clk)
+     begin
+	if(!reset && t_asi_tlb_flush)
+	  begin
+	     $display("[TLBFLUSH] va %x type %0d", r_req2.addr[31:0], r_req2.addr[11:8]);
+	  end
+     end
+`endif
    assign mmureg_wr = t_mmureg_wr;
    assign mmureg_fsr_clr = t_mmureg_fsr_clr;
    assign mmureg_sel = r_req2.addr[10:8];

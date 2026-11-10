@@ -778,6 +778,19 @@ static bool fp_unfinished(uint32_t opf, uint32_t a32, uint32_t b32, uint64_t a64
     }
 }
 
+/* the FPops fp_unfinished can punt: the ones FSR.NS flushes */
+static bool fp_can_punt(uint32_t opf) {
+  switch(opf)
+    {
+    case 0x029: case 0x02a: case 0x069: case 0x0c6: case 0x0c9:
+    case 0x041: case 0x045: case 0x049: case 0x04d:
+    case 0x042: case 0x046: case 0x04a: case 0x04e:
+      return true;
+    default:
+      return false;
+    }
+}
+
 /* float -> int32 (fstoi/fdtoi always round toward zero).  NaN and positive
  * overflow give 0x7fffffff, negative overflow 0x80000000, all with NV. */
 static uint32_t f2i(double v, uint32_t *exc) {
@@ -819,8 +832,20 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
   uint32_t a32 = s->f[rs1], b32 = s->f[rs2];
   uint64_t a64 = get_d(s, rs1), b64 = get_d(s, rs2);
 
+  /* FSR.NS (nonstandard mode, -fns), as the RTL FPU does it (fp_nan.vh fp_ftz): a
+   * denormal operand reads as a zero of its sign, and a tiny result -- the case
+   * that punts below -- is delivered as a zero of its sign with UF and NX.  Only
+   * the ops fp_unfinished knows; fitos/fitod read integer bits. */
+  bool ftz = false;
+  if(not fpop2 and (s->fsr & FSR_NS) and fp_can_punt(opf)) {
+    a32 = den32(a32) ? (a32 & 0x80000000u) : a32;
+    b32 = den32(b32) ? (b32 & 0x80000000u) : b32;
+    a64 = den64(a64) ? (a64 & (1ULL << 63)) : a64;
+    b64 = den64(b64) ? (b64 & (1ULL << 63)) : b64;
+    ftz = fp_unfinished(opf, a32, b32, a64, b64);
+  }
   /* (user-mode emulation has no OS to emulate it: compute it, as the OS would) */
-  if(not fpop2 and not s->user_emu and fp_unfinished(opf, a32, b32, a64, b64)) {
+  else if(not fpop2 and not s->user_emu and fp_unfinished(opf, a32, b32, a64, b64)) {
     set_ftt(s, FTT_UNFINISHED);
     return TT_FP_EXCEPTION;
   }
@@ -960,6 +985,13 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
       default:
 	return fp_unimp(s, pc, inst);                                   /* quad + reserved */
       }
+  }
+
+  if(ftz) {
+    /* the host's result carries the sign of the exact one */
+    r32 &= 0x80000000u;
+    r64 &= 1ULL << 63;
+    exc = FEXC_UF | FEXC_NX;
   }
 
   uint32_t tem = (s->fsr >> FSR_TEM_SHIFT) & 0x1f;

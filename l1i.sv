@@ -33,6 +33,7 @@ module l1i(clk,
 	   flush_line_complete,
 	   blk_inv_req,
 	   blk_inv_addr,
+	   blk_inv_line,
 	   blk_inv_done,
 	   restart_pc,
 	   restart_npc,
@@ -117,6 +118,9 @@ module l1i(clk,
     * flush -- while fetch carries on.  blk_inv_done pulses when all are clear. */
    input logic 	      blk_inv_req;
    input logic [`PA_WIDTH-1:0] blk_inv_addr;
+   /* with blk_inv_req: only the line at blk_inv_addr, at every colour (the L2's
+    * coherence drop before an L1D fill or write-around) -- 1 cycle per colour */
+   input logic 	      blk_inv_line;
    output logic       blk_inv_done;
    //restart signals
    input logic [`M_WIDTH-1:0] restart_pc;
@@ -481,6 +485,10 @@ endfunction
    logic [BINV_CNT_BITS-1:0] r_binv_cnt, n_binv_cnt;
    logic [`LG_PG_SZ-8:0]  r_binv_off, n_binv_off;   /* the block's offset in the page */
    logic 		  r_binv_done;
+   logic 		  r_binv_line, n_binv_line;   /* one line, every colour */
+   /* the last {colour, line} of the walk: every colour of a line, or the whole block */
+   wire 		  w_binv_last = r_binv_line ? ((r_binv_cnt | BINV_CNT_BITS'(7)) == {BINV_CNT_BITS{1'b1}}) :
+			  (r_binv_cnt == {BINV_CNT_BITS{1'b1}});
    logic 		  t_binv_fire;
    logic [31:0] 	  t_binv_va;
    assign blk_inv_done = r_binv_done;
@@ -493,16 +501,20 @@ endfunction
 	n_binv_busy = r_binv_busy;
 	n_binv_cnt = r_binv_cnt;
 	n_binv_off = r_binv_off;
+	n_binv_line = r_binv_line;
 	if(blk_inv_req)
 	  begin
 	     n_binv_busy = 1'b1;
-	     n_binv_cnt = 'd0;
+	     /* a line drop starts at colour 0 of its line; a block drop at line 0 */
+	     n_binv_cnt = blk_inv_line ? BINV_CNT_BITS'(blk_inv_addr[6:4]) : 'd0;
 	     n_binv_off = blk_inv_addr[`LG_PG_SZ-1:7];
+	     n_binv_line = blk_inv_line;
 	  end
 	else if(t_binv_fire)
 	  begin
-	     n_binv_cnt = r_binv_cnt + 'd1;
-	     n_binv_busy = (r_binv_cnt != {BINV_CNT_BITS{1'b1}});
+	     /* a line drop steps the colour only (the line is cnt[2:0]) */
+	     n_binv_cnt = r_binv_cnt + (r_binv_line ? BINV_CNT_BITS'(8) : BINV_CNT_BITS'(1));
+	     n_binv_busy = !w_binv_last;
 	  end
      end // always_comb
    always_ff@(posedge clk)
@@ -513,13 +525,15 @@ endfunction
 	     r_binv_cnt <= 'd0;
 	     r_binv_off <= 'd0;
 	     r_binv_done <= 1'b0;
+	     r_binv_line <= 1'b0;
 	  end
 	else
 	  begin
 	     r_binv_busy <= n_binv_busy;
 	     r_binv_cnt <= n_binv_cnt;
 	     r_binv_off <= n_binv_off;
-	     r_binv_done <= t_binv_fire && (r_binv_cnt == {BINV_CNT_BITS{1'b1}});
+	     r_binv_line <= n_binv_line;
+	     r_binv_done <= t_binv_fire && w_binv_last;
 	  end
      end // always_ff
    
@@ -952,8 +966,11 @@ endfunction
 	t_gb_pc1 = r_cache_pc + 'd4;
 	t_gb_simm1 = {{(`M_WIDTH-24){t_insn_data2[21]}}, t_insn_data2[21:0], 2'd0};
 	t_gb_target1 = t_gb_pc1 + t_gb_simm1;
+	/* a b<cond>,a (2) pairs only when predicted taken: predicted not taken, it
+	 * skips its slot, which the branch-alone path below does */
 	t_gb_ok1 = (t_first_branch == 'd1) && (t_insn_idx <= 2'd2) && !fq_full2 &&
-		   ((t_gb_pd1 == 4'd1) || (t_gb_pd1 == 4'd2) || (t_gb_pd1 == 4'd3) || (t_gb_pd1 == 4'd8));
+		   ((t_gb_pd1 == 4'd1) || ((t_gb_pd1 == 4'd2) && t_pred_vec[t_insn_idx + 2'd1]) ||
+		    (t_gb_pd1 == 4'd3) || (t_gb_pd1 == 4'd8));
 
 	t_branch_cnt = {2'd0, select_pd(t_jump_out, 'd0) != 4'd0} +
 		       {2'd0, select_pd(t_jump_out, 'd1) != 4'd0} +
@@ -1131,12 +1148,25 @@ endfunction
 		      end
 		    else if(t_pd == 4'd2)
 		      begin
-			 //$display("decoded likely branch @ %x", r_cache_pc);
-			 //treat as always taken for simplicity
-			 t_is_cflow = 1'b1;			 
-			 n_delay_slot = 1'b1;
-			 t_take_br = 1'b1;
-			 n_pc = r_cache_pc + t_simm;
+			 /* b<cond>,a: predicted by the PHT like a=0 conditionals.  Taken:
+			  * the slot, then the target.  Not taken, the slot is annulled:
+			  * skip it, as ba,a skips its slot (drop the sequential read,
+			  * fetch pc + 8; decode then gives the branch no slot and a taken
+			  * outcome restarts into it, core.sv annul_skip).  A b<cond>,a
+			  * that is itself a delay slot (a DCTI couple) stays predicted
+			  * taken: core.sv's couple restart reads a slot-less branch as ba,a */
+			 t_is_cflow = 1'b1;
+			 if(t_pht_out[1] | r_delay_slot)
+			   begin
+			      n_delay_slot = 1'b1;
+			      t_take_br = 1'b1;
+			      n_pc = r_cache_pc + t_simm;
+			   end
+			 else
+			   begin
+			      n_pc = r_cache_pc + 'd8;
+			      n_req = 1'b0;
+			   end
 		      end
 		    else if(t_pd == 4'd9)
 		      begin
@@ -1445,7 +1475,8 @@ endfunction
 	t_insn.pred_target = n_pc;
 	t_insn.pred = t_take_br;
 	t_insn.bpu_idx = r_bpu_idx;
-	t_insn.is_branch = (t_pd != 4'd0) && (t_pd != 4'd10);   /* a delay slot follows */
+	t_insn.is_branch = (t_pd != 4'd0) && (t_pd != 4'd10) &&   /* a delay slot follows */
+			   !((t_pd == 4'd2) && !t_take_br);         /* (not a skipped b<cond>,a slot) */
 `ifdef	ENABLE_CYCLE_ACCOUNTING
 	t_insn.fetch_cycle = r_cycle;
 `endif

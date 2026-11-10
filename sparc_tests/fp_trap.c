@@ -17,6 +17,12 @@ static unsigned get_fsr(void) {
 
 static volatile float fz = 0.0f, f1 = 1.0f, f3 = 3.0f, fbig = 3e38f, fsmall = 1e-30f;
 static volatile double dz = 0.0, d1 = 1.0, d3 = 3.0, dbig = 1e308;
+static volatile float fnsmall = -1e-30f;
+static volatile double dmin = 2.2250738585072014e-308, dmin15 = 3.3375e-308, dtiny = 1e-40;
+static volatile union { float f; unsigned u; } fden = { .u = 0x00012345 }, fnden = { .u = 0x80012345 };
+static volatile union { double d; unsigned long long u; } dden = { .u = 0x0000123456789abcULL };
+#define FSR_NS (1u << 22)
+static double sqrt_d(double v) { double r; asm volatile("fsqrtd %1, %0" : "=e"(r) : "e"(v)); return r; }
 volatile unsigned res[64];
 volatile unsigned fsr_after[64];
 
@@ -57,5 +63,25 @@ int main(void) {
   fsr_after[n++] = get_fsr();
   /* a successful FPop clears ftt */
   x.f = f1 + f1;    res[n] = x.u; fsr_after[n++] = get_fsr();
+  /* FSR.NS: a denormal operand reads as a zero of its sign; a tiny result is a
+   * zero of its sign with UF NX; nothing punts */
+  set_fsr(FSR_NS);
+  x.u = 0x12345678; x.f = fsmall * fsmall;  res[n] = x.u; fsr_after[n++] = get_fsr();   /* +0, UF NX */
+  x.u = 0x12345678; x.f = fnsmall * fsmall; res[n] = x.u; fsr_after[n++] = get_fsr();   /* -0 */
+  x.u = 0x12345678; x.f = fsmall / fbig;    res[n] = x.u; fsr_after[n++] = get_fsr();   /* div: +0 */
+  x.u = 0x12345678; x.f = fden.f + f1;      res[n] = x.u; fsr_after[n++] = get_fsr();   /* 1.0 exact */
+  x.u = 0x12345678; x.f = fnden.f * f3;     res[n] = x.u; fsr_after[n++] = get_fsr();   /* -0, no flags */
+  y.u = 0x1122334455667788ULL; y.d = dmin15 - dmin;  res[n] = (unsigned)(y.u >> 32); fsr_after[n++] = get_fsr(); /* +0 */
+  y.u = 0x1122334455667788ULL; y.d = dmin - dmin15;  res[n] = (unsigned)(y.u >> 32); fsr_after[n++] = get_fsr(); /* -0 */
+  y.u = 0x1122334455667788ULL; y.d = dden.d + d1;    res[n] = (unsigned)y.u; fsr_after[n++] = get_fsr();         /* 1.0 */
+  y.u = 0x1122334455667788ULL; y.d = sqrt_d(dden.d); res[n] = (unsigned)(y.u >> 32); fsr_after[n++] = get_fsr(); /* +0 */
+  y.u = 0x1122334455667788ULL; y.d = (double)fnden.f; res[n] = (unsigned)(y.u >> 32); fsr_after[n++] = get_fsr(); /* fstod -0 */
+  x.u = 0x12345678; x.f = (float)dtiny;     res[n] = x.u; fsr_after[n++] = get_fsr();   /* fdtos +0, UF NX */
+  x.u = 0x12345678; x.f = (float)dden.d;    res[n] = x.u; fsr_after[n++] = get_fsr();   /* fdtos of a denormal: +0 */
+  x.u = 0x12345678; x.f = f1 * f3;          res[n] = x.u; fsr_after[n++] = get_fsr();   /* normal ops unaffected */
+  /* ... and UF enabled: the flushed result's UF is an IEEE trap */
+  set_fsr(FSR_NS | TEM(0, 0, 1, 0, 0));
+  x.u = 0x12345678; x.f = fsmall * fsmall;  res[n] = x.u; fsr_after[n++] = get_fsr();
+  set_fsr(0);
   return (int)fp_traps;
 }

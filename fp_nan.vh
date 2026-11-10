@@ -38,4 +38,16 @@ function automatic logic [63:0] sparc_nan(input logic [63:0] a, input logic [63:
    end
 endfunction // sparc_nan
 
+/* FSR.NS (nonstandard mode, -fns): a denormal operand reads as a zero of its sign
+ * instead of punting unfinished_FPop, and a tiny result (nonzero, below the
+ * smallest normal before rounding) is delivered as a zero of its sign with UF and
+ * NX (interpret.cc exec_fpop).  fp_ftz flushes one operand; the high word of a
+ * single (fmt 0) is kept. */
+function automatic logic [63:0] fp_ftz(input logic [63:0] x, input logic fmt);
+   begin
+      fp_ftz = fmt ? (((x[62:52] == 11'd0) & (|x[51:0])) ? {x[63], 63'd0} : x)
+		   : (((x[30:23] == 8'd0) & (|x[22:0])) ? {x[63:32], x[31], 31'd0} : x);
+   end
+endfunction // fp_ftz
+
 `endif

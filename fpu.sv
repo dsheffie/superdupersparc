@@ -1,5 +1,6 @@
 `include "uop.vh"
 `include "fp_compare.vh"
+`include "fp_nan.vh"
 
 module fpu(clk,
 	   reset,
@@ -11,6 +12,7 @@ module fpu(clk,
 	   src_c,
 	   src_fcr,
 	   rm,
+	   ns,
 	   rob_ptr_in,
 	   dst_ptr_in,
 	   fcr_ptr_in,
@@ -42,6 +44,7 @@ module fpu(clk,
    input logic [63:0] src_c;
    input logic [7:0]  src_fcr;
    input logic [1:0]  rm;          // FCSR.RM (0=RN 1=RZ 2=RP 3=RM)
+   input logic 	      ns;          // FSR.NS: flush denormals to zero (fp_nan.vh fp_ftz)
 
    input logic [LG_ROB_WIDTH-1:0] rob_ptr_in;
    input logic [LG_PRF_WIDTH-1:0] dst_ptr_in;
@@ -332,13 +335,17 @@ module fpu(clk,
 				    : ((opcode == SP_SUB) || (opcode == DP_SUB));
    wire w_add_en        = w_restart | (opcode == SP_ADD) || (opcode == SP_SUB) ||
 			  (opcode == DP_ADD) || (opcode == DP_SUB);
+   /* FSR.NS: a denormal operand reads as a zero of its sign */
+   wire [63:0] w_add_a = ns ? fp_ftz(src_a, w_add_is_double) : src_a;
+   wire [63:0] w_add_b = ns ? fp_ftz(src_b, w_add_is_double) : src_b;
    fpu_add #(.ADD_LAT(FPU_LAT))
    sadd (.clk(clk),
 	 .sub(w_add_is_sub),
-	 .a(w_restart ? t_mult_result : src_a),   /* madd add pass: the rounded product */
-	 .b(w_restart ? r_srcc[0] : src_b),       /* ... and fr */
+	 .a(w_restart ? t_mult_result : w_add_a),   /* madd add pass: the rounded product */
+	 .b(w_restart ? r_srcc[0] : w_add_b),       /* ... and fr */
 	 .en(w_add_en),
 	 .rm(rm),
+	 .ns(ns),
 	 .fmt(w_add_is_double),
 	 .y(t_adder_result),
 	 .denorm(w_add_denorm),
@@ -362,12 +369,15 @@ module fpu(clk,
 		   {x[31], {3'd0, x[30:23]} + 11'd896, x[22:0], 29'd0};
       end
    endfunction // widen32
+   wire [63:0] w_mul_a0 = w_fsmuld ? widen32(src_a[31:0]) : src_a;
+   wire [63:0] w_mul_b0 = w_fsmuld ? widen32(src_b[31:0]) : src_b;
    fpu_mul #(.MUL_LAT(FPU_LAT))
    smul (.clk(clk),
-	 .a(w_fsmuld ? widen32(src_a[31:0]) : src_a),
-	 .b(w_fsmuld ? widen32(src_b[31:0]) : src_b),
+	 .a(ns ? fp_ftz(w_mul_a0, w_mul_is_double) : w_mul_a0),
+	 .b(ns ? fp_ftz(w_mul_b0, w_mul_is_double) : w_mul_b0),
 	 .en(w_mul_en),
 	 .rm(rm),
+	 .ns(ns),
 	 .fmt(w_mul_is_double),
 	 .y(t_mult_result),
 	 .denorm(w_mul_denorm),

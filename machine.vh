@@ -65,7 +65,9 @@
  * hardware and software relies on it: Linux's viking_flush_sig_insns is a no-op, and OBP
  * patches code with cached stores and runs it with no FLUSH.  Instructions already
  * fetched are not covered (FLUSH still refetches), nor is DMA. */
+`ifndef DISABLE_COHERENT_L1I
 `define ENABLE_COHERENT_L1I 1
+`endif
 
 /* ENABLE_MIPS4: the MIPS IV (R5000/R10000) instructions; on by itself for an R4400
  * with MIPS IV bolted on (the cmov silicon builds), and implied by ENABLE_R10000.
@@ -117,10 +119,12 @@
 /* ALU int matrix scheduler: 4 entries (LG=2), downsized from 8 (LG=3).  The O(N^2)
  * wakeup/select was on the critical path, so 8->4 is a WNS win (timing margin vs
  * metastability) at a small IPC cost -- kept per functional>IPC.  Bump to 3 for full IPC. */
+`ifndef LG_INT_SCHED_ENTRIES
 `ifdef TINY_CORE
  `define LG_INT_SCHED_ENTRIES 2
 `else
  `define LG_INT_SCHED_ENTRIES 3
+`endif
 `endif
 /* usable ALU scheduler entries, at most 1 << LG_INT_SCHED_ENTRIES (e.g. 12 of 16);
  * the top entries are never allocated and synthesis prunes them, as for the LSU.
@@ -164,7 +168,15 @@
  * into the ALU bank until it was full: no ALU op could allocate, with half the
  * MEM bank free (the OpenBIOS console loop hung after a few hundred window
  * traps).  512x32 is twice r9999's 128x64 bit count. */
-`define LG_PRF_ENTRIES 8
+/* 512 with every window group resident (WIN_RESIDENT_GROUPS 8: 16 * 8 + 16 arch
+ * registers per half, plus in flight); TINY_CORE keeps 256 with 5 groups. */
+`ifndef LG_PRF_ENTRIES
+`ifdef TINY_CORE
+ `define LG_PRF_ENTRIES 8
+`else
+ `define LG_PRF_ENTRIES 9
+`endif
+`endif
 
 /* FP physical registers: their own size, not the integer PRF's.  SPARC
  * renames the 16 64-bit FP pairs (only the even arch indices, decode_sparc.sv
@@ -173,7 +185,9 @@
  * destination (at most one per ROB entry): (1 << LG_FP_PRF_ENTRIES) / 2 >=
  * 16 + ROB_ENTRIES.  Sizing it at the integer PRF's 512 cost ~20K LUTs (the
  * register file and its two 512-wide free-list searches). */
+`ifndef LG_FP_PRF_ENTRIES
 `define LG_FP_PRF_ENTRIES 6
+`endif
 
 /* Register windows resident in the integer PRF.  A window group is 16 flat arch
  * registers (window g's outs and locals = window g-1's ins); window w reads
@@ -184,7 +198,14 @@
  * fill the missing ones, restart at it.  8 = every group may be resident
  * (misses only on first use).  Each PRF half must hold 16 * groups + 16 arch
  * registers plus the in-flight destinations. */
-`define WIN_RESIDENT_GROUPS 5
+/* 8 (2026-11): +10K LUTs over 5 with LG_PRF_ENTRIES 9; li +10% on silicon (CINT92) */
+`ifndef WIN_RESIDENT_GROUPS
+`ifdef TINY_CORE
+ `define WIN_RESIDENT_GROUPS 5
+`else
+ `define WIN_RESIDENT_GROUPS 8
+`endif
+`endif
 
 /* SPARC register windows (power of two: the flat arch index wraps mod 16*NWINDOWS) */
 `define LG_NWINDOWS 3
@@ -209,10 +230,12 @@
 `define LG_FQ_ENTRIES 3
 
 //rob size
+`ifndef LG_ROB_ENTRIES
 `ifdef FORMAL
  `define LG_ROB_ENTRIES 2
 `else
  `define LG_ROB_ENTRIES 4
+`endif
 `endif
 
 /* ROB_ENTRIES may be any EVEN count in (2^(LG-1), 2^LG] (even: two-wide
@@ -230,10 +253,12 @@
 /* LSU (exec.sv): age-ordered pool fed by the in-order mem uop queue.  Simple
  * loads are held until answered, plain stores until retired and written; slots
  * also index the l1d-side store buffer */
+`ifndef LG_MEM_SCHED_ENTRIES
 `ifdef TINY_CORE
  `define LG_MEM_SCHED_ENTRIES 2
 `else
  `define LG_MEM_SCHED_ENTRIES 3
+`endif
 `endif
 /* usable LSU slots, at most 1 << LG_MEM_SCHED_ENTRIES.  A smaller count (e.g. 12
  * of 16) never allocates the top slots, so their valid bits are constant 0 and
@@ -300,7 +325,7 @@
 `elsif TINY_CORE
  `define LG_L1D_NUM_SETS 8    // 256 sets x 16B = 4KB (one page: no colours)
 `else
- `define LG_L1D_NUM_SETS 10   // 1024 sets x 16B = 16KB
+ `define LG_L1D_NUM_SETS 12   // 4096 sets x 16B = 64KB (VA-indexed; the L2 tracks colours)
 `endif
 `endif
 /* L1D set colour bits: the index bits above the page offset (2 at 16KB, 4 at 64KB);
@@ -318,7 +343,7 @@
 `elsif TINY_CORE
  `define LG_L1I_NUM_SETS 8    // 2 x 4KB
 `else
- `define LG_L1I_NUM_SETS 10   // 1024 sets x 16B = 16KB (4KB direct-mapped thrashed dhry_henny code -> L1I conflict misses)
+ `define LG_L1I_NUM_SETS 11   // 2 x 2048 sets x 16B = 2 x 32KB
 `endif
 `endif
 
@@ -346,7 +371,7 @@
  `elsif BIG_SIM_L2
   `define LG_L2_NUM_SETS 16     /* 65536 lines x 16B = 1MB (sim-only; too big for FPGA BRAM) */
  `else
-  `define LG_L2_NUM_SETS 13      /* 8192 lines x 16B = 128KB (restored for debug bit; deep trace lives in DRAM, not BRAM) */
+  `define LG_L2_NUM_SETS 15      /* 32768 lines x 16B = 512KB */
  `endif
 `endif
 `endif
@@ -414,8 +439,29 @@ typedef struct packed {
 /* context number width: SuperSPARC implements 16 bits (the ISS masks to 0xffff) */
 `define SRMMU_CTX_BITS 16
 /* TLB entries (fully associative CAMs: the size is the FPGA timing knob) */
-`define N_DTLB_ENTRIES 16
-`define N_ITLB_ENTRIES 8
+`ifndef N_DTLB_ENTRIES
+`ifdef TINY_CORE
+ `define N_DTLB_ENTRIES 16
+`else
+ `define N_DTLB_ENTRIES 32
+`endif
+`endif
+`ifndef N_ITLB_ENTRIES
+`ifdef TINY_CORE
+ `define N_ITLB_ENTRIES 8
+`else
+ `define N_ITLB_ENTRIES 32
+`endif
+`endif
+/* mmu.sv's walker caches, behind both L1 TLBs: a direct-mapped second-level TLB of
+ * 4KB (level 3) PTEs and a direct-mapped walk cache of level-2 PTDs (a hit goes
+ * straight to the level-3 read).  0 disables one. */
+`ifndef LG_L2TLB_ENTRIES
+`define LG_L2TLB_ENTRIES 8
+`endif
+`ifndef LG_WALKC_ENTRIES
+`define LG_WALKC_ENTRIES 5
+`endif
 
 /* Per-structure block-RAM synthesis-attribute guards. Defined as the attribute =
  * force that array into block RAM (frees the LUT/FF fabric, which is the bottleneck

@@ -324,6 +324,9 @@ module exec(clk,
       end
    endfunction
    wire [1:0] w_fsr_rd = r_fcsr[31:30];
+   /* FSR.NS: denormals flush to zero instead of punting (fp_nan.vh fp_ftz); like RD,
+    * stable per FP op */
+   wire       w_fsr_ns = r_fcsr[22];
    /* TEM in the FPU's flag order */
    wire [4:0] w_fsr_tem = {r_fcsr[27], r_fcsr[24], r_fcsr[26], r_fcsr[25], r_fcsr[23]};
    wire [31:0] w_fsr = r_fcsr | {20'd0, r_fcr_prf[r_sd_fcr][1:0], 10'd0};
@@ -1495,6 +1498,7 @@ module exec(clk,
        .fp_src_b(w_fp_srcB),
 `endif
        .fp_rm(w_fsr_rd),
+       .fp_ns(w_fsr_ns),
        .fp_rob_ptr_in(r_fp_iss_uop.rob_ptr),
        .fp_dst_ptr_in(r_fp_iss_uop.dst),
        .fp_wb_slot_used(t_fdiv_wb_used),
@@ -2079,6 +2083,7 @@ module exec(clk,
 `endif
 	.src_fcr(r_fp_iss_fcr),
 	.rm(w_fsr_rd),   /* FCSR.RM; CTC1 serializes so this is stable per FP op */
+	.ns(w_fsr_ns),
 	.rob_ptr_in(r_fp_iss_uop.rob_ptr),
 	.dst_ptr_in(r_fp_iss_uop.dst),
 	.fcr_ptr_in(r_fp_iss_uop.hilo_dst[`LG_FCR_PRF_ENTRIES-1:0]),
@@ -2120,6 +2125,7 @@ module exec(clk,
    fpu_f2f f2f0(.in(w_fp_srcA),
 		.to_double(r_fp_iss_uop.op == CVT_D_S),
 		.rm(w_fsr_rd),
+		.ns(w_fsr_ns),
 		.out(w_f2f_out), .denorm(w_f2f_denorm), .fflags(w_f2f_fflags));
    always_ff@(posedge clk)
      begin
@@ -2573,10 +2579,10 @@ module exec(clk,
 	  S_BICC:
 	    begin
 	       /* cond ba with no slot (ba,a) and bn,a (decode: ba to pc+8) are jumps;
-		* a=1 conditionals annul a not-taken slot, as MIPS branch-likely does */
+		* a=1 conditionals are predicted like any other (l1i.sv): predicted
+		* taken, the slot follows; predicted not taken, fetch skipped it */
 	       t_take_br = (int_uop.cond == 4'd8) | eval_icc(int_uop.cond, w_s_icc);
-	       t_mispred_br = (int_uop.br_pred != t_take_br) |
-			      (int_uop.has_nullifying_delay_slot & !t_take_br);
+	       t_mispred_br = (int_uop.br_pred != t_take_br);
 	       t_pc = `M_WIDTH'(t_take_br ? w_s_branch_target : w_s_pc8);
 	       t_alu_valid = 1'b1;
 	    end
@@ -2584,8 +2590,7 @@ module exec(clk,
 	    begin
 	       /* as S_BICC, on fcc (the renamed FCR register's [1:0]) */
 	       t_take_br = eval_fcc(int_uop.cond, r_fcr_prf[int_uop.hilo_src[`LG_FCR_PRF_ENTRIES-1:0]][1:0]);
-	       t_mispred_br = (int_uop.br_pred != t_take_br) |
-			      (int_uop.has_nullifying_delay_slot & !t_take_br);
+	       t_mispred_br = (int_uop.br_pred != t_take_br);
 	       t_pc = `M_WIDTH'(t_take_br ? w_s_branch_target : w_s_pc8);
 	       t_alu_valid = 1'b1;
 	    end

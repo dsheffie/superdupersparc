@@ -335,6 +335,7 @@ module decode_sparc(
 	uop.is_fp = 1'b0;
 	uop.has_delay_slot = 1'b0;
 	uop.has_nullifying_delay_slot = 1'b0;
+	uop.annul_skip = 1'b0;
 	uop.imm = t_imm32[15:0];
 	uop.jmp_imm = w_imm_hi;
 	uop.pc = pc;
@@ -441,9 +442,11 @@ module decode_sparc(
 			 else
 			   begin
 			      /* conditional: a=1 annuls the slot when not taken, which
-			       * is MIPS branch-likely */
-			      uop.has_delay_slot = 1'b1;
-			      uop.has_nullifying_delay_slot = annul;
+			       * is MIPS branch-likely.  Predicted not taken (l1i.sv), fetch
+			       * skipped that slot: no slot follows in the stream */
+			      uop.annul_skip = annul & !insn_pred;
+			      uop.has_delay_slot = !(annul & !insn_pred);
+			      uop.has_nullifying_delay_slot = annul & insn_pred;
 			   end
 		      end
 		 end // case: 2'd0

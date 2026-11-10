@@ -30,7 +30,7 @@ module fpu_add(/*AUTOARG*/
    // Outputs
    y, denorm, fflags,
    // Inputs
-   clk, sub, a, b, en, rm, fmt
+   clk, sub, a, b, en, rm, ns, fmt
    );
    parameter ADD_LAT = 4;     // informational; pipeline below is 4 deep
 
@@ -40,6 +40,7 @@ module fpu_add(/*AUTOARG*/
    input logic [63:0] b;
    input logic 	      en;
    input logic [1:0]  rm;
+   input logic 	      ns;   /* FSR.NS: a tiny result -> a signed zero (UF, NX), no punt */
    input logic 	      fmt;
    output logic [63:0] y;
    output logic        denorm;
@@ -122,13 +123,14 @@ module fpu_add(/*AUTOARG*/
    logic [63:0]   r1_early_y;
    logic 	  r1_early_valid, r1_special, r1_inv, r1_in_den, r1_fmt;
    logic [1:0] 	  r1_rm;
+   logic 	  r1_ns;
    always_ff @(posedge clk)
      begin
 	r1_a <= t_a_align; r1_b <= t_b_align; r1_exp <= t_align_exp;
 	r1_sgn_a <= sgn_a; r1_sgn_b <= sgn_b;
 	r1_early_y <= s1_early_y; r1_early_valid <= s1_early_valid;
 	r1_special <= special; r1_inv <= s1_invalid; r1_in_den <= s1_in_denorm;
-	r1_fmt <= fmt; r1_rm <= rm;
+	r1_fmt <= fmt; r1_rm <= rm; r1_ns <= ns;
      end
 
    // ================= S2 comb: add / subtract magnitudes =================
@@ -167,13 +169,14 @@ module fpu_add(/*AUTOARG*/
    logic [63:0] r2_early_y;
    logic 	r2_early_valid, r2_special, r2_inv, r2_in_den, r2_fmt;
    logic [1:0] 	r2_rm;
+   logic 	r2_ns;
    always_ff @(posedge clk)
      begin
 	r2_mant <= t_add_mant; r2_exp <= t_add_exp;
 	r2_g <= t_guard; r2_r <= t_round; r2_s <= t_sticky; r2_sign <= t_align_sign;
 	r2_early_y <= r1_early_y; r2_early_valid <= r1_early_valid;
 	r2_special <= r1_special; r2_inv <= r1_inv; r2_in_den <= r1_in_den;
-	r2_fmt <= r1_fmt; r2_rm <= r1_rm;
+	r2_fmt <= r1_fmt; r2_rm <= r1_rm; r2_ns <= r1_ns;
      end
 
    // ================= S3 comb: leading-zero normalize =================
@@ -215,6 +218,7 @@ module fpu_add(/*AUTOARG*/
    logic [63:0] r3_early_y;
    logic 	r3_early_valid, r3_special, r3_inv, r3_in_den, r3_fmt;
    logic [1:0] 	r3_rm;
+   logic 	r3_ns;
    always_ff @(posedge clk)
      begin
 	r3_mant <= t_norm_mant; r3_exp <= t_norm_exp;
@@ -222,7 +226,7 @@ module fpu_add(/*AUTOARG*/
 	r3_exp_le0 <= s3_exp_le0;
 	r3_early_y <= r2_early_y; r3_early_valid <= r2_early_valid;
 	r3_special <= r2_special; r3_inv <= r2_inv; r3_in_den <= r2_in_den;
-	r3_fmt <= r2_fmt; r3_rm <= r2_rm;
+	r3_fmt <= r2_fmt; r3_rm <= r2_rm; r3_ns <= r2_ns;
      end
 
    // ================= S4 comb: round + overflow + pack =================
@@ -267,9 +271,13 @@ module fpu_add(/*AUTOARG*/
    /* the unfinished_FPop punt (the same rule in interpret.cc fp_unfinished): any
     * denormal operand, or a nonzero exact result below the smallest normal
     * (tininess before rounding) */
-   wire 	w_denorm = r3_in_den | (~r3_special & w_res_denorm);
-   wire 	w_f_inexact  = ~r3_early_valid & ~w_is_zero & (w_inexact | w_overflow);
-   wire 	w_f_overflow = ~r3_early_valid & ~w_is_zero & w_overflow;
+   /* FSR.NS: the operands arrive flushed (fpu.sv fp_ftz), and a tiny result is a
+    * zero of its sign, inexact */
+   wire 	w_ftz = r3_ns & ~r3_special & w_res_denorm;
+   wire 	w_denorm = r3_in_den | (~r3_special & w_res_denorm & ~r3_ns);
+   wire 	w_f_inexact  = (~r3_early_valid & ~w_is_zero & (w_inexact | w_overflow)) | w_ftz;
+   /* a tiny result's exponent has wrapped negative: w_overflow is meaningless there */
+   wire 	w_f_overflow = ~r3_early_valid & ~w_is_zero & w_overflow & ~w_ftz;
    wire 	w_f_underflow = ~r3_early_valid & w_res_denorm;
    wire [4:0] 	w_fflags = {r3_inv, 1'b0, w_f_overflow, w_f_underflow, w_f_inexact};
 
@@ -278,7 +286,8 @@ module fpu_add(/*AUTOARG*/
    logic [4:0] 	r4_fflags;
    always_ff @(posedge clk)
      begin
-	r4_y <= w_y; r4_denorm <= w_denorm; r4_fflags <= w_fflags;
+	r4_y <= w_ftz ? (r3_fmt ? {r3_sign, 63'd0} : {32'd0, r3_sign, 31'd0}) : w_y;
+	r4_denorm <= w_denorm; r4_fflags <= w_fflags;
      end
    assign y = r4_y;
    assign denorm = r4_denorm;
