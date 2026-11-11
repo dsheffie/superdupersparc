@@ -10,6 +10,7 @@ use `$CMURPHI`, default `~/code/murphi/cmurphi`). Rumur reads the same files.
 | `r9999_incl.m` | inclusive L2 with back-invalidate probes, presence bits and DMA snoop. **Generated** from `r9999_main.m` by `gen/make_incl.py` (+ `gen/{rsp_inline,tagonly,presence,dmasnoop}.py`): edit the generators, then `python3 gen/make_incl.py` in this directory |
 | `r9999_va.m` | VA-indexed L1D with L2 alias tracking (`pd`/`pidx`). Push (the RTL, stage C2b) is `ALIAS_PULL=0`; the file default is pull |
 | `r9999_nb.m` | the probe protocol with a non-blocking L2 |
+| `sdsparc_nb.m` | `r9999_nb.m` plus a non-blocking L1D (several fills in flight, program-order replay), out-of-order DRAM, posted writebacks and a separate eviction buffer. Run with `run_sdnb_rumur.sh` (Rumur, multithreaded); `neg_sdnb.sh` runs its negative controls |
 | `r9999_dma.m`, `r9999_pagewalk.m` | DMA coherence options; the injected page-walk (XPG) order |
 | `r9999_caches.m`, `rv64core_*.m` | earlier r9999 model; rv64core's caches, credits and DMA |
 
