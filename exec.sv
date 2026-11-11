@@ -326,7 +326,11 @@ module exec(clk,
    wire [1:0] w_fsr_rd = r_fcsr[31:30];
    /* FSR.NS: denormals flush to zero instead of punting (fp_nan.vh fp_ftz); like RD,
     * stable per FP op */
+`ifdef FP_FLUSH_TO_ZERO
+   wire       w_fsr_ns = 1'b1;   /* machine.vh: NS always on */
+`else
    wire       w_fsr_ns = r_fcsr[22];
+`endif
    /* TEM in the FPU's flag order */
    wire [4:0] w_fsr_tem = {r_fcsr[27], r_fcsr[24], r_fcsr[26], r_fcsr[25], r_fcsr[23]};
    wire [31:0] w_fsr = r_fcsr | {20'd0, r_fcr_prf[r_sd_fcr][1:0], 10'd0};

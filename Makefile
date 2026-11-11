@@ -49,6 +49,9 @@ CXXFLAGS += -DENABLE_R10000 -DENABLE_MIPS4
 else ifneq ($(shell grep -c '^`define ENABLE_MIPS4' machine.vh),0)
 CXXFLAGS += -DENABLE_MIPS4
 endif
+ifneq ($(shell grep -c '^`define FP_FLUSH_TO_ZERO' machine.vh),0)
+CXXFLAGS += -DFP_FLUSH_TO_ZERO
+endif
 # those flags come from a grep, not an #include, and they change state_t's layout: every
 # C++ object that uses state_t must rebuild when machine.vh does
 $(filter-out verilated.o verilated_vcd_c.o,$(OBJ)): machine.vh

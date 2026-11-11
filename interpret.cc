@@ -837,7 +837,13 @@ static uint32_t exec_fpop(state_t *s, uint32_t pc, uint32_t inst, bool fpop2) {
    * that punts below -- is delivered as a zero of its sign with UF and NX.  Only
    * the ops fp_unfinished knows; fitos/fitod read integer bits. */
   bool ftz = false;
-  if(not fpop2 and (s->fsr & FSR_NS) and fp_can_punt(opf)) {
+#ifdef FP_FLUSH_TO_ZERO
+  /* machine.vh FP_FLUSH_TO_ZERO: NS always on, as the RTL's w_fsr_ns */
+  static const bool always_ns = true;
+#else
+  static const bool always_ns = false;
+#endif
+  if(not fpop2 and (always_ns or (s->fsr & FSR_NS)) and fp_can_punt(opf)) {
     a32 = den32(a32) ? (a32 & 0x80000000u) : a32;
     b32 = den32(b32) ? (b32 & 0x80000000u) : b32;
     a64 = den64(a64) ? (a64 & (1ULL << 63)) : a64;

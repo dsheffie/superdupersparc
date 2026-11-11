@@ -69,6 +69,15 @@
 `define ENABLE_COHERENT_L1I 1
 `endif
 
+/* FP_FLUSH_TO_ZERO: behave as if FSR.NS were always set -- a denormal operand reads as
+ * a zero of its sign and a tiny result is a zero of its sign (UF, NX), so the FPU never
+ * punts unfinished_FPop.  The punt traps with an empty FQ; Solaris's FP-exception path
+ * needs the FPop in the FQ, finds none, and re-runs the same FPop forever (iropt's
+ * SolveMatrix fdtos under -xprofile=collect).  Until there is a one-entry FQ with the
+ * trap taken after the FPop, this trades IEEE gradual underflow for not livelocking.
+ * Column-0 `define: the Makefile greps it into -DFP_FLUSH_TO_ZERO for the ISS. */
+`define FP_FLUSH_TO_ZERO 1
+
 /* ENABLE_MIPS4: the MIPS IV (R5000/R10000) instructions; on by itself for an R4400
  * with MIPS IV bolted on (the cmov silicon builds), and implied by ENABLE_R10000.
  *
@@ -106,7 +115,9 @@
  *   wrote), and the kind of thing Verilator, having no delays, can never reproduce.
  * Costs one cycle of load-use latency.  r_core_mem_rsp/_valid are already maintained
  * in l1d.sv -- this only changes which one drives the output. */
+`ifndef DISABLE_REG_L1D_RSP
 `define REG_L1D_RSP 1
+`endif
 
 `define LG_M_WIDTH 5
 
