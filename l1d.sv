@@ -2437,6 +2437,7 @@ endfunction
    logic [2:0] 		r_fc_ft;
    logic [1:0] 		r_fc_level;
    logic 		t_walk_start, t_walk_mark, t_fc_use;
+   logic 		r_walk_stale, n_walk_stale;
    wire 		w_fc_hit2 = r_fc_valid & (r_fc_vpn == r_req2.addr[31:12]);
    assign page_walk_req_valid = r_walk_req;
    assign page_walk_req_va = r_walk_va;
@@ -2452,7 +2453,10 @@ endfunction
 	n_walk_mark = r_walk_mark;
 	n_walk_probe = r_walk_probe;
 	n_prbres_valid = r_prbres_valid & !t_prbres_use & !tlb_flush;
-	n_fc_valid = r_fc_valid & !t_fc_use;
+	/* as the l1i's: a cached walk fault is dropped on a pipeline restart, and a
+	 * walk outstanding across one does not cache its fault */
+	n_fc_valid = r_fc_valid & !t_fc_use & !restart_valid;
+	n_walk_stale = (r_walk_stale | (r_walk_busy & restart_valid)) & r_walk_busy;
 	t_dtlb_replace = 1'b0;
 	if(t_walk_start)
 	  begin
@@ -2462,6 +2466,7 @@ endfunction
 	     n_walk_mark = t_walk_mark;
 	     n_walk_probe = t_walk_probe;
 	     n_fc_valid = 1'b0;
+	     n_walk_stale = 1'b0;
 	  end
 	if(page_walk_rsp_valid)
 	  begin
@@ -2469,7 +2474,8 @@ endfunction
 	     /* a mark walk only sets the existing entry's M (set_m; even if the
 	      * PTE has since changed: the stale entry is software's to flush) */
 	     t_dtlb_replace = !page_walk_rsp.fault & !r_walk_mark & !r_walk_probe;
-	     n_fc_valid = page_walk_rsp.fault & !r_walk_mark & !r_walk_probe;
+	     n_fc_valid = page_walk_rsp.fault & !r_walk_mark & !r_walk_probe & !r_walk_stale & !restart_valid;
+	     n_walk_stale = 1'b0;
 	     n_prbres_valid = r_walk_probe;
 	  end
      end // always_comb
@@ -2479,6 +2485,7 @@ endfunction
 	r_walk_busy <= reset ? 1'b0 : n_walk_busy;
 	r_walk_req <= reset ? 1'b0 : n_walk_req;
 	r_fc_valid <= reset ? 1'b0 : n_fc_valid;
+	r_walk_stale <= reset ? 1'b0 : n_walk_stale;
 	r_walk_va <= n_walk_va;
 	r_walk_mark <= reset ? 1'b0 : n_walk_mark;
 	r_walk_probe <= reset ? 1'b0 : n_walk_probe;

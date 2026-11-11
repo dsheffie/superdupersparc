@@ -790,6 +790,10 @@ endfunction
    logic 		r_iwalk_req, n_iwalk_req;
    logic [31:0] 	r_iwalk_va, n_iwalk_va;
    logic 		r_ifc_valid, n_ifc_valid;
+   /* a walk outstanding across a fetch restart: its fault is not cached (it may
+    * have read a PTE the OS has since made valid -- an invalid PTE needs no TLB
+    * flush on SRMMU, so nothing else would tell us) */
+   logic 		r_iwalk_stale, n_iwalk_stale;
    logic [19:0] 	r_ifc_vpn;
    logic [2:0] 		r_ifc_ft;
    logic [1:0] 		r_ifc_level;
@@ -806,7 +810,12 @@ endfunction
 	n_iwalk_busy = r_iwalk_busy;
 	n_iwalk_req = 1'b0;
 	n_iwalk_va = r_iwalk_va;
-	n_ifc_valid = r_ifc_valid & !t_ifc_use;
+	/* a cached walk fault is only for the fetch that caused the walk: any fetch
+	 * restart (trap, rett, mispredict) drops it, else a fault seen on a
+	 * speculative path -- e.g. fetching a trap handler's return target before
+	 * the handler has fixed the PTE -- traps a later, correct fetch */
+	n_ifc_valid = r_ifc_valid & !t_ifc_use & !restart_valid;
+	n_iwalk_stale = (r_iwalk_stale | (r_iwalk_busy & restart_valid)) & r_iwalk_busy;
 	t_itlb_replace = 1'b0;
 	if(t_iwalk_start)
 	  begin
@@ -814,12 +823,14 @@ endfunction
 	     n_iwalk_req = 1'b1;
 	     n_iwalk_va = r_miss_pc[31:0];
 	     n_ifc_valid = 1'b0;
+	     n_iwalk_stale = 1'b0;
 	  end
 	if(page_walk_rsp_valid)
 	  begin
 	     n_iwalk_busy = 1'b0;
 	     t_itlb_replace = !page_walk_rsp.fault;
-	     n_ifc_valid = page_walk_rsp.fault;
+	     n_ifc_valid = page_walk_rsp.fault & !r_iwalk_stale & !restart_valid;
+	     n_iwalk_stale = 1'b0;
 	  end
      end // always_comb
 
@@ -828,6 +839,7 @@ endfunction
 	r_iwalk_busy <= reset ? 1'b0 : n_iwalk_busy;
 	r_iwalk_req <= reset ? 1'b0 : n_iwalk_req;
 	r_ifc_valid <= reset ? 1'b0 : n_ifc_valid;
+	r_iwalk_stale <= reset ? 1'b0 : n_iwalk_stale;
 	r_iwalk_va <= n_iwalk_va;
 	r_iw_done <= reset ? 1'b0 : (page_walk_rsp_valid & r_iw_mine);
 	if(page_walk_rsp_valid)
