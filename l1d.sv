@@ -123,6 +123,10 @@ module l1d(clk,
 	   //reply from memory system
 	   mem_rsp_valid,
 	   mem_rsp_load_data,
+	   pf_req_valid,
+	   pf_req_addr,
+	   pf_req_colour,
+	   pf_rsp_valid,
 	   mem_rsp_bad,
 	   cache_accesses,
 	   cache_hits,
@@ -299,6 +303,12 @@ module l1d(clk,
    
    input logic 				  mem_rsp_valid;
    input logic [L1D_CL_LEN_BITS-1:0] 	  mem_rsp_load_data;
+   /* L1D_MULTI_MISS: the second miss engine's L2 request (its own arbiter source) and
+    * response; the response data rides mem_rsp_load_data */
+   output logic 			  pf_req_valid;
+   output logic [`PA_WIDTH-1:0] 	  pf_req_addr;
+   output logic [`L1D_N_COLOUR-1:0] 	  pf_req_colour;
+   input logic 				  pf_rsp_valid;
    input logic 				  mem_rsp_bad;        /* uncached load answered with a bus error */
 
    
@@ -617,6 +627,36 @@ endfunction
    logic [`LG_L1D_NUM_SETS-1:0] r_prb_save, n_prb_save;
    logic [`PA_WIDTH-1:TAG_LSB] r_prb_tag, n_prb_tag;
    logic 		      t_prb_pend, t_prb_ok_state, t_prb_hit;
+
+   /* L1D_MULTI_MISS: a second miss engine.  While a fill is out (INJECT_RELOAD), the next
+    * queued op's line -- a cacheable simple load to another set whose line is absent and
+    * whose victim is clean -- is requested from the L2 on its own arbiter source, and
+    * installed when the array write port is free.  Ops still complete only from the queue
+    * head, in order (formal/murphi/sdsparc_nb.m N6); the head op just finds its line.
+    * N2: one fill per set -- the head and the direct fill wait while the engine owns a
+    * set; any write to that set, or a probe of the line, drops the prefetched line
+    * (a probe must not overtake it: P3). */
+`ifdef L1D_MULTI_MISS
+   localparam PFE = 1'b1;
+`else
+   localparam PFE = 1'b0;
+`endif
+   typedef enum logic [1:0] {
+			     PF_IDLE = 2'd0,
+			     PF_CHECK = 2'd1,
+			     PF_WAIT = 2'd2,
+			     PF_DATA = 2'd3
+			     } pf_state_t;
+   pf_state_t r_pf_state, n_pf_state;
+   logic [`PA_WIDTH-1:0] 	      r_pf_addr;
+   logic [`LG_L1D_NUM_SETS-1:0]       r_pf_idx;
+   logic [L1D_CL_LEN_BITS-1:0]        r_pf_data;
+   logic 			      r_pf_cancel, r_pf_req;
+   logic 			      t_pf_rd, t_pf_install, t_pf_issue, t_pf_hitset;
+   logic [(1<<`LG_MRQ_ENTRIES)-1:0]   r_pf_tried;   /* MQ slots already checked */
+   logic [`LG_MRQ_ENTRIES-1:0] 	      t_pf_slot;
+   logic 			      t_pf_found;
+   wire 			      w_pf_busy = PFE && (r_pf_state != PF_IDLE);
 `ifdef VERILATOR
    /* stage B probe statistics (sim only) */
    logic [63:0] r_dbg_prb, r_dbg_prb_hit, r_dbg_prb_dirty;
@@ -1719,6 +1759,7 @@ endfunction
 			   && !core_mem_req_valid 
 			   && !t_got_req && !t_got_req2 
 			   && !t_push_miss
+			   && !w_pf_busy
 			   && (r_n_inflight == 'd0);
 	     
 	     r_q_priority <= n_q_priority;
@@ -1747,9 +1788,9 @@ endfunction
 
    always_comb
      begin
-	t_array_wr_addr = mem_rsp_valid ? r_mem_req_idx : r_cache_idx;
-	t_array_wr_data = mem_rsp_valid ? mem_rsp_load_data : t_array_data;
-	t_array_wr_en = w_cacheable_mem_rsp_valid || t_wr_array;
+	t_array_wr_addr = mem_rsp_valid ? r_mem_req_idx : (t_pf_install ? r_pf_idx : r_cache_idx);
+	t_array_wr_data = mem_rsp_valid ? mem_rsp_load_data : (t_pf_install ? r_pf_data : t_array_data);
+	t_array_wr_en = w_cacheable_mem_rsp_valid || t_wr_array || t_pf_install;
      end
 
 `ifdef VERBOSE_L1D
@@ -1831,9 +1872,9 @@ endfunction
       .wr_data(w_dpreload ? fml_pre_tag : r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
       .wr_en(w_cacheable_mem_rsp_valid | w_dpreload),
 `else
-      .wr_addr(r_mem_req_idx),
-      .wr_data(r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
-      .wr_en(w_cacheable_mem_rsp_valid),
+      .wr_addr(t_pf_install ? r_pf_idx : r_mem_req_idx),
+      .wr_data(t_pf_install ? r_pf_addr[`PA_WIDTH-1:TAG_LSB] : r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
+      .wr_en(w_cacheable_mem_rsp_valid | t_pf_install),
 `endif
       .rd_data0(r_tag_out),
       .rd_data1(r_tag_out2)
@@ -1881,6 +1922,11 @@ endfunction
 	     t_dirty_value = 1'b1;
 	     t_write_dirty_en = 1'b1;
 	  end	
+	else if(t_pf_install)
+	  begin
+	     t_dirty_wr_addr = r_pf_idx;
+	     t_write_dirty_en = 1'b1;
+	  end
      end
    
    ram2r1w #(.WIDTH(1), .LG_DEPTH(`LG_L1D_NUM_SETS)) dc_dirty
@@ -1919,6 +1965,12 @@ endfunction
 	     t_valid_value = !r_inhibit_write;
 	     t_write_valid_en = 1'b1;
 	  end
+	else if(t_pf_install)
+	  begin
+	     t_valid_wr_addr = r_pf_idx;
+	     t_valid_value = 1'b1;
+	     t_write_valid_en = 1'b1;
+	  end
      end // always_comb
       
    ram2r1w #(.WIDTH(1), .LG_DEPTH(`LG_L1D_NUM_SETS)) dc_valid
@@ -1932,6 +1984,154 @@ endfunction
       .rd_data0(r_valid_out),
       .rd_data1(r_valid_out2)
       );
+
+   /* ---- L1D_MULTI_MISS second miss engine (see the declarations) ---- */
+   /* the candidate: the oldest queued cacheable simple load of this era, to a set other
+    * than the outstanding fill's, not yet checked */
+   always_comb
+     begin
+	t_pf_found = 1'b0;
+	t_pf_slot = r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0];
+	for(integer k = N_MQ_ENTRIES-1; k >= 0; k = k - 1)
+	  begin
+	     logic [`LG_MRQ_ENTRIES-1:0] s;
+	     s = r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0] + k[`LG_MRQ_ENTRIES-1:0];
+	     if(r_mq_addr_valid[s] && !r_pf_tried[s] && !r_mem_q[s].commit && !r_mem_q[s].is_store &&
+		!r_mem_q[s].is_atomic && r_mem_q[s].lsu_hold && r_mem_q[s].cached &&
+		(r_mem_q[s].restart_id == restart_color) && (r_mq_addr[s] != r_mem_req_idx))
+	       begin
+		  t_pf_found = 1'b1;
+		  t_pf_slot = s;
+	       end
+	  end
+     end // always_comb
+   wire [`LG_L1D_NUM_SETS-1:0] w_pf_cand_idx = r_mq_addr[t_pf_slot];
+   wire 		       w_pf_cand_ok = PFE && t_pf_found;
+   assign pf_req_valid = r_pf_req;
+   assign pf_req_addr = r_pf_addr;
+   assign pf_req_colour = N_COLOUR'(r_pf_idx >> IDX_IN_PG);
+
+   always_comb
+     begin
+	n_pf_state = r_pf_state;
+	t_pf_issue = 1'b0;
+	t_pf_install = 1'b0;
+	/* anything that writes the engine's set, or a probe of its line, drops the line */
+	t_pf_hitset = (w_cacheable_mem_rsp_valid && (r_mem_req_idx == r_pf_idx)) ||
+		      (t_wr_array && (r_cache_idx == r_pf_idx)) ||
+		      (t_mark_invalid && (r_cache_idx == r_pf_idx)) ||
+		      (probe_req && (probe_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN] == r_pf_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN]));
+	case(r_pf_state)
+	  PF_IDLE:
+	    begin
+	       if(t_pf_rd)
+		 begin
+		    n_pf_state = PF_CHECK;
+		 end
+	    end
+	  PF_CHECK:
+	    begin
+	       /* port 1 read the set last cycle: the line is already here, or the victim
+		* is dirty (that needs a writeback -- leave it to the normal miss) */
+	       if(t_pf_hitset || (r_valid_out && (r_tag_out == r_pf_addr[`PA_WIDTH-1:TAG_LSB])) ||
+		  (r_valid_out && r_dirty_out))
+		 begin
+		    n_pf_state = PF_IDLE;
+		 end
+	       else
+		 begin
+		    t_pf_issue = 1'b1;
+		    n_pf_state = PF_WAIT;
+		 end
+	    end
+	  PF_WAIT:
+	    begin
+	       if(pf_rsp_valid)
+		 begin
+		    n_pf_state = (r_pf_cancel || t_pf_hitset) ? PF_IDLE : PF_DATA;
+		 end
+	    end
+	  PF_DATA:
+	    begin
+	       if(r_pf_cancel || t_pf_hitset)
+		 begin
+		    n_pf_state = PF_IDLE;
+		 end
+	       else if(!mem_rsp_valid && !t_wr_array && !t_mark_invalid && !probe_req)
+		 begin
+		    t_pf_install = 1'b1;
+		    n_pf_state = PF_IDLE;
+		 end
+	    end
+	  default:
+	    begin
+	    end
+	endcase // case (r_pf_state)
+     end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     r_pf_state <= PF_IDLE;
+	     r_pf_req <= 1'b0;
+	     r_pf_cancel <= 1'b0;
+	     r_pf_tried <= 'd0;
+	  end
+	else
+	  begin
+	     r_pf_state <= n_pf_state;
+	     r_pf_req <= t_pf_issue;
+	     r_pf_cancel <= (n_pf_state == PF_IDLE) ? 1'b0 :
+			    (((r_pf_state == PF_WAIT) || (r_pf_state == PF_DATA)) && t_pf_hitset) ? 1'b1 :
+			    r_pf_cancel;
+	     /* a slot is checked once per occupant: cleared when an op is pushed into it */
+	     r_pf_tried <= (r_pf_tried | (t_pf_rd ? ((1 << `LG_MRQ_ENTRIES)'(1) << t_pf_slot) : 'd0)) &
+			   ~(t_push_miss ? ((1 << `LG_MRQ_ENTRIES)'(1) << r_mq_tail_ptr[`LG_MRQ_ENTRIES-1:0]) : 'd0);
+	  end
+	if(t_pf_rd)
+	  begin
+	     r_pf_addr <= {r_mem_q[t_pf_slot].addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
+	     r_pf_idx <= w_pf_cand_idx;
+	  end
+	if(pf_rsp_valid && (r_pf_state == PF_WAIT))
+	  begin
+	     r_pf_data <= mem_rsp_load_data;
+	  end
+     end // always_ff@ (posedge clk)
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset && pf_rsp_valid && (r_pf_state != PF_WAIT))
+	  begin
+	     $display("l1d: prefetch response with no prefetch outstanding");
+	     $stop();
+	  end
+     end
+   longint unsigned c_pf_rd, c_pf_issue, c_pf_install;
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     c_pf_rd <= 0;
+	     c_pf_issue <= 0;
+	     c_pf_install <= 0;
+	  end
+	else
+	  begin
+	     c_pf_rd <= c_pf_rd + (t_pf_rd ? 1 : 0);
+	     c_pf_issue <= c_pf_issue + (t_pf_issue ? 1 : 0);
+	     c_pf_install <= c_pf_install + (t_pf_install ? 1 : 0);
+	  end
+     end
+   final
+     begin
+	if(PFE)
+	  begin
+	     $display("[L1DMM] checked %0d issued %0d installed %0d", c_pf_rd, c_pf_issue, c_pf_install);
+	  end
+     end
+`endif
 
    generate
       for(genvar i = 0; i < WORDS_PER_CL; i=i+1)
@@ -2223,7 +2423,7 @@ endfunction
     * the next (EXCEPTION_)DRAIN waited on that color forever (the go/IRIX wedge on
     * silicon, raced by XPG page flushes).  An XPG walk that ran ahead of a retired
     * store to its page also let that store land after the flush (stale DMA read). */
-   wire w_l1d_drained = mem_q_empty & (r_n_inflight == 'd0) & !r_got_req & !r_got_req2 & !lsu_sb.retired_pending;
+   wire w_l1d_drained = mem_q_empty & (r_n_inflight == 'd0) & !r_got_req & !r_got_req2 & !lsu_sb.retired_pending & !w_pf_busy;
 
 `ifdef L1D_ONE_MEMOP
    /* DIAGNOSTIC (opt-in via SV2V_DEFINES=L1D_ONE_MEMOP): accept a new core memory op
@@ -2708,6 +2908,8 @@ endfunction
 			   mem_q_empty && !r_got_req && !rr_last_wr && !r_lock_cache &&
 			   !n_flush_req && !n_flush_cl_req && !r_fill_rsp_pend &&
 			   !(r_valid_out2 && r_dirty_out2) &&
+			   /* N2: no second fill into the prefetch engine's set */
+			   !(w_pf_busy && (t_req2_idx == r_pf_idx)) &&
 			   /* the victim port 2 read (VA index) must be the set the fill
 			    * replaces (PA index): differs only when the L1D exceeds a page */
 			   (r_cache_idx2 == t_req2_idx);
@@ -3259,7 +3461,9 @@ endfunction
 
 
 	       
-	     if(!mem_q_empty && !t_got_miss && !r_lock_cache && !t_prb_pend)
+	     if(!mem_q_empty && !t_got_miss && !r_lock_cache && !t_prb_pend &&
+		/* N2: the head op waits while the prefetch engine fills its set */
+		!(w_pf_busy && (r_mq_addr[r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0]] == r_pf_idx)))
 	       begin
 		  if(!t_mh_block)
 		    begin
@@ -3723,6 +3927,14 @@ endfunction
 	     n_prb_tag = probe_addr[`PA_WIDTH-1:TAG_LSB];
 	     t_cache_idx = (probe_addr[IDX_STOP-1:IDX_START] & IDX_PG_MASK) | (`LG_L1D_NUM_SETS'(probe_colour) << IDX_IN_PG);
 	     n_state = PROBE_CHK;
+	  end
+	/* L1D_MULTI_MISS: while the fill waits (and port 1 is idle), read the next
+	 * queued op's set to see whether its line can be fetched alongside */
+	t_pf_rd = PFE && (r_pf_state == PF_IDLE) && (r_state == INJECT_RELOAD) &&
+		  (n_state == INJECT_RELOAD) && !mem_rsp_valid && !t_prb_pend && w_pf_cand_ok;
+	if(t_pf_rd)
+	  begin
+	     t_cache_idx = w_pf_cand_idx;
 	  end
 	/* a request from a flushed era (rv64core restart_id): ack and drop it */
 	if(t_req_stale && ((r_state == ACTIVE) || (r_state == INJECT_RELOAD)))

@@ -22,11 +22,13 @@ module l2(clk,
 	  l1_mem_req_opcode,
 	  l1_mem_req_from_d,
 	  l1_mem_req_colour,
+	  l1_mem_req_src,
 	  l2_nocache,
 
 	  //l2 -> l1
 	  l1_mem_rsp_valid,
 	  l1_mem_rsp_bad,
+	  l1_mem_rsp_src,
 	  l1_mem_load_data,
 
 	  //l2 -> mem
@@ -116,9 +118,13 @@ module l2(clk,
    /* stage C2: the L1D set colour (index bits above the page offset) the request's
     * line lives at in the VA-indexed L1D -- what pidx records */
    input logic [`L1D_N_COLOUR-1:0] l1_mem_req_colour;
+   /* the requester (0 L1D, 1 L1I, 2 MMU): returned with its response, which the arbiter
+    * routes by it -- with L2_HIT_UNDER_MISS a response need not be the last request's */
+   input logic [1:0] l1_mem_req_src;
 
    output logic        l1_mem_rsp_valid;
    output logic        l1_mem_rsp_bad;     /* uncached load answered with a bus error */
+   output logic [1:0]  l1_mem_rsp_src;
    output logic [127:0] l1_mem_load_data;
    
    input logic 	mem_req_ack;
@@ -348,9 +354,9 @@ module l2(clk,
    
    
    assign flush_complete = r_flush_complete;
-   assign mem_req_addr = r_addr;
+   assign mem_req_addr = r_fp ? r_fp_addr : r_addr;
    assign mem_req_valid = r_mem_req;
-   assign mem_req_opcode = r_mem_opcode;
+   assign mem_req_opcode = r_fp ? 5'd4 : r_mem_opcode;
    /* An uncached op issues only from UNCACHE_LOAD/UNCACHE_STORE (MEM_WB reuses
     * UNCACHE_STORE for a cached writeback-through).  Everything else -- fills,
     * evictions, CACHE-op writebacks -- is cached traffic, and a cached fill can be
@@ -358,11 +364,12 @@ module l2(clk,
    assign mem_req_uncached = (r_state == UNCACHE_LOAD) |
 			     ((r_state == UNCACHE_STORE) & (r_opcode != MEM_WB));
    assign mem_req_store_data = r_mem_req_store_data;
-   assign mem_req_mask = r_store_mask;
+   assign mem_req_mask = r_fp ? 16'hffff : r_store_mask;
    
    assign l1_mem_rsp_valid = r_rsp_valid;
    assign l1_mem_rsp_bad = r_rsp_bad;
    assign l1_mem_load_data = r_rsp_data;
+   assign l1_mem_rsp_src = r_rsp_src;
    assign l1_mem_req_ack = r_req_ack;
    
    assign cache_hits = r_cache_hits;
@@ -380,7 +387,7 @@ module l2(clk,
      (.clk(clk), .addr(t_idx), .wr_data(t_d0), .wr_en(t_wr_d0), .rd_data(w_d0));
       
    reg_ram1rw #(.WIDTH(TAG_BITS), .LG_DEPTH(LG_L2_LINES)) tag_ram
-     (.clk(clk), .addr(t_idx), .wr_data(r_tag), .wr_en(t_wr_tag), .rd_data(w_tag));   
+     (.clk(clk), .addr(t_idx), .wr_data(t_wtag), .wr_en(t_wr_tag), .rd_data(w_tag));   
    
    reg_ram1rw #(.WIDTH(1), .LG_DEPTH(LG_L2_LINES)) valid_ram
      (.clk(clk), .addr(t_idx), .wr_data(t_valid), .wr_en(t_wr_valid), .rd_data(w_valid));   
@@ -460,7 +467,106 @@ module l2(clk,
    /* the block op's current line; the index form takes whatever line sits at the set */
    wire [`PA_WIDTH-1:0] w_blk_line = {r_blk_addr, r_blk_cnt[2:0], 4'd0};
    wire 		w_blk_hit = (r_opcode == MEM_BLK_IDX) ? w_valid : w_hit;
-      
+
+   /* L2_HIT_UNDER_MISS: one clean reload (an L1 LW or SW miss) may PARK.  CHECK_VALID_AND_TAG
+    * issues its DRAM read from r_fp_* (which drive the DRAM port until the response) and
+    * returns to IDLE, where the L2 keeps serving other requesters' LW/SW to OTHER sets
+    * (one transaction per L2 set: formal/murphi/sdsparc_nb.m P1).  One DRAM transaction at
+    * a time: a request that misses meanwhile is DEFERRED (r_def_*) on its first CHECK
+    * visit, before it probes or changes anything, and replayed once the fill is done;
+    * flushes, snoops, retries, block ops, uncached and CACHE ops wait in IDLE.  The fill
+    * installs from IDLE (r_fp_data) and re-enters CHECK through WAIT_CLEAN_RELOAD, exactly
+    * as a CLEAN_RELOAD would, answering its requester (r_fp_src) through the hit arm. */
+`ifdef L2_HIT_UNDER_MISS
+   localparam HUM = 1'b1;
+`else
+   localparam HUM = 1'b0;
+`endif
+   logic [1:0] r_src, n_src, r_rsp_src;
+   logic [`PA_WIDTH-(LG_L2_LINES+4)-1:0] t_wtag;
+   logic       t_fp_save, t_fp_restore, t_def_save, t_def_restore;
+   logic       r_fp, r_fp_done, r_def;
+   logic [127:0] r_fp_data;
+   logic [`PA_WIDTH-1:0] r_fp_addr, r_def_addr;
+   logic [5:0] 		 r_fp_opcode, r_def_opcode;
+   logic 		 r_fp_from_d, r_def_from_d, r_fp_probed, r_fp_idropped;
+   logic [`L1D_N_COLOUR-1:0] r_fp_colour, r_def_colour;
+   logic [127:0] 	     r_fp_store_data, r_def_store_data;
+   logic [1:0] 		     r_fp_src, r_def_src;
+   wire [LG_L2_LINES-1:0]    w_fp_set = r_fp_addr[LG_L2_LINES+3:4];
+   wire [LG_L2_LINES-1:0]    w_def_set = r_def_addr[LG_L2_LINES+3:4];
+   always_ff@(posedge clk)
+     begin
+	r_src <= reset ? 2'd0 : n_src;
+	r_rsp_src <= reset ? 2'd0 : (n_rsp_valid ? n_src : r_rsp_src);
+	r_fp <= reset ? 1'b0 : (t_fp_save ? 1'b1 : (t_fp_restore ? 1'b0 : r_fp));
+	r_fp_done <= reset ? 1'b0 : (t_fp_save ? 1'b0 : ((r_fp & mem_rsp_valid) ? 1'b1 : r_fp_done));
+	r_def <= reset ? 1'b0 : (t_def_save ? 1'b1 : (t_def_restore ? 1'b0 : r_def));
+	if(r_fp & mem_rsp_valid)
+	  begin
+	     r_fp_data <= mem_rsp_load_data;
+	  end
+	if(t_fp_save)
+	  begin
+	     r_fp_addr <= r_addr;
+	     r_fp_opcode <= r_opcode;
+	     r_fp_from_d <= r_from_d;
+	     r_fp_colour <= r_req_colour;
+	     r_fp_probed <= r_probed;
+	     r_fp_idropped <= r_idropped;
+	     r_fp_store_data <= r_store_data;
+	     r_fp_src <= r_src;
+	  end
+	if(t_def_save)
+	  begin
+	     r_def_addr <= r_addr;
+	     r_def_opcode <= r_opcode;
+	     r_def_from_d <= r_from_d;
+	     r_def_colour <= r_req_colour;
+	     r_def_store_data <= r_store_data;
+	     r_def_src <= r_src;
+	  end
+     end // always_ff@ (posedge clk)
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset && r_fp && mem_rsp_valid && r_fp_done)
+	  begin
+	     $display("L2: second DRAM response while a parked fill is complete");
+	     $stop();
+	  end
+	if(!reset && t_def_save && r_def)
+	  begin
+	     $display("L2: second deferred request");
+	     $stop();
+	  end
+     end // always_ff@ (negedge clk)
+   /* how often a fill parks, a request is taken under it, and one is deferred */
+   longint unsigned c_hum_park, c_hum_take, c_hum_def;
+   always_ff@(posedge clk)
+     begin
+	if(reset)
+	  begin
+	     c_hum_park <= 0;
+	     c_hum_take <= 0;
+	     c_hum_def <= 0;
+	  end
+	else
+	  begin
+	     c_hum_park <= c_hum_park + (t_fp_save ? 1 : 0);
+	     c_hum_take <= c_hum_take + ((r_state == IDLE) && (r_fp || r_def) && n_req_ack ? 1 : 0);
+	     c_hum_def <= c_hum_def + (t_def_save ? 1 : 0);
+	  end
+     end
+   final
+     begin
+	if(HUM)
+	  begin
+	     $display("[L2HUM] parked %0d taken-under-miss %0d deferred %0d", c_hum_park, c_hum_take, c_hum_def);
+	  end
+     end
+`endif
+
    always_ff@(posedge clk)
      begin
 	if(reset)
@@ -806,7 +912,8 @@ module l2(clk,
      end
    always_ff@(negedge clk)
      begin
-	if((r_state == IDLE) & (r_mem_req))
+	/* a parked fill (L2_HIT_UNDER_MISS) legitimately holds mem_req in IDLE */
+	if((r_state == IDLE) & (r_mem_req) & !r_fp)
 	  begin
 	     $display("l2 protocol busted, last state %d", r_last_state);
 	     `ifdef VERILATOR $stop(); `endif
@@ -832,6 +939,12 @@ module l2(clk,
 	n_req_colour = r_req_colour;
 	n_addr = r_addr;
 	n_saveaddr = r_saveaddr;
+	n_src = r_src;
+	t_wtag = r_tag;
+	t_fp_save = 1'b0;
+	t_fp_restore = 1'b0;
+	t_def_save = 1'b0;
+	t_def_restore = 1'b0;
 	
 	n_req_ack = 1'b0;
 	n_snoop_ack = 1'b0;
@@ -933,7 +1046,70 @@ module l2(clk,
 	       //    $stop();
 	       //end
 	       
-	       if(n_flush_req & n_flush_skip)
+	       if(HUM && r_fp && (r_fp_done || mem_rsp_valid))
+		 begin
+		    /* the parked fill's data is here: install it (as CLEAN_RELOAD would)
+		     * and re-enter CHECK_VALID_AND_TAG with its request, which now hits */
+		    t_fp_restore = 1'b1;
+		    t_idx = w_fp_set;
+		    n_tag = r_fp_addr[`PA_WIDTH-1:LG_L2_LINES+4];
+		    t_wtag = r_fp_addr[`PA_WIDTH-1:LG_L2_LINES+4];
+		    n_addr = r_fp_addr;
+		    n_saveaddr = r_fp_addr;
+		    n_opcode = r_fp_opcode;
+		    n_from_d = r_fp_from_d;
+		    n_req_colour = r_fp_colour;
+		    n_probed = r_fp_probed;
+		    n_idropped = r_fp_idropped;
+		    n_store_data = r_fp_store_data;
+		    n_store_mask = 16'hffff;
+		    n_src = r_fp_src;
+		    n_is_uncache = 1'b0;
+		    n_reload = 1'b1;
+		    t_valid = 1'b1;
+		    t_wr_valid = 1'b1;
+		    t_dirty = 1'b0;
+		    t_wr_dirty = 1'b1;
+		    t_wr_tag = 1'b1;
+		    t_d0 = r_fp_done ? r_fp_data : mem_rsp_load_data;   /* or straight off DRAM */
+		    t_wr_d0 = 1'b1;
+		    n_state = WAIT_CLEAN_RELOAD;
+		 end
+	       else if(HUM && r_def && !r_fp)
+		 begin
+		    /* replay the request deferred while the fill was out (already acked) */
+		    t_def_restore = 1'b1;
+		    t_idx = w_def_set;
+		    n_tag = r_def_addr[`PA_WIDTH-1:LG_L2_LINES+4];
+		    n_addr = r_def_addr;
+		    n_saveaddr = r_def_addr;
+		    n_opcode = r_def_opcode;
+		    n_from_d = r_def_from_d;
+		    n_req_colour = r_def_colour;
+		    n_store_data = r_def_store_data;
+		    n_src = r_def_src;
+		    n_is_uncache = 1'b0;
+		    n_state = WAIT_FOR_RAM;
+		 end
+	       else if(HUM && (r_fp || r_def))
+		 begin
+		    /* a fill is parked: take only another requester's cacheable LW/SW to
+		     * another set; everything else waits for the fill */
+		    if(l1_mem_req_valid && !r_def && w_l2_cacheable &&
+		       ((l1_mem_req_opcode == 6'd4) || (l1_mem_req_opcode == 6'd7)) &&
+		       (l1_mem_req_src != r_fp_src) &&
+		       (l1_mem_req_addr[LG_L2_LINES+3:4] != w_fp_set))
+		      begin
+			 n_src = l1_mem_req_src;
+			 n_req_ack = 1'b1;
+			 n_state = WAIT_FOR_RAM;
+			 n_rsp_valid = (l1_mem_req_opcode == 6'd7);
+			 n_is_uncache = 1'b0;
+			 n_cache_accesses = r_cache_accesses + 64'd1;
+			 n_cache_hits = r_cache_hits + 64'd1;
+		      end
+		 end
+	       else if(n_flush_req & n_flush_skip)
 		 begin
 		    /* L1I-only flush: nothing to write back from L2 (I-cache read-only;
 		     * the D-side already wrote its lines through to DRAM). Complete the
@@ -1017,6 +1193,8 @@ module l2(clk,
 		 end
 	       else if(l1_mem_req_valid)
 		 begin
+		    /* only an accepted request names the requester (a NACK retry keeps its own) */
+		    n_src = l1_mem_req_src;
 		    if(is_blkop(l1_mem_req_opcode))
 		      begin
 			 /* R10000 block op: take it; the r_blk_pend arm above runs its lines */
@@ -1062,7 +1240,14 @@ module l2(clk,
 	  CHECK_VALID_AND_TAG:
 	    begin
 	       //load hit
-	       if(w_idrop_need)
+	       if(HUM && r_fp && !w_hit && !r_probed)
+		 begin
+		    /* a miss while a fill is parked: one DRAM transaction at a time --
+		     * set it aside untouched, replay it once the fill is done */
+		    t_def_save = 1'b1;
+		    n_state = IDLE;
+		 end
+	       else if(w_idrop_need)
 		 begin
 		    /* the L1I may hold the resident line (pi) and this request may not
 		     * leave it there: drop it from the L1I (one line, every colour) and
@@ -1492,6 +1677,13 @@ module l2(clk,
 			 n_store_mask = 16'hffff;			 
 			 n_mem_req = 1'b1;
 			 n_got_mem_rsp_valid = 1'b0;			 
+			 if(HUM && !r_is_uncache && ((r_opcode == 6'd4) || (r_opcode == 6'd7)))
+			   begin
+			      /* park it: the DRAM read runs from r_fp_*; serve others meanwhile */
+			      t_fp_save = 1'b1;
+			      n_reload = 1'b0;
+			      n_state = IDLE;
+			   end
 		      end
 		 end
 	    end // case: CHECK_VALID_AND_TAG
@@ -1701,6 +1893,12 @@ module l2(clk,
 	    begin
 	    end
 	endcase
+	/* a parked fill holds the DRAM request until its response */
+	if(HUM && (r_fp || t_fp_save))
+	  begin
+	     /* r_fp_done is stale (the previous fill's) until r_fp: only count it while parked */
+	     n_mem_req = !(r_fp && (r_fp_done || mem_rsp_valid));
+	  end
 	if(t_wr_valid && !t_wr_pres)
 	  begin
 	     t_wr_pres = 1'b1;
