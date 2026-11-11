@@ -438,13 +438,18 @@ module l2(clk,
    int 	        dbg_p_val [1 << LG_L2_LINES];
 `endif
    wire 		w_hit = w_valid ? (r_tag == w_tag) : 1'b0;
+   /* a table walk read (source 2, mmu.sv): an ordinary cached read, except that the
+    * walker keeps no copy -- any L1D copy is probed out first (it may be dirty, and
+    * the read may update the line), the L1I copy is dropped, and no presence bit is
+    * set.  r_store_data holds the PTE bits to set, in the entry's bus word. */
+   wire 		w_mmu_rd = (r_src == 2'd2) && !r_is_uncache && (r_opcode == 6'd4);
    /* drop the resident line from the L1I first (pi): for anything but an L1I fill
     * that hits it (which keeps it) and a block op (which clears the whole block in
     * the L1I itself); without ENABLE_COHERENT_L1I an L1D fill may share it too */
    wire 		w_idrop_need = w_ipres && !r_idropped && !is_blkop(r_opcode) &&
 			       !(!r_from_d && !r_is_uncache && w_hit && (r_opcode == 6'd4))
 `ifndef ENABLE_COHERENT_L1I
-			       && !(r_from_d && !r_is_uncache && w_hit && (r_opcode == 6'd4))
+			       && !(r_from_d && !w_mmu_rd && !r_is_uncache && w_hit && (r_opcode == 6'd4))
 `endif
 			       ;
    /* stage C2 alias (push, the R10000 PIdx scheme): an L1D request for a line the L1D
@@ -456,7 +461,7 @@ module l2(clk,
    wire w_alias = 1'b0;
 `else
    wire w_alias = r_from_d && !r_is_uncache && w_hit && w_pres[N_PIDX] &&
-		  (w_pres[N_PIDX-1:0] != w_req_pidx) &&
+		  (w_mmu_rd || (w_pres[N_PIDX-1:0] != w_req_pidx)) &&
 		  ((r_opcode == 6'd4) || (r_opcode == MEM_INVL) || (r_opcode == MEM_PGDROP));
 `endif
    /* an L1I fill of a line the L1D may hold (pd): probe it out of the L1D first,
@@ -464,6 +469,18 @@ module l2(clk,
     * is what the L1I gets.  (r9999's IRIX wrote the D-cache back in software.) */
    wire w_ifill_pd = !r_from_d && !r_is_uncache && w_hit && w_pres[N_PIDX] && (r_opcode == 6'd4);
    wire 		w_need_wb = w_valid ? w_dirty : 1'b0;
+   /* a walk read's R/M update: OR the requested bits into the entry's bus word
+    * (the big-endian entry byte-swapped, so ET = bits 25:24) if it is a PTE */
+   function automatic logic [31:0] pte_set(input logic [31:0] w, input logic [31:0] b);
+      begin
+	 pte_set = ((b != 32'd0) && (w[25:24] == 2'd2)) ? (w | b) : w;
+      end
+   endfunction
+   wire [127:0] 	w_mmu_old = r_probe_dirty ? r_probe_data : w_d0;
+   wire [127:0] 	w_mmu_new = {pte_set(w_mmu_old[127:96], r_store_data[127:96]),
+				     pte_set(w_mmu_old[95:64], r_store_data[95:64]),
+				     pte_set(w_mmu_old[63:32], r_store_data[63:32]),
+				     pte_set(w_mmu_old[31:0], r_store_data[31:0])};
    /* the block op's current line; the index form takes whatever line sits at the set */
    wire [`PA_WIDTH-1:0] w_blk_line = {r_blk_addr, r_blk_cnt[2:0], 4'd0};
    wire 		w_blk_hit = (r_opcode == MEM_BLK_IDX) ? w_valid : w_hit;
@@ -1572,15 +1589,17 @@ module l2(clk,
 		    n_reload = 1'b0;
 		    if(r_opcode == 6'd4)
 		      begin
-			 /* an L1D fill: record that the L1D holds the line, and where */
-			 if(r_from_d)
+			 /* an L1D fill: record that the L1D holds the line, and where
+			  * (a walk read holds no copy: the alias probe took any L1D copy,
+			  * and the arm below clears pd) */
+			 if(r_from_d && !w_mmu_rd)
 			   begin
 			      t_wr_pres = 1'b1;
 			      t_pres = {1'b1, w_req_pidx};
 			   end
 			 else if(r_probed)
 			   begin
-			      /* an L1I fill: the probe took it out of the L1D */
+			      /* an L1I fill or a walk read: the probe took it out of the L1D */
 			      t_wr_pres = 1'b1;
 			      t_pres = 'd0;
 			   end
@@ -1597,6 +1616,15 @@ module l2(clk,
 			       * newest data -- serve it and keep it here, dirty */
 			      n_rsp_data = r_probe_data;
 			      t_d0 = r_probe_data;
+			      t_wr_d0 = 1'b1;
+			      t_wr_dirty = 1'b1;
+			      t_dirty = 1'b1;
+			   end
+			 if(w_mmu_rd && (w_mmu_new != w_mmu_old))
+			   begin
+			      /* the walk's R/M update, atomic with its read; the walker
+			       * gets the line as it was and applies the bits itself */
+			      t_d0 = w_mmu_new;
 			      t_wr_d0 = 1'b1;
 			      t_wr_dirty = 1'b1;
 			      t_dirty = 1'b1;

@@ -23,10 +23,13 @@ import "DPI-C" function void mmu_set_ref(input longint pte_pa, input int pte);
  * (l1d_mark with l1d_req), the walker re-walks and writes PTE|R|M, and the L1D
  * sets M in its entry.
  *
- * Memory: word reads and writes go to the L2 as UNCACHED requests, which the L2
- * makes coherent with the write-back L1D by probing the line out first.  A PTE
- * read-modify-write holds the L1 arbiter (mem_lock) from the read to the write,
- * so no L1D access to the line can land between them. */
+ * Memory: every table read is a CACHED L2 read (requester source 2, after
+ * rv64core's walker), which the L2 makes coherent with the write-back L1D by
+ * probing any L1D copy out first; the MMU holds no copy.  The R/M update is done
+ * by the L2 inside that read, so it is atomic with it: mem_req_data carries the
+ * bits to set, in the bus word of the entry (zero elsewhere), and the L2 ORs them
+ * in only if that word is a PTE (ET=2), marking the line dirty.  The response is
+ * the line as it was before the update. */
 module mmu(clk,
 	   reset,
 	   sys_reset,
@@ -52,10 +55,7 @@ module mmu(clk,
 	   fault_asi,
 	   mem_req_valid,
 	   mem_req_addr,
-	   mem_req_store,
-	   mem_req_mask,
 	   mem_req_data,
-	   mem_lock,
 	   mem_req_ack,
 	   mem_rsp_valid,
 	   mem_rsp_data,
@@ -106,10 +106,7 @@ module mmu(clk,
 
    output logic mem_req_valid;
    output logic [`PA_WIDTH-1:0] mem_req_addr;   /* line aligned */
-   output logic mem_req_store;
-   output logic [15:0] mem_req_mask;
    output logic [127:0] mem_req_data;
-   output logic mem_lock;
    input logic mem_req_ack;
    input logic mem_rsp_valid;
    input logic [127:0] mem_rsp_data;
@@ -255,8 +252,6 @@ module mmu(clk,
 			     LOOKUP,
 			     RD,
 			     RD_WAIT,
-			     WR,
-			     WR_WAIT,
 			     DONE
 			     } state_t;
    state_t r_state, n_state;
@@ -273,8 +268,6 @@ module mmu(clk,
    logic r_fault, n_fault;
    logic [2:0] r_ft, n_ft;
    logic r_mem_req, n_mem_req;
-   logic r_mem_store, n_mem_store;
-   logic r_lock, n_lock;
    logic r_l1i_rsp, n_l1i_rsp, r_l1d_rsp, n_l1d_rsp;
 
    /* ---- the walker's caches ----
@@ -334,7 +327,9 @@ module mmu(clk,
 			    (r_ea[3:2] == 2'd2) ? mem_rsp_data[95:64] :
 			    mem_rsp_data[127:96];
    wire [31:0] w_entry = {w_bus_word[7:0], w_bus_word[15:8], w_bus_word[23:16], w_bus_word[31:24]};
-   wire [31:0] w_wr_word = {r_pte[7:0], r_pte[15:8], r_pte[23:16], r_pte[31:24]};
+   /* the R/M bits this read asks the L2 to set (none for a probe), as a bus word */
+   wire [31:0] w_set = r_do_probe ? 32'd0 : (32'h20 | (r_do_mark ? 32'h40 : 32'h0));
+   wire [31:0] w_set_word = {w_set[7:0], w_set[15:8], w_set[23:16], w_set[31:24]};
 
    /* the next table entry: (PTP << 4) + 4*index, the index from the VA bits of
     * the level being entered */
@@ -352,10 +347,10 @@ module mmu(clk,
 
    assign mem_req_valid = r_mem_req;
    assign mem_req_addr = {r_ea[`PA_WIDTH-1:4], 4'd0};
-   assign mem_req_store = r_mem_store;
-   assign mem_req_mask = 16'hf << {r_ea[3:2], 2'd0};
-   assign mem_req_data = {w_wr_word, w_wr_word, w_wr_word, w_wr_word};
-   assign mem_lock = r_lock;
+   assign mem_req_data = {(r_ea[3:2] == 2'd3) ? w_set_word : 32'd0,
+			  (r_ea[3:2] == 2'd2) ? w_set_word : 32'd0,
+			  (r_ea[3:2] == 2'd1) ? w_set_word : 32'd0,
+			  (r_ea[3:2] == 2'd0) ? w_set_word : 32'd0};
    assign l1i_rsp_valid = r_l1i_rsp;
    assign l1d_rsp_valid = r_l1d_rsp;
    assign walk_pte = r_pte;
@@ -386,8 +381,6 @@ module mmu(clk,
 	n_fault = r_fault;
 	n_ft = r_ft;
 	n_mem_req = r_mem_req;
-	n_mem_store = r_mem_store;
-	n_lock = r_lock;
 	n_l1i_rsp = 1'b0;
 	n_l1d_rsp = 1'b0;
 	n_wctx = r_wctx;
@@ -454,8 +447,6 @@ module mmu(clk,
 	  RD:
 	    begin
 	       n_mem_req = 1'b1;
-	       n_mem_store = 1'b0;
-	       n_lock = 1'b1;
 	       n_state = RD_WAIT;
 	    end
 	  RD_WAIT:
@@ -465,11 +456,11 @@ module mmu(clk,
 		    n_pte = w_entry;
 		    if(w_entry[1:0] == 2'd2)
 		      begin
-			 /* PTE: write back R (and, for a retire-side request, M) if
-			  * either is missing; a probe only reads it (interpret.cc
-			  * asi_load) */
-			 n_pte = r_do_probe ? w_entry : (w_entry | 32'h20 | (r_do_mark ? 32'h40 : 32'h0));
-			 n_state = (n_pte != w_entry) ? WR : DONE;
+			 /* PTE: the L2 has set R (and, for a retire-side request, M)
+			  * in memory with this read; a probe only reads it
+			  * (interpret.cc asi_load) */
+			 n_pte = w_entry | w_set;
+			 n_state = DONE;
 		      end
 		    else if((w_entry[1:0] == 2'd1) && r_do_probe && (r_level == w_probe_stop) && (r_level != 2'd3))
 		      begin
@@ -483,7 +474,6 @@ module mmu(clk,
 			 t_wc_wr = WC_ON & (r_level == 2'd2) & !r_do_probe & !n_nofill;
 			 n_ea = w_next_ea;
 			 n_level = r_level + 2'd1;
-			 n_lock = 1'b0;
 			 n_state = RD;
 		      end
 		    else
@@ -494,25 +484,11 @@ module mmu(clk,
 		      end
 		 end
 	    end
-	  WR:
-	    begin
-	       n_mem_req = 1'b1;
-	       n_mem_store = 1'b1;
-	       n_state = WR_WAIT;
-	    end
-	  WR_WAIT:
-	    begin
-	       if(mem_rsp_valid)
-		 begin
-		    n_state = DONE;
-		 end
-	    end
 	  DONE:
 	    begin
 	       /* a completed 4KB translation (as written back: R, and M for a mark
 		* walk) goes into the second-level TLB */
 	       t_l2t_wr = L2T_ON & !r_fault & !r_do_probe & (r_level == 2'd3) & !n_nofill;
-	       n_lock = 1'b0;
 	       n_l1i_rsp = r_do_l1i;
 	       n_l1d_rsp = !r_do_l1i;
 	       n_state = IDLE;
@@ -531,7 +507,6 @@ module mmu(clk,
 	     r_l1i_req <= 1'b0;
 	     r_l1d_req <= 1'b0;
 	     r_mem_req <= 1'b0;
-	     r_lock <= 1'b0;
 	     r_l1i_rsp <= 1'b0;
 	     r_l1d_rsp <= 1'b0;
 	  end
@@ -541,7 +516,6 @@ module mmu(clk,
 	     r_l1i_req <= n_l1i_req;
 	     r_l1d_req <= n_l1d_req;
 	     r_mem_req <= n_mem_req;
-	     r_lock <= n_lock;
 	     r_l1i_rsp <= n_l1i_rsp;
 	     r_l1d_rsp <= n_l1d_rsp;
 	  end
@@ -555,7 +529,6 @@ module mmu(clk,
 	r_wctx <= n_wctx;
 	r_fault <= n_fault;
 	r_ft <= n_ft;
-	r_mem_store <= n_mem_store;
      end // always_ff@ (posedge clk)
 
    /* the walker caches: registered reads with the next VA (valid in LOOKUP),
@@ -601,9 +574,10 @@ module mmu(clk,
     * ISS executes, and it sets R and M itself) */
    always_ff@(posedge clk)
      begin
-	if(!reset && (r_state == WR_WAIT) && mem_rsp_valid && !r_do_mark)
+	if(!reset && (r_state == RD_WAIT) && mem_rsp_valid && !r_do_mark && !r_do_probe &&
+	   (w_entry[1:0] == 2'd2) && ((w_entry | w_set) != w_entry))
 	  begin
-	     mmu_set_ref(64'(r_ea), r_pte);
+	     mmu_set_ref(64'(r_ea), w_entry | w_set);
 	  end
      end
 `endif

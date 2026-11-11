@@ -672,15 +672,11 @@ module core_l1d_l1i(clk,
       GNT_L1DP = 'd4   /* the L1D's second miss engine (L1D_MULTI_MISS) */
    } state_t;
 
-   /* the SRMMU walker: a third requester on the L1 -> L2 port (uncached word
-    * reads/writes), ahead of both L1s; mem_lock keeps the port for it between a
-    * PTE read and its R/M write-back */
+   /* the SRMMU walker: a third requester on the L1 -> L2 port (cached line reads;
+    * the L2 sets PTE R/M inside the read, see mmu.sv), ahead of both L1s */
    wire 				  w_mmu_mem_req_valid;
    wire [`PA_WIDTH-1:0] 		  w_mmu_mem_req_addr;
-   wire 				  w_mmu_mem_req_store;
-   wire [15:0] 				  w_mmu_mem_req_mask;
    wire [127:0] 			  w_mmu_mem_req_data;
-   wire 				  w_mmu_mem_lock;
    logic 				  t_mmu_mem_req_ack, t_mmu_mem_rsp_valid;
    
    logic 				  l1d_mem_req_ack;
@@ -749,13 +745,13 @@ module core_l1d_l1i(clk,
 	t_l2_req_addr = (r_state == GNT_MMU) ? w_mmu_mem_req_addr :
 			(r_state == GNT_L1I) ? l1i_mem_req_addr :
 			(r_state == GNT_L1DP) ? w_pf_req_addr : l1d_mem_req_addr;
-	t_l2_req_opcode = (r_state == GNT_MMU) ? (w_mmu_mem_req_store ? MEM_SW : MEM_LW) :
+	t_l2_req_opcode = (r_state == GNT_MMU) ? MEM_LW :
 			  (r_state == GNT_L1I) ? l1i_mem_req_opcode :
 			  (r_state == GNT_L1DP) ? MEM_LW : l1d_mem_req_opcode;
-	t_l2_req_cacheable = (r_state == GNT_MMU) ? 1'b0 :
+	t_l2_req_cacheable = (r_state == GNT_MMU) ? 1'b1 :
 			     (r_state == GNT_L1I) ? l1i_mem_req_cacheable :
 			     (r_state == GNT_L1DP) ? 1'b1 : l1d_mem_req_cacheable;
-	t_l2_req_mask = (r_state == GNT_MMU) ? w_mmu_mem_req_mask :
+	t_l2_req_mask = (r_state == GNT_MMU) ? 16'hffff :
 			(r_state == GNT_L1I) ? l1i_mem_req_mask :
 			(r_state == GNT_L1DP) ? 16'hffff : l1d_mem_req_mask;
 	t_l2_req_store_data = (r_state == GNT_MMU) ? w_mmu_mem_req_data : l1d_mem_req_store_data;
@@ -780,10 +776,6 @@ module core_l1d_l1i(clk,
 		 begin
 		    n_state = GNT_MMU;
 		    n_req = 1'b1;
-		 end
-	       else if(w_mmu_mem_lock)
-		 begin
-		    /* between a PTE read and its write-back: hold the port */
 		 end
 	       else if(n_l1d_req && !r_out_d && !(n_l1i_req && !r_out_i))
 		 begin
@@ -1062,10 +1054,7 @@ module core_l1d_l1i(clk,
 	    .fault_asi(!w_mmu_fault_valid & w_buserr_asi),
 	    .mem_req_valid(w_mmu_mem_req_valid),
 	    .mem_req_addr(w_mmu_mem_req_addr),
-	    .mem_req_store(w_mmu_mem_req_store),
-	    .mem_req_mask(w_mmu_mem_req_mask),
 	    .mem_req_data(w_mmu_mem_req_data),
-	    .mem_lock(w_mmu_mem_lock),
 	    .mem_req_ack(t_mmu_mem_req_ack),
 	    .mem_rsp_valid(t_mmu_mem_rsp_valid),
 	    .mem_rsp_data(w_l1_mem_load_data),
