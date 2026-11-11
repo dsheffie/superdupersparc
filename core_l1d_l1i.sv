@@ -698,23 +698,27 @@ module core_l1d_l1i(clk,
    logic [5:0] 				  l1i_mem_req_opcode;
    logic 				  l1d_mem_rsp_valid, l1i_mem_rsp_valid;
    
-   state_t r_state, n_state;
+   state_t t_sel;
    logic 				  r_l1d_req, n_l1d_req;
    logic 				  r_l1i_req, n_l1i_req;
    logic 				  r_last_gnt, n_last_gnt;
-   logic 				  n_req, r_req;
    /* one L2 transaction per requester: a grant ends at the L2's ack, and the requester
     * stays outstanding until the response the L2 tags with its id (l1_mem_rsp_src) --
     * with L2_HIT_UNDER_MISS the L2 may answer another requester first */
-   logic 				  r_out_d, r_out_i, r_out_m, r_out_p;
-   logic 				  t_ack_d, t_ack_i, t_ack_m, t_ack_p;
-   logic 				  r_l1dp_req, n_l1dp_req;
-   wire 				  w_pf_req_valid;
-   wire [`PA_WIDTH-1:0] 		  w_pf_req_addr;
-   wire [`L1D_N_COLOUR-1:0] 		  w_pf_req_colour;
-   logic 				  t_pf_rsp_valid;
-   logic [1:0] 				  t_l2_req_src;
-   wire [1:0] 				  w_l1_mem_rsp_src;
+   /* the L1D's second-miss engines (L1D_MULTI_MISS) are sources 3.. , one each */
+   localparam NPF = `L1D_PF_ENGINES;
+   localparam LG_NPF = (NPF > 1) ? $clog2(NPF) : 1;
+   logic 				  r_out_d, r_out_i, r_out_m;
+   logic 				  t_ack_d, t_ack_i, t_ack_m;
+   logic [NPF-1:0] 			  r_out_p, t_ack_p;
+   logic [NPF-1:0] 			  r_l1dp_req, n_l1dp_req;
+   wire [NPF-1:0] 			  w_pf_req_valid;
+   wire [NPF-1:0][`PA_WIDTH-1:0] 	  w_pf_req_addr;
+   wire [NPF-1:0][`L1D_N_COLOUR-1:0] 	  w_pf_req_colour;
+   logic [NPF-1:0] 			  t_pf_rsp_valid;
+   logic [LG_NPF-1:0] 			  t_sel_p;   /* the engine offered, with GNT_L1DP */
+   logic [2:0] 				  t_l2_req_src;
+   wire [2:0] 				  w_l1_mem_rsp_src;
 
    logic 				  insn_valid,insn_valid2;
    logic 				  insn_ack, insn_ack2;
@@ -725,7 +729,6 @@ module core_l1d_l1i(clk,
    logic [5:0] 				  t_l2_req_opcode;
    logic				  t_l2_req_cacheable;
    logic [15:0]				  t_l2_req_mask;
-   logic				  t_l2_passthru;
    logic [127:0]			  t_l2_req_store_data;
 
 
@@ -733,29 +736,68 @@ module core_l1d_l1i(clk,
    wire w_l1_mem_req_ack;
    
 
+   /* the request offered to the L2 this cycle: the MMU first, then the L1D and the
+    * L1I (alternating when both wait), then the L1D's second miss engine, each with
+    * at most one transaction outstanding.  The L2 acks in the cycle it takes the
+    * request (l1_mem_req_ack is combinational), so another can follow the next
+    * cycle; an L1's request is offered in the cycle it raises it. */
+   wire w_d_pend = (r_l1d_req || l1d_mem_req_valid) && !r_out_d;
+   wire w_i_pend = (r_l1i_req || l1i_mem_req_valid) && !r_out_i;
+   wire [NPF-1:0] w_p_pend = (r_l1dp_req | w_pf_req_valid) & ~r_out_p;
    always_comb
      begin
-	n_state = r_state;
+	t_sel = IDLE;
+	t_sel_p = 'd0;
+	for(integer e = NPF-1; e >= 0; e = e - 1)
+	  begin
+	     if(w_p_pend[e])
+	       begin
+		  t_sel_p = LG_NPF'(e);
+	       end
+	  end
+	if(w_mmu_mem_req_valid && !r_out_m)
+	  begin
+	     t_sel = GNT_MMU;
+	  end
+	else if(w_d_pend && w_i_pend)
+	  begin
+	     t_sel = r_last_gnt ? GNT_L1D : GNT_L1I;
+	  end
+	else if(w_d_pend)
+	  begin
+	     t_sel = GNT_L1D;
+	  end
+	else if(w_i_pend)
+	  begin
+	     t_sel = GNT_L1I;
+	  end
+	else if(|w_p_pend)
+	  begin
+	     t_sel = GNT_L1DP;
+	  end
+	t_l2_req_addr = (t_sel == GNT_MMU) ? w_mmu_mem_req_addr :
+			(t_sel == GNT_L1I) ? l1i_mem_req_addr :
+			(t_sel == GNT_L1DP) ? w_pf_req_addr[t_sel_p] : l1d_mem_req_addr;
+	t_l2_req_opcode = (t_sel == GNT_MMU) ? MEM_LW :
+			  (t_sel == GNT_L1I) ? l1i_mem_req_opcode :
+			  (t_sel == GNT_L1DP) ? MEM_LW : l1d_mem_req_opcode;
+	t_l2_req_cacheable = (t_sel == GNT_MMU) ? 1'b1 :
+			     (t_sel == GNT_L1I) ? l1i_mem_req_cacheable :
+			     (t_sel == GNT_L1DP) ? 1'b1 : l1d_mem_req_cacheable;
+	t_l2_req_mask = (t_sel == GNT_MMU) ? 16'hffff :
+			(t_sel == GNT_L1I) ? l1i_mem_req_mask :
+			(t_sel == GNT_L1DP) ? 16'hffff : l1d_mem_req_mask;
+	t_l2_req_store_data = (t_sel == GNT_MMU) ? w_mmu_mem_req_data : l1d_mem_req_store_data;
+	t_l2_req_src = (t_sel == GNT_MMU) ? 3'd2 : ((t_sel == GNT_L1I) ? 3'd1 :
+						    ((t_sel == GNT_L1DP) ? (3'd3 + 3'(t_sel_p)) : 3'd0));
+     end // always_comb
+
+   always_comb
+     begin
 	n_last_gnt = r_last_gnt;
 	n_l1i_req = r_l1i_req || l1i_mem_req_valid;
 	n_l1d_req = r_l1d_req || l1d_mem_req_valid;
-	n_req = r_req;
-	
-	//mem_req_valid = n_req;	
-	t_l2_req_addr = (r_state == GNT_MMU) ? w_mmu_mem_req_addr :
-			(r_state == GNT_L1I) ? l1i_mem_req_addr :
-			(r_state == GNT_L1DP) ? w_pf_req_addr : l1d_mem_req_addr;
-	t_l2_req_opcode = (r_state == GNT_MMU) ? MEM_LW :
-			  (r_state == GNT_L1I) ? l1i_mem_req_opcode :
-			  (r_state == GNT_L1DP) ? MEM_LW : l1d_mem_req_opcode;
-	t_l2_req_cacheable = (r_state == GNT_MMU) ? 1'b1 :
-			     (r_state == GNT_L1I) ? l1i_mem_req_cacheable :
-			     (r_state == GNT_L1DP) ? 1'b1 : l1d_mem_req_cacheable;
-	t_l2_req_mask = (r_state == GNT_MMU) ? 16'hffff :
-			(r_state == GNT_L1I) ? l1i_mem_req_mask :
-			(r_state == GNT_L1DP) ? 16'hffff : l1d_mem_req_mask;
-	t_l2_req_store_data = (r_state == GNT_MMU) ? w_mmu_mem_req_data : l1d_mem_req_store_data;
-	
+	n_l1dp_req = r_l1dp_req | w_pf_req_valid;
 	l1d_mem_rsp_valid = 1'b0;
 	l1i_mem_rsp_valid = 1'b0;
 	t_mmu_mem_req_ack = 1'b0;
@@ -763,100 +805,49 @@ module core_l1d_l1i(clk,
 	t_ack_d = 1'b0;
 	t_ack_i = 1'b0;
 	t_ack_m = 1'b0;
-	t_ack_p = 1'b0;
-	t_pf_rsp_valid = 1'b0;
-	n_l1dp_req = r_l1dp_req || w_pf_req_valid;
-	t_l2_req_src = (r_state == GNT_MMU) ? 2'd2 : ((r_state == GNT_L1I) ? 2'd1 :
-							((r_state == GNT_L1DP) ? 2'd3 : 2'd0));
-
-	case(r_state)
-	  IDLE:
-	    begin
-	       if(w_mmu_mem_req_valid && !r_out_m)
+	t_ack_p = 'd0;
+	t_pf_rsp_valid = 'd0;
+	if(w_l1_mem_req_ack)
+	  begin
+	     case(t_sel)
+	       GNT_L1D:
 		 begin
-		    n_state = GNT_MMU;
-		    n_req = 1'b1;
-		 end
-	       else if(n_l1d_req && !r_out_d && !(n_l1i_req && !r_out_i))
-		 begin
-		    n_state = GNT_L1D;
-		    n_req = 1'b1;
-		 end
-	       else if(!(n_l1d_req && !r_out_d) && n_l1i_req && !r_out_i)
-		 begin
-		    n_state = GNT_L1I;
-		    n_req = 1'b1;
-		 end
-	       else if(n_l1d_req && !r_out_d && n_l1i_req && !r_out_i)
-		 begin
-		    n_state = r_last_gnt ? GNT_L1D : GNT_L1I;
-		    n_req = 1'b1;
-		 end
-	       else if(n_l1dp_req && !r_out_p)
-		 begin
-		    n_state = GNT_L1DP;
-		    n_req = 1'b1;
-		 end
-	    end
-	  GNT_L1DP:
-	    begin
-	       n_l1dp_req = 1'b0;
-	       if(w_l1_mem_req_ack)
-		 begin
-		    n_req = 1'b0;
-		    n_state = IDLE;
-		    t_ack_p = 1'b1;
-		 end
-	    end
-	  GNT_L1D:
-	    begin
-	       n_last_gnt = 1'b0;
-	       n_l1d_req = 1'b0;
-	       if(w_l1_mem_req_ack)
-		 begin
-		    n_req = 1'b0;
-		    n_state = IDLE;
+		    n_l1d_req = 1'b0;
+		    n_last_gnt = 1'b0;
 		    t_ack_d = 1'b1;
 		 end
-	    end
-	  GNT_L1I:
-	    begin
-	       n_last_gnt = 1'b1;
-	       n_l1i_req = 1'b0;
-	       if(w_l1_mem_req_ack)
+	       GNT_L1I:
 		 begin
-		    n_req = 1'b0;
-		    n_state = IDLE;
+		    n_l1i_req = 1'b0;
+		    n_last_gnt = 1'b1;
 		    t_ack_i = 1'b1;
 		 end
-	    end
-	  GNT_MMU:
-	    begin
-	       if(w_l1_mem_req_ack)
+	       GNT_MMU:
 		 begin
-		    n_req = 1'b0;
-		    n_state = IDLE;
 		    t_ack_m = 1'b1;
 		    t_mmu_mem_req_ack = 1'b1;
 		 end
-	    end
-	  default:
-	    begin
-	    end
-	  endcase
+	       GNT_L1DP:
+		 begin
+		    n_l1dp_req[t_sel_p] = 1'b0;
+		    t_ack_p[t_sel_p] = 1'b1;
+		 end
+	       default:
+		 begin
+		 end
+	     endcase // case (t_sel)
+	  end
 	/* responses go to the requester the L2 names */
 	if(w_l1_mem_rsp_valid)
 	  begin
-	     l1d_mem_rsp_valid = (w_l1_mem_rsp_src == 2'd0);
-	     l1i_mem_rsp_valid = (w_l1_mem_rsp_src == 2'd1);
-	     t_mmu_mem_rsp_valid = (w_l1_mem_rsp_src == 2'd2);
-	     t_pf_rsp_valid = (w_l1_mem_rsp_src == 2'd3);
+	     l1d_mem_rsp_valid = (w_l1_mem_rsp_src == 3'd0);
+	     l1i_mem_rsp_valid = (w_l1_mem_rsp_src == 3'd1);
+	     t_mmu_mem_rsp_valid = (w_l1_mem_rsp_src == 3'd2);
+	     for(integer e = 0; e < NPF; e = e + 1)
+	       begin
+		  t_pf_rsp_valid[e] = (w_l1_mem_rsp_src == (3'd3 + 3'(e)));
+	       end
 	  end
-	/* L2 pass-through: when the arbiter is idle and grants the L1D, the L1D's
-	 * request reaches the L2 in the grant cycle instead of a cycle later through
-	 * r_req (the L2's address mux selects the L1D while IDLE, so L1D only).
-	 * r_req still follows; the L2 has left IDLE by then and the ack clears it. */
-	t_l2_passthru = (r_state == IDLE) && (n_state == GNT_L1D);
      end // always_comb
 
 
@@ -868,19 +859,21 @@ module core_l1d_l1i(clk,
     * load that owns it (dcache.r_req; stores/commits skipped) */
    import "DPI-C" function void pt_event(input int rob_ptr, input int letter, input longint cycle);
    logic [63:0] r_pt_cycle;
+   state_t r_pt_sel;
    always_ff@(posedge clk)
      begin
 	r_pt_cycle <= w_reset ? 64'd0 : r_pt_cycle + 64'd1;
+	r_pt_sel <= w_reset ? IDLE : ((w_l1_mem_req_ack || (t_sel != GNT_L1D)) ? IDLE : t_sel);
      end
    always_ff@(negedge clk)
      begin
 	if(!w_reset && !dcache.r_req.is_store)
 	  begin
-	     if((r_state == IDLE) && (n_state == GNT_L1D))
+	     if((t_sel == GNT_L1D) && (r_pt_sel != GNT_L1D))
 	       begin
 		  pt_event({{(32-`LG_ROB_ENTRIES){1'b0}}, dcache.r_req.rob_ptr}, "G", r_pt_cycle);
 	       end
-	     if((r_state == GNT_L1D) && w_l1_mem_req_ack)
+	     if((t_sel == GNT_L1D) && w_l1_mem_req_ack)
 	       begin
 		  pt_event({{(32-`LG_ROB_ENTRIES){1'b0}}, dcache.r_req.rob_ptr}, "N", r_pt_cycle);
 	       end
@@ -920,16 +913,16 @@ module core_l1d_l1i(clk,
 	       
 	       .flush_complete(w_l2_flush_complete),
 	       
-	       .l1_mem_req_valid(r_req | t_l2_passthru),
+	       .l1_mem_req_valid(t_sel != IDLE),
 	       .l1_mem_req_ack(w_l1_mem_req_ack),
 	       .l1_mem_req_addr(t_l2_req_addr),
 	       .l1_mem_req_cacheable(t_l2_req_cacheable),
 	       .l1_mem_req_mask(t_l2_req_mask),
 	       .l1_mem_req_store_data(t_l2_req_store_data),
 	       .l1_mem_req_opcode(t_l2_req_opcode),
-	       .l1_mem_req_from_d(r_state != GNT_L1I),
-	       .l1_mem_req_colour((r_state == GNT_L1DP) ? w_pf_req_colour :
-				  (((r_state != GNT_L1I) && (r_state != GNT_MMU)) ? l1d_mem_req_colour : '0)),
+	       .l1_mem_req_from_d(t_sel != GNT_L1I),
+	       .l1_mem_req_colour((t_sel == GNT_L1DP) ? w_pf_req_colour[t_sel_p] :
+				  (((t_sel != GNT_L1I) && (t_sel != GNT_MMU)) ? l1d_mem_req_colour : '0)),
 	       .l1_mem_req_src(t_l2_req_src),
 		       .l2_nocache(l2_nocache),
 	       
@@ -974,28 +967,24 @@ module core_l1d_l1i(clk,
      begin
 	if(w_reset)
 	  begin
-	     r_state <= IDLE;
 	     r_last_gnt <= 1'b0;
 	     r_l1d_req <= 1'b0;
 	     r_l1i_req <= 1'b0;
-	     r_req <= 1'b0;
 	     r_out_d <= 1'b0;
 	     r_out_i <= 1'b0;
 	     r_out_m <= 1'b0;
-	     r_out_p <= 1'b0;
-	     r_l1dp_req <= 1'b0;
+	     r_out_p <= 'd0;
+	     r_l1dp_req <= 'd0;
 	  end
 	else
 	  begin
-	     r_state <= n_state;
 	     r_last_gnt <= n_last_gnt;
 	     r_l1d_req <= n_l1d_req;
 	     r_l1i_req <= n_l1i_req;
-	     r_req <= n_req;	     
 	     r_out_d <= (r_out_d | t_ack_d) & !l1d_mem_rsp_valid;
 	     r_out_i <= (r_out_i | t_ack_i) & !l1i_mem_rsp_valid;
 	     r_out_m <= (r_out_m | t_ack_m) & !t_mmu_mem_rsp_valid;
-	     r_out_p <= (r_out_p | t_ack_p) & !t_pf_rsp_valid;
+	     r_out_p <= (r_out_p | t_ack_p) & ~t_pf_rsp_valid;
 	     r_l1dp_req <= n_l1dp_req;
 	  end
      end

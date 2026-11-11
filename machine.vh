@@ -320,6 +320,11 @@
 `endif
 
 `define LG_L1D_CL_LEN 4
+/* L1D_MULTI_MISS: how many second-miss engines fetch lines for queued loads while a
+ * fill is out (each is its own arbiter source, 3.., so at most 5) */
+`ifndef L1D_PF_ENGINES
+ `define L1D_PF_ENGINES 3
+`endif
 
 //number of sets in direct mapped cache
 /* GEOMETRY OVERRIDE: each size below is wrapped in `ifndef, so ANY of them can be set

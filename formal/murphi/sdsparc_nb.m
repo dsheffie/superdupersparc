@@ -45,6 +45,17 @@
 --     paths empty, and takes no L1 request while the snoop transaction runs.  dsheffie
 --     2026-11-10: DMA snoop latency doesn't matter, so correct-but-slow is fine.
 --
+-- The RTL's pipelined L2 (l2.sv L2_PIPE, 2026-11-11) needs no change here: an MSHR is any
+-- request in flight in the L2 -- in S1/S2, handed to the serial state machine, parked or
+-- deferred -- and a fast-path hit is an MSHR that goes accept -> look -> respond with nothing
+-- else on its set in between, one of the interleavings already explored.  With L2SETS=2 and
+-- P1, at most two transactions exist, so NM=2 covers every interleaving.  The RTL must keep:
+--  R1 S0 takes no request to a set in S1/S2, the parked fill or the deferred request (P1);
+--  R2 a fill's response reaches its L1 before any later probe of the line (P3: the RTL's
+--     probes use separate wires, so a set is busy until its response is delivered, not queued);
+--  R3 a writeback hit writes in S2, with R1 keeping its set to itself since its accept;
+--  R4 a DMA snoop waits for an empty pipeline (DMA_QUIESCE).
+--
 -- Checked: loads see the program-order value; DMA-out reads the latest value; one L1D copy
 -- per PA; presence; inclusion.  Deadlock: CHECK_RULES=0 L1I=0 (CMurphi's deadlock = no
 -- rule changes the state; L1I miss/invalidate cycles would mask a D-side deadlock).

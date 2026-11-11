@@ -305,10 +305,11 @@ module l1d(clk,
    input logic [L1D_CL_LEN_BITS-1:0] 	  mem_rsp_load_data;
    /* L1D_MULTI_MISS: the second miss engine's L2 request (its own arbiter source) and
     * response; the response data rides mem_rsp_load_data */
-   output logic 			  pf_req_valid;
-   output logic [`PA_WIDTH-1:0] 	  pf_req_addr;
-   output logic [`L1D_N_COLOUR-1:0] 	  pf_req_colour;
-   input logic 				  pf_rsp_valid;
+   /* one of each per second-miss engine */
+   output logic [`L1D_PF_ENGINES-1:0] 	  pf_req_valid;
+   output logic [`L1D_PF_ENGINES-1:0][`PA_WIDTH-1:0] pf_req_addr;
+   output logic [`L1D_PF_ENGINES-1:0][`L1D_N_COLOUR-1:0] pf_req_colour;
+   input logic [`L1D_PF_ENGINES-1:0] 	  pf_rsp_valid;
    input logic 				  mem_rsp_bad;        /* uncached load answered with a bus error */
 
    
@@ -647,16 +648,44 @@ endfunction
 			     PF_WAIT = 2'd2,
 			     PF_DATA = 2'd3
 			     } pf_state_t;
-   pf_state_t r_pf_state, n_pf_state;
-   logic [`PA_WIDTH-1:0] 	      r_pf_addr;
-   logic [`LG_L1D_NUM_SETS-1:0]       r_pf_idx;
-   logic [L1D_CL_LEN_BITS-1:0]        r_pf_data;
-   logic 			      r_pf_cancel, r_pf_req;
-   logic 			      t_pf_rd, t_pf_install, t_pf_issue, t_pf_hitset;
+   localparam NPF = `L1D_PF_ENGINES;
+   localparam LG_NPF = (NPF > 1) ? $clog2(NPF) : 1;
+   pf_state_t r_pf_state[NPF-1:0], n_pf_state[NPF-1:0];
+   logic [`PA_WIDTH-1:0] 	      r_pf_addr[NPF-1:0];
+   logic [`LG_L1D_NUM_SETS-1:0]       r_pf_idx[NPF-1:0];
+   logic [L1D_CL_LEN_BITS-1:0]        r_pf_data[NPF-1:0];
+   logic [NPF-1:0] 		      r_pf_cancel, r_pf_req, t_pf_issue, t_pf_hitset, w_pf_busy_v;
+   logic 			      t_pf_rd, t_pf_install;
+   logic 			      t_pf_early;   /* an engine takes the line of a load port 2 just missed */
+   logic [LG_NPF-1:0] 		      t_pf_rd_e, t_pf_inst_e;   /* which engine reads / installs */
    logic [(1<<`LG_MRQ_ENTRIES)-1:0]   r_pf_tried;   /* MQ slots already checked */
    logic [`LG_MRQ_ENTRIES-1:0] 	      t_pf_slot;
    logic 			      t_pf_found;
-   wire 			      w_pf_busy = PFE && (r_pf_state != PF_IDLE);
+   always_comb
+     begin
+	for(integer e = 0; e < NPF; e = e + 1)
+	  begin
+	     w_pf_busy_v[e] = PFE && (r_pf_state[e] != PF_IDLE);
+	  end
+     end
+   wire 			      w_pf_busy = |w_pf_busy_v;
+   /* N2: an engine owns its set from its check until it installs or drops the line */
+   function automatic logic pf_owns(input logic [`LG_L1D_NUM_SETS-1:0] idx);
+      begin
+	 pf_owns = 1'b0;
+	 for(integer e = 0; e < NPF; e = e + 1)
+	   begin
+	      if(w_pf_busy_v[e] && (r_pf_idx[e] == idx))
+		begin
+		   pf_owns = 1'b1;
+		end
+	   end
+      end
+   endfunction
+   /* the installing engine's line */
+   wire [`LG_L1D_NUM_SETS-1:0] 	      w_pf_inst_idx = r_pf_idx[t_pf_inst_e];
+   wire [`PA_WIDTH-1:0] 	      w_pf_inst_addr = r_pf_addr[t_pf_inst_e];
+   wire [L1D_CL_LEN_BITS-1:0] 	      w_pf_inst_data = r_pf_data[t_pf_inst_e];
 `ifdef VERILATOR
    /* stage B probe statistics (sim only) */
    logic [63:0] r_dbg_prb, r_dbg_prb_hit, r_dbg_prb_dirty;
@@ -1788,8 +1817,8 @@ endfunction
 
    always_comb
      begin
-	t_array_wr_addr = mem_rsp_valid ? r_mem_req_idx : (t_pf_install ? r_pf_idx : r_cache_idx);
-	t_array_wr_data = mem_rsp_valid ? mem_rsp_load_data : (t_pf_install ? r_pf_data : t_array_data);
+	t_array_wr_addr = mem_rsp_valid ? r_mem_req_idx : (t_pf_install ? w_pf_inst_idx : r_cache_idx);
+	t_array_wr_data = mem_rsp_valid ? mem_rsp_load_data : (t_pf_install ? w_pf_inst_data : t_array_data);
 	t_array_wr_en = w_cacheable_mem_rsp_valid || t_wr_array || t_pf_install;
      end
 
@@ -1872,8 +1901,8 @@ endfunction
       .wr_data(w_dpreload ? fml_pre_tag : r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
       .wr_en(w_cacheable_mem_rsp_valid | w_dpreload),
 `else
-      .wr_addr(t_pf_install ? r_pf_idx : r_mem_req_idx),
-      .wr_data(t_pf_install ? r_pf_addr[`PA_WIDTH-1:TAG_LSB] : r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
+      .wr_addr(t_pf_install ? w_pf_inst_idx : r_mem_req_idx),
+      .wr_data(t_pf_install ? w_pf_inst_addr[`PA_WIDTH-1:TAG_LSB] : r_mem_req_addr[`PA_WIDTH-1:TAG_LSB]),
       .wr_en(w_cacheable_mem_rsp_valid | t_pf_install),
 `endif
       .rd_data0(r_tag_out),
@@ -1924,7 +1953,7 @@ endfunction
 	  end	
 	else if(t_pf_install)
 	  begin
-	     t_dirty_wr_addr = r_pf_idx;
+	     t_dirty_wr_addr = w_pf_inst_idx;
 	     t_write_dirty_en = 1'b1;
 	  end
      end
@@ -1967,7 +1996,7 @@ endfunction
 	  end
 	else if(t_pf_install)
 	  begin
-	     t_valid_wr_addr = r_pf_idx;
+	     t_valid_wr_addr = w_pf_inst_idx;
 	     t_valid_value = 1'b1;
 	     t_write_valid_en = 1'b1;
 	  end
@@ -1985,9 +2014,9 @@ endfunction
       .rd_data1(r_valid_out2)
       );
 
-   /* ---- L1D_MULTI_MISS second miss engine (see the declarations) ---- */
+   /* ---- L1D_MULTI_MISS second miss engines (see the declarations) ---- */
    /* the candidate: the oldest queued cacheable simple load of this era, to a set other
-    * than the outstanding fill's, not yet checked */
+    * than the outstanding fill's and every engine's, not yet checked */
    always_comb
      begin
 	t_pf_found = 1'b0;
@@ -1998,7 +2027,8 @@ endfunction
 	     s = r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0] + k[`LG_MRQ_ENTRIES-1:0];
 	     if(r_mq_addr_valid[s] && !r_pf_tried[s] && !r_mem_q[s].commit && !r_mem_q[s].is_store &&
 		!r_mem_q[s].is_atomic && r_mem_q[s].lsu_hold && r_mem_q[s].cached &&
-		(r_mem_q[s].restart_id == restart_color) && (r_mq_addr[s] != r_mem_req_idx))
+		(r_mem_q[s].restart_id == restart_color) && (r_mq_addr[s] != r_mem_req_idx) &&
+		!pf_owns(r_mq_addr[s]))
 	       begin
 		  t_pf_found = 1'b1;
 		  t_pf_slot = s;
@@ -2007,108 +2037,168 @@ endfunction
      end // always_comb
    wire [`LG_L1D_NUM_SETS-1:0] w_pf_cand_idx = r_mq_addr[t_pf_slot];
    wire 		       w_pf_cand_ok = PFE && t_pf_found;
-   assign pf_req_valid = r_pf_req;
-   assign pf_req_addr = r_pf_addr;
-   assign pf_req_colour = N_COLOUR'(r_pf_idx >> IDX_IN_PG);
+   always_comb
+     begin
+	for(integer e = 0; e < NPF; e = e + 1)
+	  begin
+	     pf_req_valid[e] = r_pf_req[e];
+	     pf_req_addr[e] = r_pf_addr[e];
+	     pf_req_colour[e] = N_COLOUR'(r_pf_idx[e] >> IDX_IN_PG);
+	  end
+     end
+
+   /* the lowest idle engine takes the candidate; the lowest engine holding data whose
+    * line is still good installs when the array write port is free */
+   always_comb
+     begin
+	t_pf_rd_e = 'd0;
+	for(integer e = NPF-1; e >= 0; e = e - 1)
+	  begin
+	     if(r_pf_state[e] == PF_IDLE)
+	       begin
+		  t_pf_rd_e = LG_NPF'(e);
+	       end
+	  end
+     end // always_comb
 
    always_comb
      begin
-	n_pf_state = r_pf_state;
-	t_pf_issue = 1'b0;
 	t_pf_install = 1'b0;
-	/* anything that writes the engine's set, or a probe of its line, drops the line */
-	t_pf_hitset = (w_cacheable_mem_rsp_valid && (r_mem_req_idx == r_pf_idx)) ||
-		      (t_wr_array && (r_cache_idx == r_pf_idx)) ||
-		      (t_mark_invalid && (r_cache_idx == r_pf_idx)) ||
-		      (probe_req && (probe_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN] == r_pf_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN]));
-	case(r_pf_state)
-	  PF_IDLE:
-	    begin
-	       if(t_pf_rd)
+	t_pf_inst_e = 'd0;
+	for(integer e = 0; e < NPF; e = e + 1)
+	  begin
+	     n_pf_state[e] = r_pf_state[e];
+	     t_pf_issue[e] = 1'b0;
+	     /* anything that writes the engine's set, or a probe of its line, drops the line */
+	     t_pf_hitset[e] = (w_cacheable_mem_rsp_valid && (r_mem_req_idx == r_pf_idx[e])) ||
+			      (t_wr_array && (r_cache_idx == r_pf_idx[e])) ||
+			      (t_mark_invalid && (r_cache_idx == r_pf_idx[e])) ||
+			      (probe_req && (probe_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN] ==
+					     r_pf_addr[e][`PA_WIDTH-1:`LG_L1D_CL_LEN]));
+	  end
+	for(integer e = NPF-1; e >= 0; e = e - 1)
+	  begin
+	     case(r_pf_state[e])
+	       PF_IDLE:
 		 begin
-		    n_pf_state = PF_CHECK;
+		    if(t_pf_early && (t_pf_rd_e == LG_NPF'(e)))
+		      begin
+			 /* port 2's read was the check */
+			 t_pf_issue[e] = 1'b1;
+			 n_pf_state[e] = PF_WAIT;
+		      end
+		    else if(t_pf_rd && (t_pf_rd_e == LG_NPF'(e)))
+		      begin
+			 n_pf_state[e] = PF_CHECK;
+		      end
 		 end
-	    end
-	  PF_CHECK:
-	    begin
-	       /* port 1 read the set last cycle: the line is already here, or the victim
-		* is dirty (that needs a writeback -- leave it to the normal miss) */
-	       if(t_pf_hitset || (r_valid_out && (r_tag_out == r_pf_addr[`PA_WIDTH-1:TAG_LSB])) ||
-		  (r_valid_out && r_dirty_out))
+	       PF_CHECK:
 		 begin
-		    n_pf_state = PF_IDLE;
+		    /* port 1 read the set last cycle (one engine checks at a time): the
+		     * line is already here, or the victim is dirty (that needs a
+		     * writeback -- leave it to the normal miss) */
+		    if(t_pf_hitset[e] || (r_valid_out && (r_tag_out == r_pf_addr[e][`PA_WIDTH-1:TAG_LSB])) ||
+		       (r_valid_out && r_dirty_out))
+		      begin
+			 n_pf_state[e] = PF_IDLE;
+		      end
+		    else
+		      begin
+			 t_pf_issue[e] = 1'b1;
+			 n_pf_state[e] = PF_WAIT;
+		      end
 		 end
-	       else
+	       PF_WAIT:
 		 begin
-		    t_pf_issue = 1'b1;
-		    n_pf_state = PF_WAIT;
+		    if(pf_rsp_valid[e])
+		      begin
+			 n_pf_state[e] = (r_pf_cancel[e] || t_pf_hitset[e]) ? PF_IDLE : PF_DATA;
+		      end
 		 end
-	    end
-	  PF_WAIT:
-	    begin
-	       if(pf_rsp_valid)
+	       PF_DATA:
 		 begin
-		    n_pf_state = (r_pf_cancel || t_pf_hitset) ? PF_IDLE : PF_DATA;
+		    if(r_pf_cancel[e] || t_pf_hitset[e])
+		      begin
+			 n_pf_state[e] = PF_IDLE;
+		      end
+		    else if(!mem_rsp_valid && !t_wr_array && !t_mark_invalid && !probe_req)
+		      begin
+			 t_pf_inst_e = LG_NPF'(e);
+		      end
 		 end
-	    end
-	  PF_DATA:
-	    begin
-	       if(r_pf_cancel || t_pf_hitset)
+	       default:
 		 begin
-		    n_pf_state = PF_IDLE;
 		 end
-	       else if(!mem_rsp_valid && !t_wr_array && !t_mark_invalid && !probe_req)
-		 begin
-		    t_pf_install = 1'b1;
-		    n_pf_state = PF_IDLE;
-		 end
-	    end
-	  default:
-	    begin
-	    end
-	endcase // case (r_pf_state)
+	     endcase // case (r_pf_state[e])
+	  end
+	/* the loop above leaves the lowest installing engine in t_pf_inst_e */
+	if(PFE && (r_pf_state[t_pf_inst_e] == PF_DATA) && !r_pf_cancel[t_pf_inst_e] && !t_pf_hitset[t_pf_inst_e] &&
+	   !mem_rsp_valid && !t_wr_array && !t_mark_invalid && !probe_req)
+	  begin
+	     t_pf_install = 1'b1;
+	     n_pf_state[t_pf_inst_e] = PF_IDLE;
+	  end
      end // always_comb
 
    always_ff@(posedge clk)
      begin
+	for(integer e = 0; e < NPF; e = e + 1)
+	  begin
+	     if(reset)
+	       begin
+		  r_pf_state[e] <= PF_IDLE;
+		  r_pf_req[e] <= 1'b0;
+		  r_pf_cancel[e] <= 1'b0;
+	       end
+	     else
+	       begin
+		  r_pf_state[e] <= n_pf_state[e];
+		  r_pf_req[e] <= t_pf_issue[e];
+		  r_pf_cancel[e] <= (n_pf_state[e] == PF_IDLE) ? 1'b0 :
+				    (((r_pf_state[e] == PF_WAIT) || (r_pf_state[e] == PF_DATA)) && t_pf_hitset[e]) ? 1'b1 :
+				    r_pf_cancel[e];
+	       end
+	     if(t_pf_early && (t_pf_rd_e == LG_NPF'(e)))
+	       begin
+		  r_pf_addr[e] <= {t_remapped_req2.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
+		  r_pf_idx[e] <= t_req2_idx;
+	       end
+	     else if(t_pf_rd && (t_pf_rd_e == LG_NPF'(e)))
+	       begin
+		  r_pf_addr[e] <= {r_mem_q[t_pf_slot].addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
+		  r_pf_idx[e] <= w_pf_cand_idx;
+	       end
+	     if(pf_rsp_valid[e] && (r_pf_state[e] == PF_WAIT))
+	       begin
+		  r_pf_data[e] <= mem_rsp_load_data;
+	       end
+	  end
 	if(reset)
 	  begin
-	     r_pf_state <= PF_IDLE;
-	     r_pf_req <= 1'b0;
-	     r_pf_cancel <= 1'b0;
 	     r_pf_tried <= 'd0;
 	  end
 	else
 	  begin
-	     r_pf_state <= n_pf_state;
-	     r_pf_req <= t_pf_issue;
-	     r_pf_cancel <= (n_pf_state == PF_IDLE) ? 1'b0 :
-			    (((r_pf_state == PF_WAIT) || (r_pf_state == PF_DATA)) && t_pf_hitset) ? 1'b1 :
-			    r_pf_cancel;
-	     /* a slot is checked once per occupant: cleared when an op is pushed into it */
-	     r_pf_tried <= (r_pf_tried | (t_pf_rd ? ((1 << `LG_MRQ_ENTRIES)'(1) << t_pf_slot) : 'd0)) &
-			   ~(t_push_miss ? ((1 << `LG_MRQ_ENTRIES)'(1) << r_mq_tail_ptr[`LG_MRQ_ENTRIES-1:0]) : 'd0);
-	  end
-	if(t_pf_rd)
-	  begin
-	     r_pf_addr <= {r_mem_q[t_pf_slot].addr[`PA_WIDTH-1:`LG_L1D_CL_LEN], {`LG_L1D_CL_LEN{1'b0}}};
-	     r_pf_idx <= w_pf_cand_idx;
-	  end
-	if(pf_rsp_valid && (r_pf_state == PF_WAIT))
-	  begin
-	     r_pf_data <= mem_rsp_load_data;
+	     /* a slot is checked once per occupant: cleared when an op is pushed into it,
+	      * set at once when an engine took the op's line as it was pushed */
+	     r_pf_tried <= ((r_pf_tried | (t_pf_rd ? ((1 << `LG_MRQ_ENTRIES)'(1) << t_pf_slot) : 'd0)) &
+			    ~(t_push_miss ? ((1 << `LG_MRQ_ENTRIES)'(1) << r_mq_tail_ptr[`LG_MRQ_ENTRIES-1:0]) : 'd0)) |
+			   (t_pf_early ? ((1 << `LG_MRQ_ENTRIES)'(1) << r_mq_tail_ptr[`LG_MRQ_ENTRIES-1:0]) : 'd0);
 	  end
      end // always_ff@ (posedge clk)
 `ifdef VERILATOR
    always_ff@(negedge clk)
      begin
-	if(!reset && pf_rsp_valid && (r_pf_state != PF_WAIT))
+	for(integer e = 0; e < NPF; e = e + 1)
 	  begin
-	     $display("l1d: prefetch response with no prefetch outstanding");
-	     $stop();
+	     if(!reset && pf_rsp_valid[e] && (r_pf_state[e] != PF_WAIT))
+	       begin
+		  $display("l1d: prefetch response with no prefetch outstanding (engine %0d)", e);
+		  $stop();
+	       end
 	  end
      end
-   longint unsigned c_pf_rd, c_pf_issue, c_pf_install;
+   longint unsigned c_pf_rd, c_pf_issue, c_pf_install, c_pf_early;
    always_ff@(posedge clk)
      begin
 	if(reset)
@@ -2116,19 +2206,21 @@ endfunction
 	     c_pf_rd <= 0;
 	     c_pf_issue <= 0;
 	     c_pf_install <= 0;
+	     c_pf_early <= 0;
 	  end
 	else
 	  begin
 	     c_pf_rd <= c_pf_rd + (t_pf_rd ? 1 : 0);
-	     c_pf_issue <= c_pf_issue + (t_pf_issue ? 1 : 0);
+	     c_pf_issue <= c_pf_issue + 64'($countones(t_pf_issue));
 	     c_pf_install <= c_pf_install + (t_pf_install ? 1 : 0);
+	     c_pf_early <= c_pf_early + (t_pf_early ? 1 : 0);
 	  end
      end
    final
      begin
 	if(PFE)
 	  begin
-	     $display("[L1DMM] checked %0d issued %0d installed %0d", c_pf_rd, c_pf_issue, c_pf_install);
+	     $display("[L1DMM] engines %0d early %0d checked %0d issued %0d installed %0d", NPF, c_pf_early, c_pf_rd, c_pf_issue, c_pf_install);
 	  end
      end
 `endif
@@ -2778,6 +2870,7 @@ endfunction
 	
 	t_got_miss = 1'b0;
 	t_push_miss = 1'b0;
+	t_pf_early = 1'b0;
 	t_mmureg_wr = 1'b0;
 	t_mmureg_fsr_clr = 1'b0;
 	t_asi_tlb_flush = 1'b0;
@@ -2908,8 +3001,8 @@ endfunction
 			   mem_q_empty && !r_got_req && !rr_last_wr && !r_lock_cache &&
 			   !n_flush_req && !n_flush_cl_req && !r_fill_rsp_pend &&
 			   !(r_valid_out2 && r_dirty_out2) &&
-			   /* N2: no second fill into the prefetch engine's set */
-			   !(w_pf_busy && (t_req2_idx == r_pf_idx)) &&
+			   /* N2: no second fill into a prefetch engine's set */
+			   !pf_owns(t_req2_idx) &&
 			   /* the victim port 2 read (VA index) must be the set the fill
 			    * replaces (PA index): differs only when the L1D exceeds a page */
 			   (r_cache_idx2 == t_req2_idx);
@@ -3188,6 +3281,22 @@ endfunction
 			 else
 			   begin
 			      t_push_miss = 1'b1;
+			      /* L1D_MULTI_MISS early request (rv64core nu_l1d w_gen_early_req):
+			       * port 2 just read the set, so a cacheable simple load whose line
+			       * is absent and whose victim is clean has its line fetched now, in
+			       * any state, by an idle engine -- N2 (no other fill to the set, no
+			       * write to it in flight) as for the direct fill above */
+			      t_pf_early = PFE && !(&w_pf_busy_v) &&
+					   r_req2.lsu_hold && !r_req2.is_store && t_remapped_req2.cached &&
+					   !t_port2_hit_cache && !r_hit_busy_addr2 &&
+					   !r_got_req && !rr_last_wr && !r_lock_cache &&
+					   !n_flush_req && !n_flush_cl_req &&
+					   !(r_valid_out2 && r_dirty_out2) &&
+					   !pf_owns(t_req2_idx) && (t_req2_idx != r_mem_req_idx) &&
+					   (r_cache_idx2 == t_req2_idx) &&
+					   !(w_cacheable_mem_rsp_valid && (r_mem_req_idx == t_req2_idx)) &&
+					   !(probe_req && (probe_addr[`PA_WIDTH-1:`LG_L1D_CL_LEN] ==
+							   t_remapped_req2.addr[`PA_WIDTH-1:`LG_L1D_CL_LEN]));
 			   end
 			 if(t_port2_hit_cache)
 			   begin
@@ -3462,8 +3571,8 @@ endfunction
 
 	       
 	     if(!mem_q_empty && !t_got_miss && !r_lock_cache && !t_prb_pend &&
-		/* N2: the head op waits while the prefetch engine fills its set */
-		!(w_pf_busy && (r_mq_addr[r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0]] == r_pf_idx)))
+		/* N2: the head op waits while a prefetch engine fills its set */
+		!pf_owns(r_mq_addr[r_mq_head_ptr[`LG_MRQ_ENTRIES-1:0]]))
 	       begin
 		  if(!t_mh_block)
 		    begin
@@ -3930,7 +4039,7 @@ endfunction
 	  end
 	/* L1D_MULTI_MISS: while the fill waits (and port 1 is idle), read the next
 	 * queued op's set to see whether its line can be fetched alongside */
-	t_pf_rd = PFE && (r_pf_state == PF_IDLE) && (r_state == INJECT_RELOAD) &&
+	t_pf_rd = PFE && !(&w_pf_busy_v) && !t_pf_early && (r_state == INJECT_RELOAD) &&
 		  (n_state == INJECT_RELOAD) && !mem_rsp_valid && !t_prb_pend && w_pf_cand_ok;
 	if(t_pf_rd)
 	  begin
