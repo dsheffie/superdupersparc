@@ -985,6 +985,15 @@ int main(int argc, char **argv) {
   std::string branch_name = "branch_info.txt";
   uint64_t heartbeat = 1UL<<36, start_trace_at = ~0UL;
   uint64_t max_cycle = 0, max_icnt = 0, mem_lat = 2;
+  /* --warmup: retire this many instructions before measuring.  A checkpoint resumes
+   * with every cache, TLB and predictor cold; the stats file (-l) then covers only
+   * the --maxicnt instructions after the warm-up (the RTL's own counters printed at
+   * the end still cover the whole run). */
+  uint64_t warmup = 0;
+  struct {
+    uint64_t cycle = 0, insns = 0, mispredicts = 0, l1d_hits = 0, l1d_acc = 0;
+    uint64_t l2_hits = 0, l2_acc = 0, loads = 0, stores = 0;
+  } w0;
   /* MBus mode, data cache enabled (DE), MMU-off accesses cacheable (AC): an elf
    * runs cached, as the RTL caches only with DE (and AC with the MMU off) */
   std::string mmu_ctrl = "0x8900", mmu_ctpr = "0", mmu_ctx = "0";
@@ -1021,7 +1030,8 @@ int main(int argc, char **argv) {
       ("pipeend", po::value<uint64_t>(&pipeend)->default_value(~0UL), "when to stop logging")
       ("topdown", po::value<bool>(&topdown::enabled)->default_value(false), "top-down slot accounting over the pipestart..pipeend window (build with +define+TOPDOWN)")
       ("maxcycle", po::value<uint64_t>(&max_cycle)->default_value(1UL<<34), "maximum cycles")
-      ("maxicnt", po::value<uint64_t>(&max_icnt)->default_value(1UL<<50), "maximum icnt")
+      ("maxicnt", po::value<uint64_t>(&max_icnt)->default_value(1UL<<50), "maximum icnt (after --warmup)")
+      ("warmup", po::value<uint64_t>(&warmup)->default_value(0), "instructions retired before the stats (-l) start counting")
       ("trace,t", po::value<bool>(&globals::trace_retirement)->default_value(false), "trace retired instruction stream")
       ("mmu-ctrl", po::value<std::string>(&mmu_ctrl), "SRMMU control register at reset (sim: until ASI 0x4 is plumbed)")
       ("mmu-ctpr", po::value<std::string>(&mmu_ctpr), "SRMMU context table pointer at reset")
@@ -1181,7 +1191,7 @@ int main(int argc, char **argv) {
   double t0 = timestamp();
   bool irq_pending = false;
   uint32_t irq_pc = 0, irq_level = 0;
-  while(!Verilated::gotFinish() && (globals::cycle < max_cycle) && (insns_retired < max_icnt)) {
+  while(!Verilated::gotFinish() && (globals::cycle < max_cycle) && (insns_retired < (max_icnt + warmup))) {
     if(g_board) {
       /* an APC halt (sun4m.cc) holds retirement; time skips to the next timer
        * event until an interrupt is requested (ss10sim's rule) */
@@ -1260,6 +1270,18 @@ int main(int argc, char **argv) {
     for(int i = 0; i < n_retire; i++) {
       const uint32_t rpc = static_cast<uint32_t>(retire_pcs[i]);
       ++insns_retired;
+      if(insns_retired == warmup) {
+	w0.cycle = globals::cycle;
+	w0.insns = insns_retired;
+	w0.mispredicts = n_mispredicts;
+	w0.l1d_hits = tb->l1d_cache_hits;
+	w0.l1d_acc = tb->l1d_cache_accesses;
+	w0.l2_hits = tb->l2_cache_hits;
+	w0.l2_acc = tb->l2_cache_accesses;
+	w0.loads = n_loads;
+	w0.stores = n_stores;
+	std::cout << "warm-up done at cycle " << globals::cycle << "\n";
+      }
       if(last_retire > 1) {
 	pushout_histo[rpc] += last_retire;
       }
@@ -1584,12 +1606,17 @@ int main(int argc, char **argv) {
 
   if(!incorrect) {
     std::ofstream out(log_name);
-    out << "n_mispredicts = " << n_mispredicts
-	<<  ", cycles = " << globals::cycle
-	<< ", insns = " << insns_retired
+    /* everything below the warm-up line is measured from it (w0 is zero without one) */
+    const uint64_t m_cycles = globals::cycle - w0.cycle, m_insns = insns_retired - w0.insns;
+    if(warmup != 0) {
+      out << "warmup = " << warmup << " insns, " << w0.cycle << " cycles\n";
+    }
+    out << "n_mispredicts = " << (n_mispredicts - w0.mispredicts)
+	<<  ", cycles = " << m_cycles
+	<< ", insns = " << m_insns
 	<< ", n_checks = " << n_checks
 	<< "\n";
-    out << static_cast<double>(insns_retired) / globals::cycle << " insn per cycle\n";
+    out << static_cast<double>(m_insns) / m_cycles << " insn per cycle\n";
     double avg_inflight = 0, sum = 0;
     for(int i = 0; i < 32; i++) {
       if(inflight[i] == 0) continue;
@@ -1605,10 +1632,10 @@ int main(int argc, char **argv) {
 	      << ", max inflight = " << max_inflight << "\n";
   
 
-    out << "l1d cache hits = " << tb->l1d_cache_hits << "\n";
-    out << "l1d cache accesses = " << tb->l1d_cache_accesses << "\n";
+    out << "l1d cache hits = " << (tb->l1d_cache_hits - w0.l1d_hits) << "\n";
+    out << "l1d cache accesses = " << (tb->l1d_cache_accesses - w0.l1d_acc) << "\n";
     out << "l1d hit rate = "
-	      << 100.0 *(static_cast<double>(tb->l1d_cache_hits) / tb->l1d_cache_accesses)
+	      << 100.0 *(static_cast<double>(tb->l1d_cache_hits - w0.l1d_hits) / (tb->l1d_cache_accesses - w0.l1d_acc))
 	      << "\n";
     out << "l1i cache hits = " << tb->l1i_cache_hits << "\n";
     out << "l1i cache accesses = " << tb->l1i_cache_accesses << "\n";
@@ -1616,8 +1643,8 @@ int main(int argc, char **argv) {
 	      << 100.0 *(static_cast<double>(tb->l1i_cache_hits) / tb->l1i_cache_accesses)
 	      << "\n";
 
-    out << "l2 cache hits = " << tb->l2_cache_hits << "\n";
-    out << "l2 cache accesses = " << tb->l2_cache_accesses << "\n";
+    out << "l2 cache hits = " << (tb->l2_cache_hits - w0.l2_hits) << "\n";
+    out << "l2 cache accesses = " << (tb->l2_cache_accesses - w0.l2_acc) << "\n";
 
 
     out << "branch mispredict rate = "
@@ -1625,11 +1652,11 @@ int main(int argc, char **argv) {
 	      << "\n";
 
     out << "mispredicts per kiloinsn = "
-	      << (static_cast<double>(n_mispredicts) / insns_retired) * 1000.0
+	      << (static_cast<double>(n_mispredicts - w0.mispredicts) / m_insns) * 1000.0
 	      << "\n";
     out << n_flush_cycles << " cycles spent flushing caches\n";
-    out << n_loads << " cache line loads\n";
-    out << n_stores << " cache line stores\n";
+    out << (n_loads - w0.loads) << " cache line loads\n";
+    out << (n_stores - w0.stores) << " cache line stores\n";
     out << l1d_misses << " l1d misses\n";
     out << l1d_insns << " insns access the l1d\n";
 
