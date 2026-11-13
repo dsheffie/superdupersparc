@@ -3132,9 +3132,15 @@ endfunction
 		    else if(w_tlb_miss2)
 		      begin
 			 /* dtlb miss: walk (unless one is pending) and hold the request in
-			  * the LSU until the walk is done */
+			  * the LSU until the walk is done.  While a fault is cached only the
+			  * ROB head may start a walk (a walk start drops the cached fault):
+			  * otherwise younger misses to two faulting pages trade the walker
+			  * and each wipes the other's fault before the head replays (a
+			  * window fill straddling two pages under MCR.NF: Kodiak livelock,
+			  * sparc_tests/nf_fill.S).  A blocked younger one re-issues while
+			  * tlb_busy is low, so it waits out the head or takes its own fault. */
 			 t_pt2 = "T";
-			 t_walk_start = !r_walk_busy;
+			 t_walk_start = !r_walk_busy & (!r_fc_valid | w_req2_nonspec);
 			 t_sb_unres_clr = r_req2.is_store;
 			 n_core_mem_blk_valid = 1'b1;
 			 n_core_mem_rsp.blk = BLK_TLB;
