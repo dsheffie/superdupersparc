@@ -2234,4 +2234,21 @@ endfunction
 	  end
      end
    
+`ifdef VERILATOR
+   /* sim-only: every line the L1I fills checked against the checker's memory
+    * (top.cc) -- a stale fill shows up where it enters, not later as a retire
+    * mismatch */
+   import "DPI-C" function void l1i_fill_chk(input longint pa, input int w0, input int w1, input int w2,
+					      input int w3, input int way, input int idx);
+   always_ff@(negedge clk)
+     begin
+	if(!reset && mem_rsp_valid)
+	  begin
+	     l1i_fill_chk({{(64-`PA_WIDTH){1'b0}}, r_mem_req_addr}, mem_rsp_load_data[31:0], mem_rsp_load_data[63:32],
+			  mem_rsp_load_data[95:64], mem_rsp_load_data[127:96], {31'd0, r_fill_way},
+			  {{(32-(IDX_STOP-IDX_START)){1'b0}}, r_miss_pc[IDX_STOP-1:IDX_START]});
+	  end
+     end // always_ff@ (negedge clk)
+`endif
+
 endmodule

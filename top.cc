@@ -91,6 +91,36 @@ extern "C" {
  * PIL 11:8, S 7, PS 6, ET 5, CWP 4:0) and WIM after its last retire cycle */
 static uint32_t g_rtl_psr = 0, g_rtl_wim = 0;
 static bool g_rtl_sregs_valid = false;
+/* l1i.sv: an L1I line fill against memory (the checker's, ss, and the RTL
+ * image, s); bus word k is the 4 bytes at line+4k as stored */
+extern "C" void l1i_fill_chk(long long pa, int w0, int w1, int w2, int w3, int way, int idx) {
+  static uint64_t n_bad = 0;
+  if(ss == nullptr) {
+    return;
+  }
+  const uint32_t w[4] = {static_cast<uint32_t>(w0), static_cast<uint32_t>(w1), static_cast<uint32_t>(w2), static_cast<uint32_t>(w3)};
+  bool bad = false;
+  for(int k = 0; k < 4; k++) {
+    if(w[k] != ss->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k)) {
+      bad = true;
+    }
+  }
+  if(bad and (n_bad++ < 40)) {
+    std::cout << "[L1IFILL] cyc " << globals::cycle << " pa " << std::hex << pa << " way " << way << " idx " << idx << " rtl";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << w[k];
+    }
+    std::cout << " iss";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << ss->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k);
+    }
+    std::cout << " rtlimg";
+    for(int k = 0; k < 4; k++) {
+      std::cout << " " << s->mem.get<uint32_t>(static_cast<uint64_t>(pa) + 4*k);
+    }
+    std::cout << std::dec << "\n";
+  }
+}
 extern "C" void rtl_sregs(int psr, int wim) {
   g_rtl_psr = static_cast<uint32_t>(psr);
   g_rtl_wim = static_cast<uint32_t>(wim);
