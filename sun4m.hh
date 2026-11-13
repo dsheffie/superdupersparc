@@ -204,6 +204,7 @@ struct esp_t {
   scsi_req_t req;
   uint32_t async_off = 0, async_len = 0;  /* the part of req.buf still to move */
   bool irq = false;                /* to the espdma */
+  bool irq_deferred = false;       /* a raise held until the DMA's writes land (dma_busy) */
 };
 
 /* Am7990 Lance Ethernet at 0xef0c00000 (RDP at +0, RAP at +2), the ledma's
@@ -241,6 +242,15 @@ public:
    * snoops those lines out of the CPU's caches (null: the DMA is coherent) */
   void (*dma_snoop)(void *ctx, uint64_t pa, uint32_t len) = nullptr;
   void *dma_snoop_ctx = nullptr;
+  /* a DMA completes only after its writes are visible to the CPU, as on the bus.
+   * With dma_hook the RTL testbench queues the writes behind cache snoops: while
+   * dma_busy says some are still queued, the ESP's interrupt -- its INT status
+   * bit, the espdma's pending bit and the line, all of which a driver may poll --
+   * is held, and the host calls dma_drained() once the queue empties (null: DMA
+   * writes are visible at once) */
+  bool (*dma_busy)(void *ctx) = nullptr;
+  void *dma_busy_ctx = nullptr;
+  void dma_drained();
   intctl_t intctl;
   slavio_ctr_t ctr[SUN4M_NTIMER_CPUS + 1];
   uint32_t ctr_user_mode = 0;          /* bit n: CPU n's counter is a user timer */

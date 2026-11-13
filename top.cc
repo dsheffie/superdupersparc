@@ -139,8 +139,17 @@ struct dma_line_t {
   uint16_t mask;
 };
 static std::deque<dma_line_t> g_dma_lines;
+static sun4m_t *g_board = nullptr;
 static bool g_snoop_req = false, g_snoop_busy = false;
 static uint64_t g_snoops = 0;
+/* sun4m_t::dma_busy: a device's DMA is complete (its interrupt, which a driver
+ * may also poll for) only once all its lines have landed -- else a process woken
+ * by a disk read reads the page's old bytes (a Solaris CD boot: 6K lines still
+ * queued when ld.so read a paged-in page) */
+static bool rtl_dma_busy(void *ctx) {
+  (void)ctx;
+  return not g_dma_lines.empty();
+}
 static void rtl_dma_hook(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t len) {
   (void)ctx;
   for(uint32_t i = 0; i < len; ) {
@@ -184,12 +193,14 @@ template <typename T> static void snoop_sample(T *tb) {
     g_dma_lines.pop_front();
     g_snoop_busy = false;
     ++g_snoops;
+    if(g_dma_lines.empty() and g_board != nullptr) {
+      g_board->dma_drained();
+    }
   }
 }
 
 /* ---------------------------------------------------------------- devices */
 
-static sun4m_t *g_board = nullptr;
 static bool g_dev_error = false;
 
 /* reads the PROM serves have no side effects: both sides read it directly */
@@ -1099,6 +1110,7 @@ int main(int argc, char **argv) {
     s->sun4m = nullptr;
     g_board = ss->sun4m;
     g_board->dma_hook = rtl_dma_hook;  /* device DMA writes reach the RTL's memory image after a snoop */
+    g_board->dma_busy = rtl_dma_busy;  /* ... and complete once they all have */
     if(ss->npc != ss->pc + 4) {
       std::cerr << "checkpoint: npc " << std::hex << ss->npc << " is not pc + 4 (" << ss->pc << std::dec
 		<< "): the RTL resumes from one pc\n";

@@ -54,10 +54,21 @@ static uint32_t fifo_pop_buf(std::vector<uint8_t> &f, uint8_t *dst, uint32_t n) 
 }
 
 void sun4m_t::esp_raise_irq() {
+  if(dma_busy != nullptr and dma_busy(dma_busy_ctx)) {
+    esp.irq_deferred = true;   /* raised by dma_drained (sun4m.hh) */
+    return;
+  }
   if(not (esp.rregs[ESP_RSTAT] & STAT_INT)) {
     esp.rregs[ESP_RSTAT] |= STAT_INT;
     esp.irq = true;
     dma_set_irq(espdma, true);
+  }
+}
+
+void sun4m_t::dma_drained() {
+  if(esp.irq_deferred) {
+    esp.irq_deferred = false;
+    esp_raise_irq();
   }
 }
 
@@ -555,6 +566,7 @@ void sun4m_t::esp_hard_reset() {
 
 void sun4m_t::esp_soft_reset() {
   esp.irq = false;
+  esp.irq_deferred = false;
   dma_set_irq(espdma, false);
   esp_hard_reset();
 }
