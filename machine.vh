@@ -392,6 +392,33 @@
 `endif
 `endif
 
+/* L2_WAYS: L2 associativity, any integer >= 1 (3 is fine: the way select is one-hot).
+ * LG_L2_NUM_SETS is then the sets PER WAY, so the L2 holds
+ * L2_WAYS * 2^LG_L2_NUM_SETS * 16 B (512KB 2-way = L2_WAYS=2 LG_L2_NUM_SETS=14).
+ * 1 is the direct-mapped L2, cycle-identical to before ways existed.  Not with
+ * L2_PIPE (l2.sv stops the elaboration). */
+`ifndef L2_WAYS
+ `define L2_WAYS 1
+`endif
+/* L2_REPL: the replacement policy when L2_WAYS > 1 (pass the number):
+ *   0 NRU   1 bit/way/set; a hit or fill sets its bit, clearing the others once all
+ *           are set; victim = first invalid way, else the first with its bit clear
+ *   1 SRRIP 2-bit RRPV/way/set (Jaleel et al., ISCA 2010); hit -> 0, fill -> 2
+ *   2 BRRIP as SRRIP, but a fill goes in at 3 except 1 in 32 at 2
+ *   3 DRRIP set dueling: 32 SRRIP and 32 BRRIP leader sets steer a 10-bit PSEL
+ *   4 RAND  first invalid way, else a pseudo-random way (free-running LFSR); no state */
+`define L2_REPL_NRU   0
+`define L2_REPL_SRRIP 1
+`define L2_REPL_BRRIP 2
+`define L2_REPL_DRRIP 3
+`define L2_REPL_RAND  4
+`ifndef L2_REPL
+ `define L2_REPL `L2_REPL_NRU
+`endif
+/* L2_SEL_STAGE (off unless defined): spend one more L2 cycle per lookup so the
+ * N-way tag compare and the way mux in front of the 128-bit data are in different
+ * cycles (FPGA timing; l2.sv r_way / r_hit).  Costs at most a cycle per L2 access. */
+
 
 
 `define M_WIDTH (1 << `LG_M_WIDTH)
