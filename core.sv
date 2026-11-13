@@ -5264,6 +5264,15 @@ module core(clk,
    wire w_ldd_lo_done;
    wire [`LG_ROB_ENTRIES-1:0] w_ldd_lo_rob;
    wire w_lsu_st_pending;
+   /* the PMU's retired-instruction count (rd %asr18/19, exec.sv S_RDASR): the
+    * architectural retirements the co-sim checker steps, retire_valid and
+    * retire_two_valid */
+   logic [63:0] r_pmu_retired;
+   always_ff@(posedge clk)
+     begin
+	r_pmu_retired <= reset ? 64'd0 : (r_pmu_retired + {63'd0, retire_valid} + {63'd0, retire_two_valid});
+     end // always_ff@ (posedge clk)
+
    exec e (
 	   .win_spill_valid(t_wm_spill),
 	   .win_fill_valid(t_wm_fill),
@@ -5274,6 +5283,7 @@ module core(clk,
 	   .sparc_psr({8'h41, 4'd0, 6'd0, 1'b0, r_psr_ef, r_psr_pil, r_psr_s, r_psr_ps, r_psr_et, 5'd0}),
 	   .sparc_wim(32'(r_wim)),
 	   .sparc_tbr({r_tbr_tba, r_tbr_tt, 4'd0}),
+	   .retired_insns(r_pmu_retired),
 	   .dbg_exec_snap(w_dbg_exec_snap),
 	   .clk(clk), 
 	   .reset(reset),

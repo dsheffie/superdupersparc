@@ -1413,6 +1413,12 @@ int main(int argc, char **argv) {
     if(tb->retire_y_valid) {
       s->y = tb->retire_y_data;
     }
+    /* rd %asr16-19 (the PMU): the ISS has no cycle count and reads its own
+     * icount, so the checker takes the RTL's values (rv64core's did_rdtime) */
+    for(uint32_t k = 0; k < ss->n_pmu_rd; k++) {
+      ss->r[ss->pmu_rd[k]] = s->r[ss->pmu_rd[k]];
+    }
+    ss->n_pmu_rd = 0;
 
     /* architectural compare once the cycle's writebacks have landed: the RTL's
      * retired registers (s) against the ISS (ss) */

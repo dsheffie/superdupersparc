@@ -160,6 +160,10 @@ public:
   int exit_code = 0;
   uint64_t icnt = 0;
   uint64_t ntraps = 0;       /* traps taken (interrupts included) */
+  /* the flat registers rd %asr16-19 (the PMU) wrote since the checker last
+   * synced them (top.cc copies the RTL's values in) */
+  uint32_t pmu_rd[2] = {0, 0};
+  uint32_t n_pmu_rd = 0;
 
   /* --user: start in user mode and emulate the Linux sparc32 syscall ABI (ta 0x10)
    * plus the kernel's window spill/fill, so the same static ELF runs under

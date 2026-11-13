@@ -26,6 +26,7 @@ module exec(clk,
 	    sparc_psr,
 	    sparc_wim,
 	    sparc_tbr,
+	    retired_insns,
 	    reset,
 	    core_fcsr_we,
 	    core_fcsr_cause6,
@@ -102,6 +103,8 @@ module exec(clk,
    input logic [31:0] sparc_psr;
    input logic [31:0] sparc_wim;
    input logic [31:0] sparc_tbr;
+   /* the PMU's retired-instruction count (core.sv), read by S_RDASR with r_cycle */
+   input logic [63:0] retired_insns;
    /* SPARC ldd: its parked rd+1 was written; completes the ldd's ROB entry */
    output logic ldd_lo_done;
    output logic [`LG_ROB_ENTRIES-1:0] ldd_lo_rob;
@@ -2640,6 +2643,16 @@ module exec(clk,
 	  S_RDWIM:
 	    begin
 	       t_result = `M_WIDTH'(sparc_wim);
+	       t_wr_int_prf = int_uop.dst_valid;
+	       t_alu_valid = 1'b1;
+	    end
+	  S_RDASR:
+	    begin
+	       /* the PMU, as rv64core's RDCYCLE/RDINSTRET: read when it executes */
+	       t_result = (int_uop.imm[1:0] == 2'd0) ? `M_WIDTH'(r_cycle[31:0]) :
+			  (int_uop.imm[1:0] == 2'd1) ? `M_WIDTH'(r_cycle[63:32]) :
+			  (int_uop.imm[1:0] == 2'd2) ? `M_WIDTH'(retired_insns[31:0]) :
+			  `M_WIDTH'(retired_insns[63:32]);
 	       t_wr_int_prf = int_uop.dst_valid;
 	       t_alu_valid = 1'b1;
 	    end

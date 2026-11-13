@@ -524,10 +524,17 @@ module decode_sparc(
 				uop.srcA_valid = 1'b0;
 				uop.srcB_valid = 1'b0;
 				/* as qemu sparc32 (non-LEON) and interpret.cc: rs1 = 15 is stbar
-				 * whatever rd is, every other rs1 (rdasr) reads %y */
+				 * whatever rd is, rs1 = 16-19 the PMU (S_RDASR: 64-bit cycle and
+				 * retired-instruction counts, low then high word; user mode may
+				 * read them), every other rs1 (rdasr) reads %y */
 				if(rs1 == 5'd15)
 				  begin
 				     uop.op = NOP;   /* stbar: memory is TSO here */
+				  end
+				else if(rs1[4:2] == 3'b100)
+				  begin
+				     uop.op = (rd == 5'd0) ? NOP : S_RDASR;
+				     uop.imm = {14'd0, rs1[1:0]};
 				  end
 				else
 				  begin

@@ -1251,6 +1251,17 @@ void execSparc(state_t *s) {
 	  if(rs1 == 15) {
 	    /* stbar: stores are already in order here */
 	  }
+	  else if((rs1 >> 2) == 4) {
+	    /* %asr16-19, the PMU (decode_sparc.sv S_RDASR, user readable): cycles
+	     * and retired instructions, low then high word.  No cycle model here,
+	     * so both count instructions (rv64core's interpret.cc rdcycle); the
+	     * co-sim checker takes the RTL's value (top.cc, pmu_rd) */
+	    const uint64_t v = s->icnt;
+	    wr(rd, (rs1 & 1) ? static_cast<uint32_t>(v >> 32) : static_cast<uint32_t>(v));
+	    if(rd != 0 and s->n_pmu_rd < 2) {
+	      s->pmu_rd[s->n_pmu_rd++] = widx(s->cwp, rd);
+	    }
+	  }
 	  else {
 	    wr(rd, s->y);
 	  }

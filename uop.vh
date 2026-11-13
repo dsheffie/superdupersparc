@@ -289,7 +289,10 @@ typedef enum logic [8:0]
    /* core.sv: an instruction that names a register of a non-resident window
     * group (machine.vh WIN_RESIDENT_GROUPS), folded and faulted at alloc: imm
     * [7:0] = the groups it needs, imm[8] = it was TRAP_L1/L2 (re-inject the trap) */
-   WMISS
+   WMISS,
+   /* rd %asr16-19, the PMU (user readable): imm[1:0] selects cycles [31:0],
+    * cycles [63:32], retired instructions [31:0], retired instructions [63:32] */
+   S_RDASR
    } opcode_t;
 
 function logic is_mult(opcode_t op);
