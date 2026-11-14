@@ -391,6 +391,21 @@ void escc_t::write(uint32_t off, uint32_t v) {
     else if(console and c == CHN_A) {
       fputc(s.tx, stdout);
       fflush(stdout);
+      if(line_icnt != nullptr) {
+	if(s.tx == '\n') {
+	  if(line_state != nullptr) {
+	    fprintf(stderr, "[console icnt %llu uicnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt),
+		    static_cast<unsigned long long>(line_state->uicnt()), line.c_str());
+	  }
+	  else {
+	    fprintf(stderr, "[console icnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt), line.c_str());
+	  }
+	  line.clear();
+	}
+	else if(s.tx >= 0x20 and s.tx < 0x7f and line.size() < 200) {
+	  line += static_cast<char>(s.tx);
+	}
+      }
     }
     else if(serio and c == CHN_A and not disabled) {
       kbd_command(s.tx);
@@ -418,25 +433,31 @@ intctl_t::intctl_t() {
   check();
 }
 
-void intctl_t::check() {
-  uint32_t pending = master_pending & ~master_disabled;
-  for(uint32_t i = 0; i < SUN4M_MAX_CPUS; i++) {
-    uint32_t pil = 0;
-    if(pending and not (master_disabled & MASTER_DISABLE) and i == target_cpu) {
-      for(uint32_t j = 0; j < 32; j++) {
-	if(((pending >> j) & 1) and INTBIT_TO_LEVEL[j]) {
-	  pil |= 1u << INTBIT_TO_LEVEL[j];
-	}
-      }
+/* the level bits (1 << INTBIT_TO_LEVEL) of a set of master interrupt bits; a
+ * bit with level 0 contributes nothing.  Visits only the set bits: update_irqs
+ * runs check() six times per device event. */
+static inline uint32_t intbits_to_levels(uint32_t bits) {
+  uint32_t m = 0;
+  while(bits) {
+    const uint32_t j = __builtin_ctz(bits);
+    bits &= bits - 1;
+    if(INTBIT_TO_LEVEL[j]) {
+      m |= 1u << INTBIT_TO_LEVEL[j];
     }
+  }
+  return m;
+}
+
+void intctl_t::check() {
+  const uint32_t pending = master_pending & ~master_disabled;
+  const uint32_t target_pil = (pending and not (master_disabled & MASTER_DISABLE)) ? intbits_to_levels(pending) : 0;
+  const uint32_t target_shown = intbits_to_levels(master_pending);
+  for(uint32_t i = 0; i < SUN4M_MAX_CPUS; i++) {
+    uint32_t pil = (i == target_cpu) ? target_pil : 0;
     /* the slave register also shows the (unmasked) hard interrupts for display */
     slave_pending[i] &= CPU_SOFTIRQ_MASK | CPU_IRQ_INT15_IN | CPU_IRQ_TIMER_IN;
     if(i == target_cpu) {
-      for(uint32_t j = 0; j < 32; j++) {
-	if(((master_pending >> j) & 1) and INTBIT_TO_LEVEL[j]) {
-	  slave_pending[i] |= 1u << INTBIT_TO_LEVEL[j];
-	}
-      }
+      slave_pending[i] |= target_shown;
     }
     /* level 15 and the CPU timer are masked only by MASTER_DISABLE */
     if(not (master_disabled & MASTER_DISABLE)) {
@@ -1119,7 +1140,13 @@ sun4m_t::sun4m_t() {
 void sun4m_t::reset_devices(uint64_t now) {
   intctl = intctl_t();
   kbd_ms = escc_t(not have_kbd, false, have_kbd);
-  serial = escc_t(false, true);
+  {
+    const uint64_t *li = serial.line_icnt;   /* (main --console-icount: kept across resets) */
+    const state_t *ls = serial.line_state;
+    serial = escc_t(false, true);
+    serial.line_icnt = li;
+    serial.line_state = ls;
+  }
   aux1 = aux2 = mdm = 0;     /* qemu slavio_misc_reset: config, aux1/2, modem ctl */
   fdc = fdc_t();
   espdma = sparc_dma_t();

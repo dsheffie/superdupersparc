@@ -160,6 +160,23 @@ public:
   int exit_code = 0;
   uint64_t icnt = 0;
   uint64_t ntraps = 0;       /* traps taken (interrupts included) */
+  /* user-mode instructions (as ss10sim's, which the sun4m device copy's
+   * --console-icount stamp reads): kept at mode switches only (set_s), so the
+   * per-instruction path is untouched; uicnt() adds the current user stretch */
+  uint64_t uicnt_base = 0;   /* user insns retired before the current user stretch */
+  uint64_t u_enter = 0;      /* icnt when user mode was last entered */
+  uint64_t uicnt() const {
+    return uicnt_base + (s ? 0 : icnt - u_enter);
+  }
+  void set_s(bool v) {
+    if(s and not v) {
+      u_enter = icnt;
+    }
+    else if(not s and v) {
+      uicnt_base += icnt - u_enter;
+    }
+    s = v;
+  }
   /* the flat registers rd %asr16-19 (the PMU) wrote since the checker last
    * synced them (top.cc copies the RTL's values in) */
   uint32_t pmu_rd[2] = {0, 0};
