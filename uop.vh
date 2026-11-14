@@ -292,7 +292,10 @@ typedef enum logic [8:0]
    WMISS,
    /* rd %asr16-19, the PMU (user readable): imm[1:0] selects cycles [31:0],
     * cycles [63:32], retired instructions [31:0], retired instructions [63:32] */
-   S_RDASR
+   S_RDASR,
+   /* casa [rs1] asi, rs2, rd (LEON3's V8 CASA): one l1d RMW like S_SWAP;
+    * store-buffer data {rd = swap value, rs2 = compare value} (decode_sparc.sv) */
+   S_CASA
    } opcode_t;
 
 function logic is_mult(opcode_t op);

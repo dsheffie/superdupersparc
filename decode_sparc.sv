@@ -794,6 +794,36 @@ module decode_sparc(
 		      begin
 			 uop.imm = {8'd0, TT_ILLEGAL};
 		      end
+		    /* casa [rs1] asi, rs2, rd (LEON3's V8 CASA): supervisor only
+		     * except ASI 0xa with i = 0 (gcc -muser-mode); V9's i = 1 %asi
+		     * form and the non-memory ASIs are illegal (interpret.cc) */
+		    else if((op3 == 6'h3c) && !s && (i || (insn[12:5] != 8'h0a)))
+		      begin
+			 uop.imm = {8'd0, TT_PRIVILEGED};
+		      end
+		    else if((op3 == 6'h3c) && (i || !asi_is_memory(insn[12:5])))
+		      begin
+			 uop.imm = {8'd0, TT_ILLEGAL};
+		      end
+		    else if(op3 == 6'h3c)
+		      begin
+			 /* swap's layout with no address offset (i = 0: imm is 0):
+			  * address rs1 in srcA, the swap value rd in srcB, the
+			  * compare value rs2 in srcD (captured after rd, as std's
+			  * rd+1: store-buffer data {rd, rs2}); rd gets the old word */
+			 uop.op = S_CASA;
+			 uop.is_mem = 1'b1;
+			 uop.is_store = 1'b1;
+			 uop.asi = insn[12:5];
+			 uop.srcA = w_rs1;
+			 uop.srcA_valid = 1'b1;
+			 uop.srcB = w_rd;
+			 uop.srcB_valid = 1'b1;
+			 uop.srcD = w_rs2;
+			 uop.srcD_valid = 1'b1;
+			 uop.dst = w_rd;
+			 uop.dst_valid = (rd != 5'd0);
+		      end
 		    else if(!w_mem_int && (op3 >= 6'h30))
 		      begin
 			 uop.imm = {8'd0, ((op3 <= 6'h37) && (op3 != 6'h32)) ? TT_CP_DISABLED : TT_ILLEGAL};

@@ -1381,6 +1381,52 @@ void execSparc(state_t *s) {
     }
     case 3: {
       const uint32_t a = s->gpr(rs1);
+      if(op3 == 0x3c) {
+	/* casa [rs1] asi, rs2, rd: LEON3's V8 CASA in V9's encoding (decode_sparc.sv
+	 * S_CASA, l1d.sv MEM_CAS).  The word at [rs1] is compared with rs2; if they
+	 * are equal rd is written there; either way rd gets the old word.  Kodiak:
+	 *   - supervisor only, except ASI 0xa (user data) with i = 0, as LEON3
+	 *     (gcc -mcpu=leon3 -muser-mode)
+	 *   - i = 1 (V9's %asi form) or a non-memory ASI is illegal
+	 *   - cacheable memory only: the memory side does ldstub/swap blind and
+	 *     cannot compare, so an uncached casa takes data_access_error with no
+	 *     access and no fault-status record */
+	const uint32_t asi = (inst >> 5) & 0xff;
+	if(not s->s and (imm or asi != 0xa)) {
+	  trap = TT_PRIVILEGED;
+	  break;
+	}
+	if(imm or not asi_is_memory(asi)) {
+	  trap = TT_ILLEGAL;
+	  break;
+	}
+	if(a & 3) {
+	  trap = TT_UNALIGNED;
+	  break;
+	}
+	uint64_t pa = 0;
+	if(mmu_xlate(s, asi, a, acc_t::store, &pa) != FT_NONE) {
+	  if(not (s->mmu_ctrl & MCR_NF)) {
+	    trap = TT_DACCESS;
+	  }
+	  break;
+	}
+	if(not g_xlate_cached) {
+	  trap = TT_DACCESS_ERROR;
+	  break;
+	}
+	const uint32_t old = ld_phys<uint32_t>(s, pa);
+	const uint32_t nv = (old == s->gpr(inst & 31)) ? s->gpr(rd) : old;
+	/* the l1d writes the word back even when the compare fails */
+	st_phys<uint32_t>(s, pa, nv);
+#ifdef STORE_CHECK
+	if(g_store_check and (pa < s->ram_size)) {
+	  g_iss_stores.emplace_back(static_cast<uint64_t>(s->pc), pa, nv);
+	}
+#endif
+	wr(rd, old);
+	break;
+      }
       const uint32_t addr = a + (imm ? simm13 : s->gpr(inst & 31));
       uint32_t asi = s->s ? 0xb : 0xa;
       const bool is_int = (op3 < 0x20);

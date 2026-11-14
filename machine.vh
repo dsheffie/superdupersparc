@@ -610,6 +610,9 @@ typedef enum logic [5:0] {
    MEM_SW   = 6'd7,
    MEM_LDSTUB = 6'd8,  /* SPARC ldstub: old byte back, 0xff written (one l1d RMW) */
    MEM_SWAP = 6'd9,    /* SPARC swap: old word back, rd written (one l1d RMW) */
+   MEM_CAS  = 6'd10,   /* SPARC casa: old word back; data {swap, compare}: the swap value
+                        * written if the old word equals compare (one l1d RMW, cached only:
+                        * never sent to the memory side) */
    MEM_LD   = 6'd14,
    MEM_SD   = 6'd15,
    MEM_INVL = 6'd24,   /* L2 line invalidate -- CACHE DMA-in drop; a dirty L2 line (or a dirty

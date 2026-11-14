@@ -382,7 +382,7 @@ module l1d(clk,
 
       b = 	(r.op == MEM_SB | r.op == MEM_LB | r.op == MEM_LBU | r.op == MEM_LDSTUB);
       s = 	(r.op == MEM_SH | r.op == MEM_LH | r.op == MEM_LHU);
-      w = 	(r.op == MEM_SW | r.op == MEM_LW | r.op == MEM_SWAP);
+      w = 	(r.op == MEM_SW | r.op == MEM_LW | r.op == MEM_SWAP | r.op == MEM_CAS);
       
       t_m = b ? 16'h0001 :
 	    s ? 16'h0003 :
@@ -518,6 +518,7 @@ endfunction
 
    logic [31:0] 			  t_array_out_b32[WORDS_PER_CL-1:0];
    logic [31:0] 			  t_w32, t_bswap_w32;
+   logic [31:0] 			  t_cas_wd;   /* casa: the word it writes back */
    logic [31:0] 			  t_w32_2, t_bswap_w32_2;
 
    logic 				  t_got_rd_retry, t_port2_hit_cache;
@@ -558,6 +559,7 @@ endfunction
    logic 				  t_got_non_mem, r_got_non_mem;
 
    logic 				  t_ucld_dead_drop;
+   logic 				  t_uccas_err;      /* an uncached casa answered with a bus error */
       
    logic 				  n_is_retry, r_is_retry;
    logic 				  r_q_priority, n_q_priority;
@@ -1038,7 +1040,7 @@ endfunction
 	       begin
 		  r_rob_inflight[{t_mem_head.restart_id, t_mem_head.rob_ptr}] <= 1'b0;
 	       end
-	     if(t_ucld_dead_drop)
+	     if(t_ucld_dead_drop | t_uccas_err)
 	       begin
 		  r_rob_inflight[{r_req.restart_id, r_req.rob_ptr}] <= 1'b0;
 	       end
@@ -2336,6 +2338,9 @@ endfunction
 	
 	t_w32 = (select_cl32(t_data, r_req.addr[WORD_STOP-1:WORD_START]));
 	t_bswap_w32 = bswap32(t_w32);
+	/* casa: the swap value (data[63:32]) if the old word equals the compare
+	 * value (data[31:0]), else the old word again */
+	t_cas_wd = (t_bswap_w32 == r_req.data[31:0]) ? r_req.data[63:32] : t_bswap_w32;
 	t_hit_cache = r_valid_out && (r_tag_out == r_cache_tag) && r_got_req && 
 		      (r_state == ACTIVE || r_state == INJECT_RELOAD);
 	t_array_data = 'd0;
@@ -2485,6 +2490,15 @@ endfunction
 	       t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
 	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
 	       t_array_data = merge_cl32(t_data, bswap32(r_req.data[31:0]), r_req.addr[WORD_STOP-1:WORD_START]);
+	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
+	    end
+	  MEM_CAS:
+	    begin
+	       /* old word back (as ld); the word is written back either way (the
+		* old word when the compare fails), so casa is a store to the line */
+	       t_rsp_data = {{32{t_bswap_w32[31]}}, t_bswap_w32};
+	       t_rsp_dst_valid = r_req.dst_valid & t_hit_cache;
+	       t_array_data = merge_cl32(t_data, bswap32(t_cas_wd), r_req.addr[WORD_STOP-1:WORD_START]);
 	       t_wr_array = t_hit_cache && (r_is_retry || r_did_reload);
 	    end
 	  default:
@@ -2960,6 +2974,7 @@ endfunction
 	n_is_retry = 1'b0;
 	n_chop_wait = r_chop_wait;
 	t_ucld_dead_drop = 1'b0;
+	t_uccas_err = 1'b0;
 	
 
 	n_q_priority = !r_q_priority;
@@ -3423,6 +3438,17 @@ endfunction
 			 t_ucld_dead_drop = 1'b1;
 			 n_core_mem_rsp.dst_valid = r_req.dst_valid;
 			 n_core_mem_rsp.bad_addr = r_req.bad_addr;
+			 n_core_mem_rsp_valid = 1'b1;
+		      end
+		    else if((r_req.cached == 1'b0) && (r_req.op == MEM_CAS))
+		      begin
+			 /* uncached casa: the memory side performs ldstub/swap blind and
+			  * cannot compare, so it takes data_access_error with no access
+			  * (interpret.cc; nothing is recorded in the fault status) */
+			 t_uccas_err = 1'b1;
+			 n_core_mem_rsp.dst_valid = 1'b0;
+			 n_core_mem_rsp.bad_addr = r_req.bad_addr;
+			 n_core_mem_rsp.bus_err = 1'b1;
 			 n_core_mem_rsp_valid = 1'b1;
 		      end
 		    else if(r_req.cached == 1'b0)
@@ -4152,11 +4178,12 @@ endfunction
    always_ff @(negedge clk)
      if(t_wr_array & ((r_req.op == MEM_SB) | (r_req.op == MEM_SH) |
 		      (r_req.op == MEM_SW) | (r_req.op == MEM_SD) |
-		      (r_req.op == MEM_LDSTUB) | (r_req.op == MEM_SWAP)))
+		      (r_req.op == MEM_LDSTUB) | (r_req.op == MEM_SWAP) | (r_req.op == MEM_CAS)))
        wr_log(64'(r_req.pc), 32'(r_req.rob_ptr), 64'(r_req.addr),
 	      (r_req.op == MEM_SB) ? {56'd0, r_req.data[7:0]}  :
 	      (r_req.op == MEM_SH) ? {48'd0, r_req.data[15:0]} :
 	      (r_req.op == MEM_LDSTUB) ? 64'hff :
+	      (r_req.op == MEM_CAS) ? {32'd0, t_cas_wd} :
 	      ((r_req.op == MEM_SW) | (r_req.op == MEM_SWAP)) ? {32'd0, r_req.data[31:0]} : r_req.data,
 	      r_req.is_atomic ? 32'd1 : 32'd0);
    // dirty-set-drop watch: a store's dirty=1 (t_wr_array) is suppressed when a dirty-clear

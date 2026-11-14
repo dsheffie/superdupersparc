@@ -2914,7 +2914,7 @@ module exec(clk,
 	 * nothing younger passes it, and performed non-speculatively by the l1d as
 	 * one read-modify-write.  swap's rd (the store data) is captured into its
 	 * store-buffer data slot before issue, as a merging load's old register. */
-	t_mem_uq_atomic = (t_mem_uq.op == S_LDSTUB) | (t_mem_uq.op == S_SWAP);
+	t_mem_uq_atomic = (t_mem_uq.op == S_LDSTUB) | (t_mem_uq.op == S_SWAP) | (t_mem_uq.op == S_CASA);
 	/* lda/sta to a non-memory ASI (SRMMU registers, flushes, module registers,
 	 * cache diagnostics) go the same way: held, oldest, performed by the l1d at
 	 * the ROB head (a store's data captured first) */
@@ -2966,7 +2966,7 @@ module exec(clk,
 	     n_mem_sched_st[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_plain_store;
 	     n_mem_sched_ser[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_serial;
 	     n_mem_sched_old1[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_old1;
-	     n_mem_sched_mg[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_merge | (t_mem_uq.op == S_SWAP) |
+	     n_mem_sched_mg[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_merge | (t_mem_uq.op == S_SWAP) | (t_mem_uq.op == S_CASA) |
 										    (t_mem_uq_mmureg & is_lsu_store(t_mem_uq.op));
 	     n_mem_sched_mv[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = t_mem_uq_move;
 	     n_mem_sched_ep[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]] = !r_mem_sched_ep[t_mem_sched_alloc_ptr[`LG_MEM_SCHED_ENTRIES-1:0]];
@@ -3373,6 +3373,15 @@ module exec(clk,
 	    begin
 	       /* the store data (rd) is in the l1d store-buffer slot (captured first) */
 	       t_mem_tail.op = MEM_SWAP;
+	       t_mem_tail.is_store = 1'b1;
+	       t_mem_tail.is_atomic = 1'b1;
+	       t_mem_tail.dst_valid = mem_uq.dst_valid;
+	       t_mem_tail.bad_addr = (w_agu[1:0] != 2'd0) | w_bad_seg_perms;
+	    end
+	  S_CASA:
+	    begin
+	       /* as swap; the store-buffer slot holds {swap value, compare value} */
+	       t_mem_tail.op = MEM_CAS;
 	       t_mem_tail.is_store = 1'b1;
 	       t_mem_tail.is_atomic = 1'b1;
 	       t_mem_tail.dst_valid = mem_uq.dst_valid;
