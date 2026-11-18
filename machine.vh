@@ -297,6 +297,13 @@
  * FP completes on its own ROB port (complete_bundle_2), so no shared wb-bitvec. */
 `define FPU_LAT 4
 `define FP_MAX_LAT `FPU_LAT
+
+/* NO_FPU (off unless defined): a core with no FPU.  PSR.EF is hard-wired 0 (V8: EF
+ * reads 0 when no FPU is present), so every FPop, FP load/store, LDFSR/STFSR and
+ * FBfcc takes fp_disabled (tt 0x04) in decode, and the FP issue queue, FPU and FP
+ * register file are removed.  Software: soft-float userland; sparc32 Linux must see
+ * EF read back 0 before it reads %fsr in cpu_type_probe (as it already does on LEON). */
+//`define NO_FPU
 /* renamed FP condition-code (FCR) register file */
 `define LG_FCR_PRF_ENTRIES 2
 /* FP issue queue (in-order, mirrors the int UQ) */

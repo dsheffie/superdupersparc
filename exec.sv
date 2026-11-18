@@ -1636,6 +1636,13 @@ module exec(clk,
     * mem_dq exactly as before.  read-before-write on a same-cycle collision is a
     * non-issue: inflight pop-gating never lets a source be read the cycle it is
     * written. */
+`ifdef NO_FPU
+   assign w_fp_rawA = 'd0;
+   assign w_fp_rawB = 'd0;
+   assign w_fp_srcC = 'd0;
+   assign r_fp_rd_srcB = 'd0;
+   assign r_fp_rd_dq = 'd0;
+`else
    fp_regfile #(.WIDTH(`FP_WIDTH), .LG_DEPTH(`LG_FP_PRF_ENTRIES))
    fpprf (.clk(clk),
 	  .reset(reset),
@@ -1662,6 +1669,7 @@ module exec(clk,
 	  .rd3(r_fp_rd_dq),
 	  .rd4(w_fp_srcC)
 	  );
+`endif
 
    
    always_comb
@@ -1904,8 +1912,14 @@ module exec(clk,
 			    (r_fp_uq_head_ptr[`LG_FP_UQ_ENTRIES-1:0] == r_fp_uq_next_tail_ptr[`LG_FP_UQ_ENTRIES-1:0]);
 	fp_uq = r_fp_uq[r_fp_uq_head_ptr[`LG_FP_UQ_ENTRIES-1:0]];
 
+`ifdef NO_FPU
+	/* no FPU: PSR.EF is hard 0, so decode never produces an FP uop */
+	t_push_two_fp = 1'b0;
+	t_push_one_fp = 1'b0;
+`else
 	t_push_two_fp = uq_push && uq_push_two && uq_uop.is_fp && uq_uop_two.is_fp;
 	t_push_one_fp = ((uq_push && uq_uop.is_fp) || (uq_push_two && uq_uop_two.is_fp)) && !t_push_two_fp;
+`endif
 
 	if(t_push_two_fp)
 	  begin
@@ -2071,6 +2085,16 @@ module exec(clk,
    wire [63:0] w_fcmov_out = 64'd0;
 `endif
 
+`ifdef NO_FPU
+   assign w_fpu_result_valid = 1'b0;
+   assign w_fpu_fcr_valid = 1'b0;
+   assign w_fpu_result = 'd0;
+   assign w_fpu_fflags = 'd0;
+   assign w_fpu_denorm = 1'b0;
+   assign w_fpu_rob_ptr = 'd0;
+   assign w_fpu_dst_ptr = 'd0;
+   assign w_fpu_fcr_ptr = 'd0;
+`else
    fpu #(.LG_PRF_WIDTH(`LG_PRF_ENTRIES),
 	 .LG_ROB_WIDTH(`LG_ROB_ENTRIES),
 	 .LG_FCR_WIDTH(`LG_FCR_PRF_ENTRIES),
@@ -2105,6 +2129,7 @@ module exec(clk,
 	.dst_ptr_out(w_fpu_dst_ptr),
 	.fcr_ptr_out(w_fpu_fcr_ptr)
 	);
+`endif
 
    /* single-cycle FP convert: combinational on the issue-stage operand (w_fp_srcA),
     * result registered one cycle -> writes bank0 / completes at pop+2.  TRUNC.W = RZ;

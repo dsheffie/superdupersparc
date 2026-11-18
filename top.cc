@@ -1150,6 +1150,9 @@ int main(int argc, char **argv) {
     for(state_t *st : {s, ss}) {
       st->fq_addr = st->fq_insn = 0;
       st->mmu_fsr = st->mmu_far = 0;
+#ifdef NO_FPU
+      st->ef = false;   /* no FPU: EF is hard-wired 0 (core.sv resumes it as 0) */
+#endif
     }
     std::cerr << "checkpoint: the FQ and the MMU fault registers start at their reset values\n";
     ss->dev = &g_replay;

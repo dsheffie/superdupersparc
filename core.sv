@@ -5090,7 +5090,11 @@ module core(clk,
 	     /* the serializing writers (never in the second retire slot) */
 	     if(t_rob_head.opcode == S_WRPSR)
 	       begin
+`ifdef NO_FPU
+		  n_psr_ef = 1'b0;
+`else
 		  n_psr_ef = t_rob_head.data[12];
+`endif
 		  n_psr_pil = t_rob_head.data[11:8];
 		  n_psr_s = t_rob_head.data[7];
 		  n_psr_ps = t_rob_head.data[6];
@@ -5160,7 +5164,11 @@ module core(clk,
 	     r_psr_s <= 1'b1;
 	     r_psr_ps <= 1'b0;
 	     r_psr_et <= 1'b0;
+`ifdef NO_FPU
+	     r_psr_ef <= 1'b0;
+`else
 	     r_psr_ef <= 1'b1;
+`endif
 	     r_psr_pil <= 4'd0;
 	     r_arch_cwp <= 'd0;
 	     r_dec_cwp <= 'd0;
@@ -5174,7 +5182,11 @@ module core(clk,
 		  r_psr_s <= 1'((ckpt_sreg(0) >> 7) & 1);
 		  r_psr_ps <= 1'((ckpt_sreg(0) >> 6) & 1);
 		  r_psr_et <= 1'((ckpt_sreg(0) >> 5) & 1);
+`ifdef NO_FPU
+		  r_psr_ef <= 1'b0;
+`else
 		  r_psr_ef <= 1'((ckpt_sreg(0) >> 12) & 1);
+`endif
 		  r_psr_pil <= 4'((ckpt_sreg(0) >> 8) & 15);
 		  r_arch_cwp <= `LG_NWINDOWS'(ckpt_sreg(0) & 31);
 		  r_dec_cwp <= `LG_NWINDOWS'(ckpt_sreg(0) & 31);

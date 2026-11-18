@@ -45,7 +45,13 @@ void state_t::set_psr(uint32_t v) {
   icc_z = (v >> 22) & 1;
   icc_v = (v >> 21) & 1;
   icc_c = (v >> 20) & 1;
+#ifdef NO_FPU
+  /* no FPU (machine.vh NO_FPU): EF is hard-wired 0, as in the RTL (core.sv n_psr_ef),
+   * so every FP instruction takes fp_disabled */
+  ef = false;
+#else
   ef = (v >> 12) & 1;
+#endif
   pil = (v >> 8) & 15;
   set_s((v >> 7) & 1);
   ps = (v >> 6) & 1;
@@ -57,7 +63,11 @@ void initState(state_t *s) {
   /* V8 reset: PC=0, nPC=4, S=1, ET=0.  load_elf overrides pc/npc. */
   s->set_s(true);
   s->et = false;
+#ifdef NO_FPU
+  s->ef = false;
+#else
   s->ef = true;
+#endif
   s->cwp = 0;
   s->wim = 0;
   if(s->user_emu) {

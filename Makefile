@@ -52,6 +52,10 @@ endif
 ifneq ($(shell grep -c '^`define FP_FLUSH_TO_ZERO' machine.vh),0)
 CXXFLAGS += -DFP_FLUSH_TO_ZERO
 endif
+# NO_FPU (no FPU): the checker ISS hard-wires PSR.EF to 0 as the RTL does
+ifneq ($(shell grep -c '^`define NO_FPU' machine.vh)$(findstring +define+NO_FPU,$(VFLAGS_EXTRA)),0)
+CXXFLAGS += -DNO_FPU
+endif
 # those flags come from a grep, not an #include, and they change state_t's layout: every
 # C++ object that uses state_t must rebuild when machine.vh does
 $(filter-out verilated.o verilated_vcd_c.o,$(OBJ)): machine.vh
