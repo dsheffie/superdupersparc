@@ -58,6 +58,14 @@ void sun4m_t::esp_raise_irq() {
     esp.irq_deferred = true;   /* raised by dma_drained (sun4m.hh) */
     return;
   }
+  if((io_s != nullptr) and not (esp.rregs[ESP_RSTAT] & STAT_INT) and
+     (now_ns(io_s) < esp_busy_until_ns)) {
+    if(esp_irq_at_ns == ~0ULL) {   /* the bus is still busy with the command: hold it */
+      esp_irq_at_ns = esp_busy_until_ns;
+      ctr_schedule(io_s);
+    }
+    return;
+  }
   if(not (esp.rregs[ESP_RSTAT] & STAT_INT)) {
     esp.rregs[ESP_RSTAT] |= STAT_INT;
     esp.irq = true;
@@ -85,6 +93,10 @@ void sun4m_t::esp_dma_enable(bool level) {
   if(level and esp.dma_cb != DMA_CB_NONE) {
     const uint8_t cb = esp.dma_cb;
     esp.dma_cb = DMA_CB_NONE;
+    /* the deferred command starts on the bus now: its time runs from here */
+    if(esp_timing and (io_s != nullptr)) {
+      esp_busy_until_ns = std::max(esp_busy_until_ns, now_ns(io_s) + esp_busy_ns(esp.rregs[ESP_CMD]));
+    }
     switch(cb)
       {
       case DMA_CB_SATN: esp_handle_satn(); break;
@@ -562,6 +574,53 @@ void sun4m_t::esp_hard_reset() {
   esp.do_cmd = false;
   esp.dma_cb = DMA_CB_NONE;
   esp.rregs[ESP_CFG1] = 7;
+  esp_irq_at_ns = ~0ULL;     /* a held interrupt dies with the chip */
+  esp_busy_until_ns = 0;
+}
+
+/* SCSI-2 bus timing, as MAME's ncr53c90.cpp (chip delays in clock-conversion
+ * units of ~200 ns) and nscsi_hle.cpp (the bus constants): arbitration delay
+ * 2.4 us; selection = bus clear + bus settle (1.2 us), settle (400 ns) and the
+ * target's BSY response; asynchronous transfers at ~2.5 MB/s; reset hold
+ * 25 us; bus free 800 ns.  The selection timeout is the chip's: STO x 8192 x
+ * CCF input clocks (CCF 0 means 8; the SS-20's ESP runs at 40 MHz). */
+static const uint64_t SCSI_ARB_NS = 2400, SCSI_SEL_NS = 1200 + 400 + 2000, SCSI_BYTE_NS = 400,
+  SCSI_RESET_NS = 25000, SCSI_FREE_NS = 800, ESP_CLOCK_NS = 25;
+
+/* how long the bus (and the target) take to do command cmd: its interrupt
+ * comes no sooner */
+uint64_t sun4m_t::esp_busy_ns(uint8_t cmd) const {
+  const uint32_t tc = esp_get_tc();
+  switch(cmd & CMD_CMD)
+    {
+    case CMD_SEL:
+    case CMD_SELATN:
+    case CMD_SELATNS: {
+      if(scsi[esp.wregs[ESP_WBUSID] & BUSID_DID] == nullptr) {
+	const uint64_t ccf = (esp.wregs[ESP_WCCF] & 7) ? (esp.wregs[ESP_WCCF] & 7) : 8;
+	const uint64_t sto = esp.wregs[ESP_RINTR] ? esp.wregs[ESP_RINTR] : 256;
+	return sto * 8192 * ccf * ESP_CLOCK_NS;
+      }
+      if((cmd & CMD_CMD) == CMD_SELATNS) {
+	return SCSI_ARB_NS + SCSI_SEL_NS + SCSI_BYTE_NS;   /* stops after the message byte */
+      }
+      const uint64_t n = esp.dma ? tc : esp.fifo.size();
+      return SCSI_ARB_NS + SCSI_SEL_NS + n * SCSI_BYTE_NS + esp_cmd_ns;
+    }
+    case CMD_TI:
+      if(esp.do_cmd) {           /* the command bytes, then the target runs it */
+	return (esp.dma ? tc : 1) * SCSI_BYTE_NS + esp_cmd_ns;
+      }
+      return (esp.dma ? tc : 1) * SCSI_BYTE_NS;
+    case CMD_ICCS:
+      return 2 * SCSI_BYTE_NS;   /* status and message in */
+    case CMD_MSGACC:
+      return SCSI_FREE_NS;
+    case CMD_BUSRESET:
+      return SCSI_RESET_NS;
+    default:
+      return 0;
+    }
 }
 
 void sun4m_t::esp_soft_reset() {
@@ -646,6 +705,9 @@ void sun4m_t::esp_write(uint32_t reg, uint8_t v) {
       }
       else {
 	esp.dma = false;
+      }
+      if(esp_timing and (io_s != nullptr)) {
+	esp_busy_until_ns = std::max(esp_busy_until_ns, now_ns(io_s) + esp_busy_ns(v));
       }
       switch(v & CMD_CMD)
 	{

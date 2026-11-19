@@ -954,6 +954,7 @@ void sun4m_t::ctr_schedule(const state_t *s) {
       next = ctr[i].next_ns;
     }
   }
+  next = std::min(next, esp_irq_at_ns);
   /* the first instruction at or after the match */
   next_event_ns = next;
   if(next == ~0ULL) {
@@ -979,6 +980,10 @@ void sun4m_t::timer_event(state_t *s) {
       t.reached = CTR_REACHED;
       t.irq = true;
     }
+  }
+  if(now >= esp_irq_at_ns) {   /* a held ESP interrupt is due (esp_raise_irq) */
+    esp_irq_at_ns = ~0ULL;
+    esp_raise_irq();
   }
   update_irqs(s);
   ctr_schedule(s);
@@ -1275,16 +1280,21 @@ static uint8_t m48t08_clock(uint32_t off, const uint8_t *nvram, int64_t t) {
  * autoconf dereferences (proplen(node, "name") fails -> NULL strcmp, Data
  * access exception).  The real contents aren't dumped; this is a minimal
  * FCode that gives the node what a real SS-20 shows:
- *   " SUNW,DBRIe" device-name  10000 my-space 100 reg  (SUNW,DBRIe@e,10000) */
+ *   " SUNW,DBRIe" device-name  10000 my-space 100 reg  (SUNW,DBRIe@e,10000)
+ *   5 0 intr  (SBus level 5 = processor level 9, a real SS-20's dbri0; NetBSD's dbri_attach_sbus
+ *   uses the interrupt unchecked -- with no intr property it reads address 0) */
 static const uint64_t DBRI_PROM_BASE = 0xee0001000ULL;
 static const uint8_t dbri_prom[0x30] = {
-  0xf1, 0x08, 0x03, 0x5b, 0x00, 0x00, 0x00, 0x25,   /* start1, checksum, length */
+  0xf1, 0x08, 0x04, 0x2d, 0x00, 0x00, 0x00, 0x2d,   /* start1, checksum, length */
   0x12, 0x0a, 'S', 'U', 'N', 'W', ',', 'D', 'B', 'R', 'I', 'e',
   0x02, 0x01,                                       /* device-name */
   0x10, 0x00, 0x01, 0x00, 0x00,                     /* b(lit) 0x10000 */
   0x01, 0x03,                                       /* my-space */
   0x10, 0x00, 0x00, 0x01, 0x00,                     /* b(lit) 0x100 */
   0x01, 0x16,                                       /* reg */
+  0x10, 0x00, 0x00, 0x00, 0x05,                     /* b(lit) 5 */
+  0xa5,                                             /* 0 */
+  0x01, 0x17,                                       /* intr */
   0x00,                                             /* end0 */
 };
 

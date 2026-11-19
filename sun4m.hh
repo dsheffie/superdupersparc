@@ -254,6 +254,19 @@ public:
    * is held, and the host calls dma_drained() once the queue empties (null: DMA
    * writes are visible at once) */
   bool (*dma_busy)(void *ctx) = nullptr;
+  /* The ESP's timing (esp.cc esp_busy_ns).  The model (qemu's) runs a command
+   * to completion inside the register write; on the bus it takes arbitration,
+   * selection, the message/command bytes and the target's own time, and
+   * drivers count on that: NeXTSTEP's esp_start drops back to PIL 0 and sleeps
+   * in -[NXConditionLock lockWhen:] right after starting a command, while the
+   * ESP interrupt handler takes the same lock -- an interrupt within a few us
+   * deadlocks it.  An interrupt raised before esp_busy_until_ns is held
+   * (esp_irq_at_ns) and timer_event raises it then.  esp_timing false: at once. */
+  bool esp_timing = true;
+  uint64_t esp_cmd_ns = 250000;        /* the target's command overhead (--scsi-cmd-us) */
+  uint64_t esp_busy_until_ns = 0;
+  uint64_t esp_irq_at_ns = ~0ULL;
+  uint64_t esp_busy_ns(uint8_t cmd) const;
   void *dma_busy_ctx = nullptr;
   void dma_drained();
   intctl_t intctl;
