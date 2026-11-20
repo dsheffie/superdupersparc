@@ -222,7 +222,11 @@ module mmu(clk,
 	  end
 	else if(sys_reset)
 	  begin
-	     r_ctrl <= (r_ctrl & 32'hfffffffc) | 32'h00002000;
+	     /* a module reset: the control register to its reset value (MBus mode,
+	      * boot mode) -- caches, snooping and cacheable table walks off, as
+	      * after power-on (keeping NeXTSTEP's TC let the walker hit stale
+	      * page-table lines OBP had rewritten uncached) */
+	     r_ctrl <= 32'h00002800;
 	     r_tlb_flush <= 1'b0;
 	  end
 	else
