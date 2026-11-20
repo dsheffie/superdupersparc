@@ -95,8 +95,8 @@ static bool g_rtl_sregs_valid = false;
  * image, s); bus word k is the 4 bytes at line+4k as stored */
 extern "C" void l1i_fill_chk(long long pa, int w0, int w1, int w2, int w3, int way, int idx) {
   static uint64_t n_bad = 0;
-  if(ss == nullptr) {
-    return;
+  if((ss == nullptr) or (static_cast<uint64_t>(pa) + 16 > ss->ram_size)) {
+    return;                    /* a PROM fill (boot mode, after a system reset): in neither image */
   }
   const uint32_t w[4] = {static_cast<uint32_t>(w0), static_cast<uint32_t>(w1), static_cast<uint32_t>(w2), static_cast<uint32_t>(w3)};
   bool bad = false;
@@ -172,6 +172,36 @@ static std::deque<dma_line_t> g_dma_lines;
 static sun4m_t *g_board = nullptr;
 static bool g_snoop_req = false, g_snoop_busy = false;
 static uint64_t g_snoops = 0;
+/* --nack-dev-loads: as Kodiak's ARM does (win_service.h win_nack_held), a device
+ * load or atomic that arrives while DMA lines still wait for their snoop is
+ * NACKed (mem_rsp_retry): the L2 goes back to IDLE, takes the snoops, and
+ * re-issues it.  Off, the co-sim answers it at once and the path is never run. */
+static bool g_nack_dev_loads = false;
+static uint64_t g_nacks = 0;
+/* --snoop-storm N: about every N cycles, queue a data-less WBINV snoop (a DMA
+ * line with an empty mask) of a random 16-byte line in one of the
+ * --snoop-region base:len ranges -- the board's DMA snoop traffic, aimed at
+ * chosen lines (a lock, its L1D-set aliases, the stack) in a directed test */
+static uint64_t g_storm = 0, g_storm_lines = 0;
+static std::vector<std::pair<uint64_t, uint64_t>> g_storm_regions;
+static uint64_t g_storm_rng = 0x9e3779b97f4a7c15ULL;
+static uint64_t storm_rand() {
+  g_storm_rng ^= g_storm_rng << 13;
+  g_storm_rng ^= g_storm_rng >> 7;
+  g_storm_rng ^= g_storm_rng << 17;
+  return g_storm_rng;
+}
+static void storm_tick() {
+  if(g_storm == 0 or g_storm_regions.empty() or g_dma_lines.size() >= 4 or (storm_rand() % g_storm) != 0) {
+    return;
+  }
+  const std::pair<uint64_t, uint64_t> &r = g_storm_regions[storm_rand() % g_storm_regions.size()];
+  dma_line_t l;
+  l.line = (r.first + 16 * (storm_rand() % std::max<uint64_t>(1, r.second / 16))) & ~15ULL;
+  l.mask = 0;
+  g_dma_lines.push_back(l);
+  ++g_storm_lines;
+}
 /* sun4m_t::dma_busy: a device's DMA is complete (its interrupt, which a driver
  * may also poll for) only once all its lines have landed -- else a process woken
  * by a disk read reads the page's old bytes (a Solaris CD boot: 6K lines still
@@ -198,6 +228,113 @@ static void rtl_dma_hook(void *ctx, uint64_t pa, const uint8_t *buf, uint32_t le
   }
 }
 /* before the clock edge: offer the next line's snoop */
+/* A system reset (a sysctrl write of bit 0: sun4m.cc reset_req), as Kodiak's
+ * sequencer does it (kodiak_soc.sv): the core writes back and invalidates its
+ * caches (ext flush, whole), retirement stops and the memory side drains, then
+ * the checker takes ss10sim's system_reset (main.cc) and the core is held in
+ * sys_reset -- under Verilator it reseeds its registers, PSR, WIM and the rest
+ * from the checker state (loadgpr/ckpt_sreg) -- and resumes at pc 0.  Without
+ * this the co-sim could not run past an OS's reboot. */
+/* the RTL's FP physical registers as fp_prf_wr writes them (below) */
+static uint64_t g_rtl_fp_prf[1024] = {0};
+static uint32_t g_rtl_fp_rrat[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+				    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+enum class sysreset_t { IDLE, FLUSH_REQ, FLUSH_WAIT, DRAIN, RESET, RESUME_WAIT, RESUME };
+static sysreset_t g_sr = sysreset_t::IDLE;
+static uint64_t g_sr_cnt = 0, g_sys_resets = 0, g_sys_resets_seen = 0;
+
+static void iss_system_reset(state_t *st) {
+  memset(st->r, 0, sizeof(st->r));
+  memset(st->f, 0, sizeof(st->f));
+  memset(st->asr, 0, sizeof(st->asr));
+  st->icc_n = st->icc_z = st->icc_v = st->icc_c = false;
+  st->ef = false;
+  st->set_s(true);
+  st->ps = true;
+  st->et = false;
+  st->pil = 0;
+  st->cwp = 0;
+  st->wim = 1;
+  st->tbr = 0;
+  st->y = 0;
+  st->fsr = 0;
+  st->fq_addr = st->fq_insn = 0;
+  st->mmu_ctrl = MCR_RESET | MCR_BMODE;   /* mmu.sv's sys_reset value (0x2800) */
+  st->pc = 0;
+  st->npc = 4;
+  st->error_mode = false;
+  st->sun4m->reset_devices(st->sun4m->now_ns(st));
+  st->sun4m->update_irqs(st);
+}
+
+/* one cycle of the sequencer: drives the core's flush, retire_allowed,
+ * sys_reset and resume before the clock edge.  True while it owns retirement. */
+template <typename T> static bool sysreset_tick(T *tb, state_t *checker, bool mem_idle) {
+  tb->ext_flush_req = 0;
+  tb->ext_flush_whole = 0;
+  tb->sys_reset = 0;
+  switch(g_sr)
+    {
+    case sysreset_t::IDLE:
+      if(g_board == nullptr or not g_board->reset_req) {
+	return false;
+      }
+      std::cout << "system reset requested at cycle " << globals::cycle << ", icnt " << checker->icnt << "\n";
+      g_sr = sysreset_t::FLUSH_REQ;
+      return false;
+    case sysreset_t::FLUSH_REQ:
+      tb->ext_flush_req = 1;
+      tb->ext_flush_whole = 1;
+      g_sr = sysreset_t::FLUSH_WAIT;
+      return false;
+    case sysreset_t::FLUSH_WAIT:
+      if(tb->ext_flush_done) {
+	g_sr = sysreset_t::DRAIN;
+      }
+      return false;
+    case sysreset_t::DRAIN:
+      tb->retire_allowed = 0;
+      if(mem_idle) {
+	iss_system_reset(checker);
+	/* the core reseeds its registers from the checker (loadgpr/loadprf): so
+	 * does the mirror the compare reads (FP: g_rtl_fp_prf, as the seed) */
+	memcpy(s->r, checker->r, sizeof(s->r));
+	s->y = checker->y;
+	for(int i = 0; i < 32; i++) {
+	  g_rtl_fp_prf[i] = static_cast<uint64_t>(loadfpr(i));
+	  g_rtl_fp_rrat[i] = static_cast<uint32_t>(i);
+	}
+	++g_sys_resets;
+	g_sr_cnt = 0;
+	g_sr = sysreset_t::RESET;
+      }
+      return true;
+    case sysreset_t::RESET:
+      tb->retire_allowed = 0;
+      tb->sys_reset = 1;
+      /* >= the register files' seeding depth (as the initial reset) */
+      if(++g_sr_cnt == 2 * (1u << 10)) {
+	g_sr = sysreset_t::RESUME_WAIT;
+      }
+      return true;
+    case sysreset_t::RESUME_WAIT:
+      tb->retire_allowed = 0;
+      if(tb->ready_for_resume) {
+	g_sr = sysreset_t::RESUME;
+      }
+      return true;
+    case sysreset_t::RESUME:
+      tb->resume = 1;
+      tb->resume_pc = 0;
+      g_sr = sysreset_t::IDLE;
+      std::cout << "system reset done at cycle " << globals::cycle << "\n";
+      return true;
+    default:
+      g_sr = sysreset_t::IDLE;
+      return false;
+    }
+}
+
 template <typename T> static void snoop_drive(T *tb) {
   if(not g_snoop_req and not g_snoop_busy and not g_dma_lines.empty()) {
     tb->snoop_req_valid = 1;
@@ -382,9 +519,6 @@ extern "C" void mmu_set_ref(long long pte_pa, int pte) {
  * mirrored here as they are written (fp_regfile.sv / core.sv); the PRF and the
  * retire RAT start as the reset seed (identity; zero, or the checkpoint's FP
  * registers -- loadfpr -- which main copies in here) */
-static uint64_t g_rtl_fp_prf[1024] = {0};
-static uint32_t g_rtl_fp_rrat[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-				    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
 extern "C" void fp_prf_wr(int ptr, long long data) {
   g_rtl_fp_prf[ptr & 1023] = static_cast<uint64_t>(data);
 }
@@ -894,8 +1028,12 @@ void record_retirement(long long pc, long long fetch_cycle, long long alloc_cycl
   uint64_t delta = retire_cycle - last_retire_cycle;
 
   if(retire_cycle < lrc) {
-    std::cout << "retirement cycle out-of-order\n";
-    exit(-1);
+    if(g_sys_resets == g_sys_resets_seen) {
+      std::cout << "retirement cycle out-of-order\n";
+      exit(-1);
+    }
+    g_sys_resets_seen = g_sys_resets;   /* a system reset restarted the core's cycle counter */
+    last_retire_cycle = retire_cycle;
   }
   lrc = retire_cycle;
   
@@ -1042,6 +1180,7 @@ int main(int argc, char **argv) {
   std::vector<std::string> scsi_disks, scsi_cdroms;
   bool cg14 = false;
   bool no_kbd = false;
+  std::vector<std::string> storm_region_s;
   std::map<uint32_t, uint64_t> pushout_histo;
   std::map<uint64_t, double> tip_map;          /* full per-cycle attribution (TIP, ported from rv64core) */
   int64_t mem_reply_cycle = -1L;
@@ -1059,6 +1198,11 @@ int main(int argc, char **argv) {
       ("tcx", po::value<std::string>(&tcx_rom)->implicit_value("/usr/share/qemu/QEMU,tcx.bin"),
        "with --checkpoint: the checkpoint has a TCX (its FCode PROM)")
       ("cg14", po::bool_switch(&cg14), "with --checkpoint: the checkpoint has a CG14")
+      ("nack-dev-loads", po::bool_switch(&g_nack_dev_loads),
+       "NACK an uncached load/atomic while DMA lines wait for their snoop (Kodiak's ARM does; l2.sv mem_rsp_retry)")
+      ("snoop-storm", po::value<uint64_t>(&g_storm), "queue a data-less WBINV snoop about every this many cycles (--snoop-region)")
+      ("snoop-region", po::value<std::vector<std::string>>(&storm_region_s), "with --snoop-storm: hex base:len to snoop in (repeatable)")
+      ("snoop-seed", po::value<uint64_t>(&g_storm_rng), "with --snoop-storm: the random seed (nonzero)")
       ("no-kbd", po::bool_switch(&no_kbd), "with --tcx/--cg14: no keyboard (as ss10sim --no-kbd; Solaris runs)")
       ("user,u", po::bool_switch(&user), "checker ISS: linux user-mode emulation (syscalls + window spill/fill)")
       ("heartbeat,h", po::value<uint64_t>(&heartbeat)->default_value(1<<24), "heartbeat for stats")
@@ -1082,6 +1226,11 @@ int main(int argc, char **argv) {
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
+    for(const std::string &r : storm_region_s) {
+      const size_t c = r.find(':');
+      g_storm_regions.push_back({std::stoull(r.substr(0, c), nullptr, 16),
+				 (c == std::string::npos) ? 16 : std::stoull(r.substr(c + 1), nullptr, 16)});
+    }
     if(vm.count("help") or (sparc_binary.empty() and ckpt_file.empty())) {
       std::cout << desc << "\n";
       return -1;
@@ -1252,11 +1401,14 @@ int main(int argc, char **argv) {
       }
       tb->retire_allowed = g_board->cpu_halted ? 0 : 1;
       tb->irl = ss->irl;
+      tb->resume = 0;
+      sysreset_tick(tb.get(), ss, (not tb->mem_req_valid) and (mem_reply_cycle == -1));
     }
     else {
       tb->irl = 0;
     }
     contextp->timeInc(1);
+    storm_tick();
     snoop_drive(tb.get());
     tb->clk = 1;
     tb->eval();
@@ -1580,6 +1732,7 @@ int main(int argc, char **argv) {
 
     //negedge
     tb->mem_rsp_valid = 0;
+    tb->mem_rsp_retry = 0;
     if(tb->mem_req_valid && (mem_reply_cycle == -1)) {
       mem_reply_cycle = globals::cycle + (tb->mem_req_opcode == 4 ? 1 : 2)*mem_lat;
     }
@@ -1594,7 +1747,14 @@ int main(int argc, char **argv) {
        * the memory side's atomic read-modify-write -- answer the old line, write
        * the store data under the mask */
       const bool atomic = (tb->mem_req_opcode == 8) or (tb->mem_req_opcode == 9);
-      if(g_board and pa >= s->ram_size) {
+      if(g_nack_dev_loads and tb->mem_req_uncached and (tb->mem_req_opcode != 7) and
+	 not g_dma_lines.empty()) {
+	/* NACK: nothing performed, the L2 re-issues it after the snoops */
+	tb->mem_rsp_retry = 1;
+	tb->mem_rsp_valid = 1;
+	++g_nacks;
+      }
+      else if(g_board and pa >= s->ram_size) {
 	/* sun4m device space (uncached, so one access per request) */
 	uint32_t d[4] = {0, 0, 0, 0};
 	bool be = false;
@@ -1901,7 +2061,8 @@ int main(int argc, char **argv) {
   
   /* the checks with no failure of their own: how much they saw */
   std::cout << "tlb fills checked = " << g_tlb_fills << ", mismatched = " << g_tlb_fill_bad << "\n";
-  std::cout << "dma line snoops = " << g_snoops << " (" << g_dma_lines.size() << " still queued)\n";
+  std::cout << "dma line snoops = " << g_snoops << " (" << g_dma_lines.size() << " still queued), "
+	    << g_nacks << " uncached loads NACKed, " << g_storm_lines << " storm snoops\n";
   std::cout << "simulation took " << t0 << " seconds, " << (insns_retired/t0)
 	    << " insns per second\n";
 
