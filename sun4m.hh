@@ -224,12 +224,22 @@ struct lance_t {
   uint32_t tx_idx = 0;                   /* next transmit descriptor */
 };
 
+/* the onboard DBRI at 0xee0010000 (dbri.cc): command and interrupt queues */
+struct dbri_t {
+  uint32_t reg0 = 0, reg1 = 0, reg2 = 0, reg3 = 0;
+  uint32_t cmdp = 0;                   /* REG8: the command being executed (DVMA) */
+  uint32_t intq_base = 0;              /* the interrupt block (IIQ), 0 = none */
+  uint32_t intq_idx = 1;               /* the next word in it */
+  bool irq = false;                    /* REG1 D_IR / the SBus level-5 line */
+};
+
 class sun4m_t {
 public:
   fw_cfg_t fw_cfg;
   sparc_dma_t espdma, ledma;
   esp_t esp;
   lance_t lance;
+  dbri_t dbri;
   tcx_t *tcx = nullptr;                /* SBus slot 2 framebuffer (main: --tcx) */
   cg14_t *cg14 = nullptr;              /* VSIMM framebuffer (main: --cg14) */
   bool have_kbd = false;               /* a Sun keyboard + mouse on kbd_ms (main: with --tcx) */
@@ -340,6 +350,13 @@ private:
   void lance_update_irq();
   void lance_init();
   void lance_transmit();
+  uint32_t dbri_rd32(uint32_t dvma);
+  void dbri_wr32(uint32_t dvma, uint32_t v);
+  void dbri_reset();
+  void dbri_post(uint32_t word);
+  void dbri_run();
+  uint32_t dbri_read(uint32_t reg);
+  void dbri_write(uint32_t reg, uint32_t v);
   uint32_t esp_get_tc() const;
   void esp_set_tc(uint32_t v);
   int esp_select();

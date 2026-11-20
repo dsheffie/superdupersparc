@@ -1159,6 +1159,7 @@ void sun4m_t::reset_devices(uint64_t now) {
   esp = esp_t();
   esp_hard_reset();          /* qemu esp_hard_reset at realize */
   lance_reset();
+  dbri_reset();
   if(tcx != nullptr) {
     tcx->reset();
   }
@@ -1304,7 +1305,7 @@ static bool is_quiet_region(uint64_t pa) {
   static const uint64_t quiet[][2] = {
     {0x090000000ULL, 0x2000}, {0x094000000ULL, 0x2000},       /* VSIMM empty slots */
     {0x098000000ULL, 0x2000}, {0x09c000000ULL, 0x2000},
-    {0xee0001000ULL, 0x30}, {0xee0010000ULL, 0x100},          /* DBRI */
+    {0xee0001000ULL, 0x30},                                    /* DBRI ID PROM */
     {0xef4800000ULL, 0x20},                                    /* bpp */
     {0xf80000000ULL, 0x2000},                                  /* SX */
   };
@@ -1333,6 +1334,7 @@ void sun4m_t::update_irqs(state_t *s) {
   intctl.set_irq(22, fdc.irq);       /* floppy -> level 11 */
   intctl.set_irq(18, espdma.irq);    /* espdma (ESP) -> level 4 */
   intctl.set_irq(16, ledma.irq);     /* ledma (Lance) -> level 6 */
+  intctl.set_irq(11, dbri.irq);      /* DBRI, SBus level 5 -> level 9 */
   for(uint32_t i = 0; i < SUN4M_NTIMER_CPUS; i++) {
     intctl.set_cpu_timer_irq(i, ctr[i + 1].irq);   /* CPU counter -> level 14 */
   }
@@ -1402,6 +1404,11 @@ uint32_t sun4m_t::read(state_t *s, uint64_t pa, uint32_t size, bool *bus_error) 
   }
   if(pa == 0xefa000000ULL and size == 1) {
     return 0;                /* APC (qemu: reads 0) */
+  }
+  if(pa >= 0xee0010000ULL and pa < 0xee0010100ULL and size == 4) {
+    uint32_t v = dbri_read(static_cast<uint32_t>(pa - 0xee0010000ULL));
+    update_irqs(s);
+    return v;
   }
   if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
     uint32_t v = lance_read(static_cast<uint32_t>(pa >> 1) & 1);
@@ -1549,6 +1556,11 @@ void sun4m_t::write(state_t *s, uint64_t pa, uint32_t size, uint32_t v, bool *bu
   }
   if(pa == 0xefa000000ULL and size == 1) {
     cpu_halted = true;       /* APC: idle the CPU until an interrupt */
+    return;
+  }
+  if(pa >= 0xee0010000ULL and pa < 0xee0010100ULL and size == 4) {
+    dbri_write(static_cast<uint32_t>(pa - 0xee0010000ULL), v);
+    update_irqs(s);
     return;
   }
   if(pa >= 0xef0c00000ULL and pa < 0xef0c00004ULL) {
