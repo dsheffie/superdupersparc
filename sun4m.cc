@@ -1156,6 +1156,10 @@ void sun4m_t::reset_devices(uint64_t now) {
   fdc = fdc_t();
   espdma = sparc_dma_t();
   ledma = sparc_dma_t();
+  /* the Lance's DVMA high byte (DMA2 E_BASE, reg 3) resets to 0xff: SunOS
+   * 4.1.4 never writes it and puts its init block at Lance address 0, i.e.
+   * DVMA 0xff000000.  (qemu resets it to 0; Linux writes it itself.) */
+  ledma.r[3] = 0xff000000;
   esp = esp_t();
   esp_hard_reset();          /* qemu esp_hard_reset at realize */
   lance_reset();
