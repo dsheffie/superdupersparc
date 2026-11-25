@@ -44,6 +44,9 @@ public:
   const uint64_t *line_icnt = nullptr;
   const state_t *line_state = nullptr;  /* with line_icnt: also stamp its user-mode icount */
   std::string line;
+  /* kodiak_arm --pmu: called with each complete console line (marker lines start
+   * and stop counter snapshots) */
+  void (*line_hook)(const std::string &) = nullptr;
   bool serio = false;       /* a Sun keyboard on channel A, a Sun mouse on channel B */
   bool irq = false;
   bool led_mode = false;                 /* the next keyboard byte is the LED state */

@@ -391,13 +391,16 @@ void escc_t::write(uint32_t off, uint32_t v) {
     else if(console and c == CHN_A) {
       fputc(s.tx, stdout);
       fflush(stdout);
-      if(line_icnt != nullptr) {
+      if((line_icnt != nullptr) or (line_hook != nullptr)) {
 	if(s.tx == '\n') {
-	  if(line_state != nullptr) {
+	  if(line_hook != nullptr) {
+	    line_hook(line);
+	  }
+	  if((line_icnt != nullptr) and (line_state != nullptr)) {
 	    fprintf(stderr, "[console icnt %llu uicnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt),
 		    static_cast<unsigned long long>(line_state->uicnt()), line.c_str());
 	  }
-	  else {
+	  else if(line_icnt != nullptr) {
 	    fprintf(stderr, "[console icnt %llu] %s\n", static_cast<unsigned long long>(*line_icnt), line.c_str());
 	  }
 	  line.clear();
@@ -1148,9 +1151,11 @@ void sun4m_t::reset_devices(uint64_t now) {
   {
     const uint64_t *li = serial.line_icnt;   /* (main --console-icount: kept across resets) */
     const state_t *ls = serial.line_state;
+    void (*lh)(const std::string &) = serial.line_hook;
     serial = escc_t(false, true);
     serial.line_icnt = li;
     serial.line_state = ls;
+    serial.line_hook = lh;
   }
   aux1 = aux2 = mdm = 0;     /* qemu slavio_misc_reset: config, aux1/2, modem ctl */
   fdc = fdc_t();
