@@ -447,6 +447,12 @@ module exec(clk,
 
    /* divider */
    logic 	t_div_ready, t_signed_div, t_start_div;
+   /* w_div_ok = the divider's `ready`, flopped (uni_divider div_ok, r9999 8714dd3): the
+    * ALU select reads it instead of t_div_ready, so start_div/fp_start leave the select
+    * path.  t_div_start_next = an int divide enters the issue stage next cycle
+    * (r_start_int's next state & the picked uop is a divide). */
+   wire 	w_div_ok;
+   logic 	t_div_start_next;
    logic [`LG_ROB_ENTRIES-1:0] t_div_rob_ptr_out;
    logic [`LG_HILO_PRF_ENTRIES-1:0] t_div_hilo_prf_ptr_out;
    /* unified divider, FP side (uni_divider.sv).
@@ -462,8 +468,19 @@ module exec(clk,
    logic [N_ROB_ENTRIES-1:0] 	    r_uq_wait, r_mq_wait, r_fp_uq_wait;
    /* DEBUG mem-op PC shadow, ROB-indexed (see dbg_memop_pc port). */
    logic [31:0] 		    r_memop_pc [N_ROB_ENTRIES-1:0];
-   /* non mem uop queue */
-   uop_t r_uq[N_UQ_ENTRIES];
+   /* non mem uop queue: banked by entry parity into LUTRAM (r9999 f939744).  The two
+    * pushes go to tail/tail+1 and the two reads to head/head+1, which always differ in
+    * parity, so each bank needs only one write and one read port (as r_rob_even/odd).
+    * As flops the full-uop queue cost a 2-write-port data mux per bit plus an 8:1
+    * read mux; as LUTRAM it is ~0.6 LUT per bit-column. */
+   localparam N_UQ_BANK = N_UQ_ENTRIES/2;
+   (* ram_style = "distributed" *) uop_t r_uq_even[N_UQ_BANK];
+   (* ram_style = "distributed" *) uop_t r_uq_odd[N_UQ_BANK];
+   logic [`LG_UQ_ENTRIES-2:0] r_uq_even_raddr, r_uq_odd_raddr;
+   logic [`LG_UQ_ENTRIES-2:0] t_uq_even_waddr, t_uq_odd_waddr;
+   logic t_uq_even_we, t_uq_odd_we;
+   uop_t t_uq_even_wdata, t_uq_odd_wdata;
+   uop_t t_uq_even_rdata, t_uq_odd_rdata;
    uop_t uq, int_uop;
    /* ENABLE_UQ_DUAL_POP: second uq entry written into a second free entry */
    uop_t uq2;
@@ -775,8 +792,10 @@ module exec(clk,
 	t_push_two_int = uq_push && uq_push_two && uq_uop.is_int && uq_uop_two.is_int;
 	t_push_one_int = ((uq_push && uq_uop.is_int) || (uq_push_two && uq_uop_two.is_int)) && !t_push_two_int;
 	
-	uq = r_uq[r_uq_head_ptr[`LG_UQ_ENTRIES-1:0]];
-	uq2 = r_uq[r_uq_next_head_ptr[`LG_UQ_ENTRIES-1:0]];
+	t_uq_even_rdata = r_uq_even[r_uq_even_raddr];
+	t_uq_odd_rdata = r_uq_odd[r_uq_odd_raddr];
+	uq = r_uq_head_ptr[0] ? t_uq_odd_rdata : t_uq_even_rdata;
+	uq2 = r_uq_head_ptr[0] ? t_uq_even_rdata : t_uq_odd_rdata;
 	
 	if(t_push_two_int)
 	  begin	     
@@ -802,19 +821,58 @@ module exec(clk,
 	  end
      end // always_comb
 
+   /* bank write ports: a push-two writes uq_uop at tail and uq_uop_two at tail+1;
+    * a push-one writes whichever of the two is the int op at tail. */
+   always_comb
+     begin
+	t_uq_even_waddr = r_uq_tail_ptr[0] ? r_uq_next_tail_ptr[`LG_UQ_ENTRIES-1:1] : r_uq_tail_ptr[`LG_UQ_ENTRIES-1:1];
+	t_uq_odd_waddr = r_uq_tail_ptr[0] ? r_uq_tail_ptr[`LG_UQ_ENTRIES-1:1] : r_uq_next_tail_ptr[`LG_UQ_ENTRIES-1:1];
+	t_uq_even_we = t_push_two_int | (t_push_one_int & !r_uq_tail_ptr[0]);
+	t_uq_odd_we = t_push_two_int | (t_push_one_int & r_uq_tail_ptr[0]);
+	t_uq_even_wdata = ((t_push_two_int & r_uq_tail_ptr[0]) | (t_push_one_int & !uq_uop.is_int)) ? uq_uop_two : uq_uop;
+	t_uq_odd_wdata = ((t_push_two_int & !r_uq_tail_ptr[0]) | (t_push_one_int & !uq_uop.is_int)) ? uq_uop_two : uq_uop;
+     end // always_comb
+
    always_ff@(posedge clk)
      begin
-	if(t_push_two_int)
+	if(t_uq_even_we)
 	  begin
-	     r_uq[r_uq_tail_ptr[`LG_UQ_ENTRIES-1:0]] <= uq_uop;
-	     r_uq[r_uq_next_tail_ptr[`LG_UQ_ENTRIES-1:0]] <= uq_uop_two;	     
+	     r_uq_even[t_uq_even_waddr] <= t_uq_even_wdata;
 	  end
-	else if(t_push_one_int)
+	if(t_uq_odd_we)
 	  begin
-	     r_uq[r_uq_tail_ptr[`LG_UQ_ENTRIES-1:0]] <= uq_uop.is_int ? uq_uop : uq_uop_two;
+	     r_uq_odd[t_uq_odd_waddr] <= t_uq_odd_wdata;
 	  end
-	
      end // always_ff@ (posedge clk)
+
+   /* bank read addresses are registered from the next head pointers so the LUTRAM
+    * address comes straight from a flop (no parity mux in front of the read) */
+   always_ff@(posedge clk)
+     begin
+	if(reset || t_flash_clear)
+	  begin
+	     r_uq_even_raddr <= 'd0;
+	     r_uq_odd_raddr <= 'd0;
+	  end
+	else
+	  begin
+	     r_uq_even_raddr <= n_uq_head_ptr[0] ? n_uq_next_head_ptr[`LG_UQ_ENTRIES-1:1] : n_uq_head_ptr[`LG_UQ_ENTRIES-1:1];
+	     r_uq_odd_raddr <= n_uq_head_ptr[0] ? n_uq_head_ptr[`LG_UQ_ENTRIES-1:1] : n_uq_next_head_ptr[`LG_UQ_ENTRIES-1:1];
+	  end
+     end // always_ff@ (posedge clk)
+
+`ifdef VERILATOR
+   always_ff@(negedge clk)
+     begin
+	if(!reset)
+	  begin
+	     assert(r_uq_next_head_ptr == r_uq_head_ptr + 'd1);
+	     assert(r_uq_next_tail_ptr == r_uq_tail_ptr + 'd1);
+	     assert(r_uq_even_raddr == (r_uq_head_ptr[0] ? r_uq_next_head_ptr[`LG_UQ_ENTRIES-1:1] : r_uq_head_ptr[`LG_UQ_ENTRIES-1:1]));
+	     assert(r_uq_odd_raddr == (r_uq_head_ptr[0] ? r_uq_head_ptr[`LG_UQ_ENTRIES-1:1] : r_uq_next_head_ptr[`LG_UQ_ENTRIES-1:1]));
+	  end
+     end
+`endif
    
    logic [63:0]        r_cycle;
    always_ff@(posedge clk)
@@ -904,6 +962,18 @@ module exec(clk,
 
    
    logic [N_INT_SCHED_ENTRIES-1:0] t_alu_entry_rdy;
+   /* t_alu_srcs_rdy = an entry's operand/ordering readiness (t_alu_entry_rdy without the
+    * unit-availability gate); t_alu_div_req = a valid divide that is srcs-ready, i.e. the
+    * int side WANTS the divider (feeds only the divider-turn flop below) */
+   logic [N_INT_SCHED_ENTRIES-1:0] t_alu_srcs_rdy, t_alu_div_req;
+   /* the int and FP divides share d0, one op in flight.  r_div_turn says which side may
+    * START a divide this cycle -- exclusive, so the two never collide -- and it is a flop,
+    * so neither side's select waits on the other's same-cycle wakeup (the FP side's
+    * t_fdiv_pop used to be in every int ALU entry's ready).  See the update after the
+    * FP-queue pop logic. */
+   localparam logic DIV_TURN_INT = 1'b0;
+   localparam logic DIV_TURN_FP = 1'b1;
+   logic r_div_turn, n_div_turn;
    logic [`LG_INT_SCHED_ENTRIES:0]  t_alu_sched_select_ptr;
    
 	
@@ -986,12 +1056,82 @@ module exec(clk,
    always_comb
      begin
 	t_picked_uop = t_uq_bypass ? uq : r_alu_sched_uops[t_alu_sched_select_ptr[`LG_INT_SCHED_ENTRIES-1:0]];
+	/* r_start_int's next state (see its always_ff) and the picked uop is a divide */
+	t_div_start_next = (((t_alu_entry_rdy != 'd0) | t_uq_bypass) & !ds_done) & is_div(t_picked_uop.op);
      end
    
    always_ff@(posedge clk)
      begin
 	int_uop <= t_picked_uop;
      end
+
+   /* Wide-immediate table (r9999 f939744): the ALU's pc and jmp_imm (on SPARC the
+    * high bits of the simm13 / sethi imm22<<10 / branch and call displacement, which
+    * sit in {jmp_imm[15:0], imm}) live in a ROB-indexed LUTRAM instead of riding in
+    * every uop-queue and scheduler entry.  Written when the uop is pushed to the issue
+    * queues; read with the picked uop's rob_ptr into r_int_pc/r_int_jmp_imm, which line
+    * up with int_uop.  The two uops pushed in one cycle hold adjacent ROB slots, so
+    * banking by rob_ptr[0] gives each bank one write port.  uop_t is unchanged:
+    * synthesis drops the now-unread pc/jmp_imm bits from the queue and the ALU
+    * scheduler (the FP and memory paths read jmp_imm from their own queues). */
+   localparam N_WIT_BANK = N_ROB_ENTRIES/2;
+   (* ram_style = "distributed" *) logic [`M_WIDTH-1:0] r_wit_pc_even[N_WIT_BANK];
+   (* ram_style = "distributed" *) logic [`M_WIDTH-1:0] r_wit_pc_odd[N_WIT_BANK];
+   (* ram_style = "distributed" *) logic [`M_WIDTH-17:0] r_wit_jmp_even[N_WIT_BANK];
+   (* ram_style = "distributed" *) logic [`M_WIDTH-17:0] r_wit_jmp_odd[N_WIT_BANK];
+   logic [`M_WIDTH-1:0]  r_int_pc;
+   logic [`M_WIDTH-17:0] r_int_jmp_imm;
+   logic t_wit_even_we, t_wit_odd_we, t_wit_even_two, t_wit_odd_two;
+   uop_t t_wit_even_uop, t_wit_odd_uop;
+   logic [`LG_ROB_ENTRIES-2:0] t_wit_raddr;
+
+   always_comb
+     begin
+	t_wit_even_two = uq_push_two & !uq_uop_two.rob_ptr[0];
+	t_wit_odd_two = uq_push_two & uq_uop_two.rob_ptr[0];
+	t_wit_even_we = (uq_push & !uq_uop.rob_ptr[0]) | t_wit_even_two;
+	t_wit_odd_we = (uq_push & uq_uop.rob_ptr[0]) | t_wit_odd_two;
+	t_wit_even_uop = t_wit_even_two ? uq_uop_two : uq_uop;
+	t_wit_odd_uop = t_wit_odd_two ? uq_uop_two : uq_uop;
+	t_wit_raddr = t_picked_uop.rob_ptr[`LG_ROB_ENTRIES-1:1];
+     end // always_comb
+
+   always_ff@(posedge clk)
+     begin
+	if(t_wit_even_we)
+	  begin
+	     r_wit_pc_even[t_wit_even_uop.rob_ptr[`LG_ROB_ENTRIES-1:1]] <= t_wit_even_uop.pc;
+	     r_wit_jmp_even[t_wit_even_uop.rob_ptr[`LG_ROB_ENTRIES-1:1]] <= t_wit_even_uop.jmp_imm;
+	  end
+	if(t_wit_odd_we)
+	  begin
+	     r_wit_pc_odd[t_wit_odd_uop.rob_ptr[`LG_ROB_ENTRIES-1:1]] <= t_wit_odd_uop.pc;
+	     r_wit_jmp_odd[t_wit_odd_uop.rob_ptr[`LG_ROB_ENTRIES-1:1]] <= t_wit_odd_uop.jmp_imm;
+	  end
+     end // always_ff@ (posedge clk)
+
+   always_ff@(posedge clk)
+     begin
+	r_int_pc <= t_picked_uop.rob_ptr[0] ? r_wit_pc_odd[t_wit_raddr] : r_wit_pc_even[t_wit_raddr];
+	r_int_jmp_imm <= t_picked_uop.rob_ptr[0] ? r_wit_jmp_odd[t_wit_raddr] : r_wit_jmp_even[t_wit_raddr];
+     end // always_ff@ (posedge clk)
+
+`ifdef VERILATOR
+   always_ff@(posedge clk)
+     begin
+	if(!reset && uq_push && uq_push_two && (uq_uop.rob_ptr[0] == uq_uop_two.rob_ptr[0]))
+	  begin
+	     $display("WIT: two pushes to the same bank, rob_ptr %d and %d", uq_uop.rob_ptr, uq_uop_two.rob_ptr);
+	     $stop;
+	  end
+	if(!reset && r_start_int && ((r_int_pc != int_uop.pc) || (r_int_jmp_imm != int_uop.jmp_imm)))
+	  begin
+	     $display("WIT: table mismatch at rob_ptr %d: pc %x vs %x, jmp_imm %x vs %x",
+		      int_uop.rob_ptr, r_int_pc, int_uop.pc, r_int_jmp_imm, int_uop.jmp_imm);
+	     $stop;
+	  end
+     end // always_ff@ (posedge clk)
+`endif
 
 `ifdef TOPDOWN
    /* per-uop stage stamps (see core.sv TOPDOWN): 1 = enters the ALU scheduler,
@@ -1206,9 +1346,7 @@ module exec(clk,
 
 		//is_mult(r_alu_sched_uops[i].op);
 		
-		t_alu_entry_rdy[i] = r_alu_sched_valid[i] &&
-				     (is_div(r_alu_sched_uops[i].op) ?  (t_div_ready & !t_fdiv_pop & !r_wb_bitvec[1]) :  (is_mult(r_alu_sched_uops[i].op) ?  !r_wb_bitvec[`MUL_LAT+2] : !r_wb_bitvec[1]))
-				     ? (
+		t_alu_srcs_rdy[i] = (
 					(t_alu_srcA_match[i] |r_alu_srcA_rdy[i]) &
 					(t_alu_srcB_match[i] |r_alu_srcB_rdy[i]) &
 					(t_alu_hilo_match[i] |r_alu_hilo_rdy[i]) &
@@ -1226,7 +1364,11 @@ module exec(clk,
 					  * complete while the delay slot waits to be oldest -> deadlock
 					  * (IRIX boot: faulted beqz + mfc0 c0_cause delay slot). */
 					 (head_of_rob_ds_committable &&
-					  (r_alu_sched_uops[i].rob_ptr == next_head_of_rob_ptr))) ) : 1'b0;
+					  (r_alu_sched_uops[i].rob_ptr == next_head_of_rob_ptr))) );
+		t_alu_div_req[i] = r_alu_sched_valid[i] & is_div(r_alu_sched_uops[i].op) & t_alu_srcs_rdy[i];
+		t_alu_entry_rdy[i] = r_alu_sched_valid[i] &&
+				     (is_div(r_alu_sched_uops[i].op) ?  (w_div_ok & (r_div_turn == DIV_TURN_INT) & !r_wb_bitvec[1]) :  (is_mult(r_alu_sched_uops[i].op) ?  !r_wb_bitvec[`MUL_LAT+2] : !r_wb_bitvec[1]))
+				     ? t_alu_srcs_rdy[i] : 1'b0;
 	     end // always_comb
 	   
 	   always_ff@(posedge clk)
@@ -1488,11 +1630,14 @@ module exec(clk,
        .hilo_prf_ptr_in(int_uop.hilo_dst),
        .is_signed_div(t_signed_div),
        .start_div(t_start_div),
+       .start_div_next(t_div_start_next),
+       .fp_start_next(t_fdiv_pop),
        .y(w_div_y),
        .rob_ptr_out(t_div_rob_ptr_out),
        .hilo_prf_ptr_out(t_div_hilo_prf_ptr_out),
        .complete(t_div_complete),
        .ready(t_div_ready),
+       .div_ok(w_div_ok),
        .fp_opcode(r_fp_iss_uop.op),
        .fp_start(t_fdiv_start),
 `ifdef ENABLE_MIPS4
@@ -1519,6 +1664,28 @@ module exec(clk,
        );
    
    assign divide_ready = t_div_ready;
+`ifdef VERILATOR
+   /* div_ok must never claim a free divider that is busy (that would start two ops on
+    * d0).  It may be pessimistic: besides a flush cycle, a SPARC divide by zero issues
+    * (t_div_start_next) but traps instead of starting the divider (t_start_div has
+    * !t_trap, from the divisor read at execute), so div_ok is 0 for that one cycle while
+    * ready is 1 -- and the trap flushes next anyway.  MIPS divides cannot trap, so r9999
+    * checks equality. */
+   always_ff@(posedge clk)
+     begin
+	if(!reset && !ds_done && w_div_ok && !t_div_ready)
+	  begin
+	     $display("exec: div_ok %b != divider ready %b", w_div_ok, t_div_ready);
+	     $stop;
+	  end
+	/* r_div_turn is exclusive: an int and a FP divide never both start next cycle */
+	if(!reset && t_div_start_next && t_fdiv_pop)
+	  begin
+	     $display("exec: int and FP divide picked for d0 in the same cycle (turn %b)", r_div_turn);
+	     $stop;
+	  end
+     end
+`endif
 
 
 
@@ -1989,7 +2156,7 @@ module exec(clk,
 	 * in the first cycle neither fpu0 nor the convert path is using them -- so it
 	 * takes no r_fp_wb_bitvec reservation. */
 	t_pop_fp_uq = !t_fp_uq_empty && !t_flash_clear && t_fpu_srcs_rdy &&
-		      (w_head_is_ds ? w_fdiv_ready
+		      (w_head_is_ds ? (w_fdiv_ready & (r_div_turn == DIV_TURN_FP))
 				    : !r_fp_wb_bitvec[w_head_wb_dist]);
 `ifdef ENABLE_MIPS4
 	/* an fpu op (not convert/signop/cmov, not divider) starts fpu0 next cycle: not in
@@ -2003,6 +2170,38 @@ module exec(clk,
 	t_fdiv_start   = r_fp_iss_valid & w_iss_is_ds;
 	t_fdiv_wb_used = w_fpu_result_valid | w_fpu_fcr_valid | r_cvt_valid;
      end
+
+   /* divider turn (see r_div_turn): the side holding it keeps it while it has a srcs-ready
+    * divide that has not started; it passes to the other side once that side wants the
+    * divider and the holder either just started one or has none ready.  Requests are
+    * READINESS, not presence: an int divide waiting on an FP divide's result (via an FP
+    * store and load) must not hold the turn.  A collision costs the loser about a cycle;
+    * an uncontended divide keeps the turn from its side's last divide, or gets it the next
+    * cycle. */
+   logic t_fp_div_req;
+   always_comb
+     begin
+	t_fp_div_req = !t_fp_uq_empty && !t_flash_clear && t_fpu_srcs_rdy && w_head_is_ds;
+	n_div_turn = r_div_turn;
+	if(r_div_turn == DIV_TURN_INT)
+	  begin
+	     if(t_fp_div_req && (t_div_start_next || (t_alu_div_req == 'd0)))
+	       begin
+		  n_div_turn = DIV_TURN_FP;
+	       end
+	  end
+	else
+	  begin
+	     if((t_alu_div_req != 'd0) && (t_fdiv_pop || !t_fp_div_req))
+	       begin
+		  n_div_turn = DIV_TURN_INT;
+	       end
+	  end
+     end // always_comb
+   always_ff@(posedge clk)
+     begin
+	r_div_turn <= reset ? DIV_TURN_INT : n_div_turn;
+     end // always_ff
 
    /* FP writeback reservation: shift down each cycle; on pop, reserve dist-1 (next-cycle
     * frame). gate above reads [dist]. arith/compare fpu dist=FPU_LAT+1, convert dist=2. */
@@ -2326,7 +2525,7 @@ module exec(clk,
 
    /* ---- SPARC integer datapath (the S_* ops, uop.vh) ---- */
    /* operand 2: rs2, or the sign-extended immediate in {jmp_imm[15:0], imm} */
-   assign w_s_op2 = int_uop.srcB_valid ? t_srcB[31:0] : {int_uop.jmp_imm[15:0], int_uop.imm};
+   assign w_s_op2 = int_uop.srcB_valid ? t_srcB[31:0] : {r_int_jmp_imm[15:0], int_uop.imm};
    /* the incoming icc: the icc version the reader renamed (flags_src_valid) */
    wire [3:0]  w_s_icc = r_icc_prf[int_uop.icc_src];
    wire        w_s_cin = int_uop.flags_src_valid & w_s_icc[0] &
@@ -2348,8 +2547,8 @@ module exec(clk,
 			   ((int_uop.op == S_ORN) | (int_uop.op == S_ORNCC)) ? (t_srcA[31:0] | ~w_s_op2) :
 			   ((int_uop.op == S_XOR) | (int_uop.op == S_XORCC)) ? (t_srcA[31:0] ^ w_s_op2) :
 			   (t_srcA[31:0] ^ ~w_s_op2);
-   wire [31:0] w_s_branch_target = int_uop.pc[31:0] + {int_uop.jmp_imm[15:0], int_uop.imm};
-   wire [31:0] w_s_pc8 = int_uop.pc[31:0] + 32'd8;
+   wire [31:0] w_s_branch_target = r_int_pc[31:0] + {r_int_jmp_imm[15:0], int_uop.imm};
+   wire [31:0] w_s_pc8 = r_int_pc[31:0] + 32'd8;
 
    /* Bicc / Ticc condition on {N, Z, V, C} (interpret.cc eval_icc) */
    function automatic logic eval_icc(input logic [3:0] c, input logic [3:0] icc);
@@ -2396,9 +2595,9 @@ module exec(clk,
    
    always_comb
      begin
-	t_pc = int_uop.pc + zero_extend32(32'd4);  /* default restart = pc+4 */
-	t_pc4 = int_uop.pc + zero_extend32(32'd4);
-	t_pc8 = int_uop.pc + zero_extend32(32'd8);
+	t_pc = r_int_pc + zero_extend32(32'd4);  /* default restart = pc+4 */
+	t_pc4 = r_int_pc + zero_extend32(32'd4);
+	t_pc8 = r_int_pc + zero_extend32(32'd8);
 	t_result = zero_extend32(32'd0);
 	t_unimp_op = 1'b0;
 	t_fault = 1'b0;
@@ -2407,7 +2606,7 @@ module exec(clk,
 	t_wr_fcsr = 1'b0;
 	t_take_br = 1'b0;
 	t_mispred_br = 1'b0;
-	t_jaddr = {int_uop.jmp_imm[9:0],int_uop.imm,2'd0};
+	t_jaddr = {r_int_jmp_imm[9:0],int_uop.imm,2'd0};
 	t_alu_valid = 1'b0;
 	t_hilo_result = 'd0;
 	t_wr_hilo = 1'b0;
@@ -2596,7 +2795,7 @@ module exec(clk,
 	    end
 	  S_SETHI, TRAP_L1, TRAP_L2:
 	    begin
-	       t_result = `M_WIDTH'({int_uop.jmp_imm[15:0], int_uop.imm});
+	       t_result = `M_WIDTH'({r_int_jmp_imm[15:0], int_uop.imm});
 	       t_wr_int_prf = int_uop.dst_valid;
 	       t_alu_valid = 1'b1;
 	    end
@@ -2631,7 +2830,7 @@ module exec(clk,
 	       t_take_br = 1'b1;
 	       t_mispred_br = (int_uop.br_pred != 1'b1);
 	       t_pc = `M_WIDTH'(w_s_branch_target);
-	       t_result = int_uop.pc;
+	       t_result = r_int_pc;
 	       t_wr_int_prf = int_uop.dst_valid;
 	       t_alu_valid = 1'b1;
 	    end
@@ -2643,7 +2842,7 @@ module exec(clk,
 	       t_trap = (w_s_add[1:0] != 2'd0);
 	       t_fault = t_trap;
 	       t_mispred_br = (t_pc != int_uop.pred_target);
-	       t_result = t_trap ? `M_WIDTH'(8'h07) : int_uop.pc;
+	       t_result = t_trap ? `M_WIDTH'(8'h07) : r_int_pc;
 	       t_wr_int_prf = int_uop.dst_valid & !t_trap;
 	       t_alu_valid = 1'b1;
 	    end
